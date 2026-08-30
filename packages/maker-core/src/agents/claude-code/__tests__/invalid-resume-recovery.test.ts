@@ -9,6 +9,7 @@ import type { AgentDeps, StartSessionOptions } from '../../base-agent.js';
 import type { AuthAdapter } from '../../../interfaces/auth-adapter.js';
 import type { AgentEvent } from '../../../types/events.js';
 import type { Logger } from '../../../interfaces/logger.js';
+import type { ModelDescriptor } from '../../../types/capabilities.js';
 import { sanitizeClaudeProjectKey } from '../claude-projects-fs.js';
 
 const sdkMock = vi.hoisted(() => ({ query: vi.fn(), forkSession: vi.fn() }));
@@ -122,6 +123,7 @@ function createFakeQuery(stream: ReturnType<typeof createControlledStream>) {
     setPermissionMode: vi.fn(async () => {}),
     setModel: vi.fn(async () => {}),
     applyFlagSettings: vi.fn(async () => {}),
+    supportedAgents: vi.fn(async () => []),
     interrupt: vi.fn(async () => {}),
     close: vi.fn(async () => {
       stream.end();
@@ -147,6 +149,9 @@ async function startHarness(args: {
   resumeSessionId?: string;
   transcriptExists: boolean;
   onInvalidResumeSession: StartSessionOptions['onInvalidResumeSession'];
+  model?: string;
+  additionalModels?: ModelDescriptor[];
+  resolveVerifiedContextWindow?: AgentDeps['resolveVerifiedContextWindow'];
 }) {
   const configDir = await makeTempDir();
   const workingDir = await makeTempDir();
@@ -177,10 +182,17 @@ async function startHarness(args: {
     return queries[index];
   });
 
-  const agent = new ClaudeCodeAgent(createDeps());
+  const agent = new ClaudeCodeAgent(createDeps({
+    ...(args.additionalModels
+      ? { capabilityAdditions: { availableModels: args.additionalModels } }
+      : {}),
+    ...(args.resolveVerifiedContextWindow
+      ? { resolveVerifiedContextWindow: args.resolveVerifiedContextWindow }
+      : {}),
+  }));
   const handle = await agent.startSession({
     sessionId: 'local-session',
-    model: 'claude-opus-4-6',
+    model: args.model ?? 'claude-opus-4-6',
     workingDir,
     permissionMode: 'acceptEdits',
     resumeSessionId: args.resumeSessionId,
@@ -292,6 +304,33 @@ describe('Claude invalid-resume recovery', () => {
 
     await h.handle.close();
     h.streams[1].end();
+    await h.collected;
+  });
+
+  it('does not spawn a fresh replacement when the invalid Query close is unacknowledged', async () => {
+    const clear = vi.fn(async () => true);
+    const h = await startHarness({
+      resumeSessionId: 'sdk-orphan',
+      transcriptExists: true,
+      onInvalidResumeSession: clear,
+    });
+    h.queries[0].close.mockRejectedValueOnce(new Error('invalid Query close rejected'));
+
+    h.streams[0].fail(
+      new Error('Claude Code returned an error result: No conversation found with session ID: sdk-orphan'),
+    );
+    await vi.waitFor(() => {
+      expect(
+        h.events.some((event) =>
+          event.type === 'error'
+          && (event.data as { message?: string }).message?.includes(
+            'CLAUDE_INVALID_RESUME_CLOSE_FAILED',
+          )),
+      ).toBe(true);
+    });
+
+    expect(clear).toHaveBeenCalledWith('sdk-orphan');
+    expect(h.queryOptions).toHaveLength(1);
     await h.collected;
   });
 
@@ -643,6 +682,70 @@ describe('Claude invalid-resume recovery', () => {
       source: 'claude-code',
     });
 
+    await h.handle.close();
+    h.streams[1].end();
+    await h.collected;
+  });
+
+  it('synchronizes a catalog-changed wire model before invalid-resume replay input', async () => {
+    const dynamicModel: ModelDescriptor = {
+      id: 'claude-haiku-dynamic',
+      displayName: 'Dynamic Haiku',
+      contextWindow: 1_000_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    let verifiedWindow = 1_000_000;
+    const clear = vi.fn(async () => true);
+    const h = await startHarness({
+      resumeSessionId: 'sdk-wire-old',
+      transcriptExists: true,
+      onInvalidResumeSession: clear,
+      model: dynamicModel.id,
+      additionalModels: [dynamicModel],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === dynamicModel.id ? verifiedWindow : null,
+    });
+    let notifyInventoryStarted!: () => void;
+    let releaseInventory!: () => void;
+    const inventoryStarted = new Promise<void>((resolve) => { notifyInventoryStarted = resolve; });
+    const inventoryHold = new Promise<void>((resolve) => { releaseInventory = resolve; });
+    h.queries[1].supportedAgents.mockImplementationOnce(async () => {
+      notifyInventoryStarted();
+      await inventoryHold;
+      return [];
+    });
+
+    await h.handle.send({ type: 'user', content: 'replay only on synchronized wire' });
+    h.streams[0].emit({
+      type: 'result',
+      is_error: true,
+      subtype: 'error_during_execution',
+      total_cost_usd: 0,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    h.streams[0].fail(
+      new Error('Claude Code returned an error result: No conversation found with session ID: sdk-wire-old'),
+    );
+    await inventoryStarted;
+    verifiedWindow = 200_000;
+    releaseInventory();
+
+    await vi.waitFor(() => expect(h.consumedInputs[1]?.length).toBe(1));
+    expect(h.queryOptions).toHaveLength(2);
+    expect(h.queryOptions[1]).toHaveProperty('model', `${dynamicModel.id}[1m]`);
+    expect(h.queries[1].setModel).toHaveBeenCalledWith(dynamicModel.id);
+    expect(h.consumedInputs[1]).toHaveLength(1);
+
+    h.streams[1].emit({ type: 'system', subtype: 'init', session_id: 'sdk-wire-new' });
+    h.streams[1].emit({
+      type: 'result',
+      is_error: false,
+      result: 'ok',
+      total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    await waitForDone(h.events);
     await h.handle.close();
     h.streams[1].end();
     await h.collected;

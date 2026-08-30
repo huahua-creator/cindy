@@ -2054,7 +2054,7 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
     await handle.close().catch(() => undefined);
   });
 
-  it('Stop rebuild proceeds when the retired remote Query close rejects', async () => {
+  it('Stop rebuild stays blocked when close rejects, then retries close on the next explicit send', async () => {
     const { handle, stream, events, fakeQuery, fakeQueries } = await startSessionWithStream();
     const closeDeferred = createDeferred<void>();
 
@@ -2070,7 +2070,11 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
     expect(fakeQueries).toHaveLength(1);
 
     closeDeferred.reject(new Error('remote close rejected'));
-    await sendPromise;
+    await expect(sendPromise).rejects.toThrow('remote close rejected');
+    expect(fakeQueries).toHaveLength(1);
+
+    await handle.send({ type: 'user', content: 'explicit retry after close rejection' });
+    expect(fakeQuery.close).toHaveBeenCalledTimes(2);
     expect(fakeQueries).toHaveLength(2);
     stream.emit(turnResult('replacement after rejected close'));
     await waitFor(() => events.filter(isProductTerminal).length === 2, 'replacement terminal observed');
@@ -2748,7 +2752,7 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
     await handle.abort();
     await waitFor(() => events.filter(isProductTerminal).length === 1, 'synthetic terminal observed');
     await handle.setModel?.('claude-sonnet-5');
-    expect(handle.getUsageSnapshot().contextWindow).toBe(500_000);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
 
     const preview = await handle.previewRewindFiles?.('user-uuid-1');
     expect(preview?.canRewind).toBe(false);
@@ -2801,7 +2805,7 @@ describe('ClaudeCodeAgent abort stops background wake tasks', () => {
     await waitFor(() => handle.isTurnRunning?.() === false, 'synthetic terminal acknowledged');
 
     await expect(handle.setModel?.('claude-sonnet-5')).resolves.toBeUndefined();
-    expect(handle.getUsageSnapshot().contextWindow).toBe(500_000);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
     expect(handle.isTurnRunning?.()).toBe(false);
 
     await handle.send({ type: 'user', content: 'user after cancellation' });

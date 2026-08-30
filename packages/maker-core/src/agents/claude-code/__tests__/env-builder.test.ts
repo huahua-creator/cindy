@@ -3,9 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthAdapter } from '../../../interfaces/auth-adapter.js';
 import type { AgentRuntimeConfig } from '../../../interfaces/runtime-config.js';
 import {
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV,
   SENSITIVE_ANTHROPIC_ENV_KEYS,
+  applyClaudeContextWindowProfileEnv,
   applySubagentModelEnv,
   buildClaudeEnv,
+  isClaudeCodeIntrinsicWindowSafe,
+  resolveClaudeContextWindowProfile,
 } from '../env-builder.js';
 
 const MODEL_CONTEXT_WINDOWS_ENV = 'XDT_MAKER_MODEL_CONTEXT_WINDOWS';
@@ -509,5 +513,120 @@ describe('applySubagentModelEnv', () => {
     expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBe('xai/grok-4.5');
     applySubagentModelEnv(env, null);
     expect('CLAUDE_CODE_SUBAGENT_MODEL' in env).toBe(false);
+  });
+});
+
+describe('resolveClaudeContextWindowProfile', () => {
+  it('rejects verified windows smaller than Claude Code intrinsic name branches', () => {
+    expect(isClaudeCodeIntrinsicWindowSafe('claude-custom', 128_000)).toBe(false);
+    expect(isClaudeCodeIntrinsicWindowSafe('claude-custom', 200_000)).toBe(true);
+    expect(isClaudeCodeIntrinsicWindowSafe('provider/custom[1m]', 500_000)).toBe(false);
+    expect(isClaudeCodeIntrinsicWindowSafe('provider/custom[1m]', 1_000_000)).toBe(true);
+    expect(isClaudeCodeIntrinsicWindowSafe('provider/custom[1m]', undefined)).toBe(false);
+    expect(isClaudeCodeIntrinsicWindowSafe('provider/custom', undefined)).toBe(true);
+    expect(isClaudeCodeIntrinsicWindowSafe('sonnet', undefined)).toBe(true);
+  });
+
+  it('injects the verified non-Claude window when a native Claude subagent cannot consume MAX_CONTEXT', () => {
+    const profile = resolveClaudeContextWindowProfile({
+      model: 'gpt-5.6-terra',
+      contextWindow: 372_000,
+      subagentModel: 'claude-haiku-4-5',
+      subagentContextWindow: 200_000,
+    });
+
+    expect(profile).toEqual({
+      envValue: '372000',
+      effectiveContextWindow: 372_000,
+      reason: 'verified-process-minimum',
+    });
+  });
+
+  it('uses the smallest verified non-Claude window shared by the process', () => {
+    const profile = resolveClaudeContextWindowProfile({
+      model: 'gpt-5.6-terra',
+      contextWindow: 372_000,
+      subagentModel: 'gpt-5.6-luna',
+      subagentContextWindow: 272_000,
+    });
+
+    expect(profile.envValue).toBe('272000');
+    expect(profile.effectiveContextWindow).toBe(272_000);
+  });
+
+  it('uses the verified main window when the authoritative agent inventory has no custom model', () => {
+    const profile = resolveClaudeContextWindowProfile({
+      model: 'gpt-5.6-terra',
+      contextWindow: 372_000,
+    });
+
+    expect(profile).toEqual({
+      envValue: '372000',
+      effectiveContextWindow: 372_000,
+      reason: 'verified-process-minimum',
+    });
+  });
+
+  it('keeps a verified sub-200k safety bound from the authoritative agent inventory', () => {
+    const profile = resolveClaudeContextWindowProfile({
+      model: 'gpt-5.6-terra',
+      contextWindow: 372_000,
+      additionalSubagentModels: [{ model: 'provider/small', contextWindow: 128_000 }],
+    });
+
+    expect(profile.envValue).toBe('128000');
+    expect(profile.effectiveContextWindow).toBe(128_000);
+  });
+
+  it('protects a smaller provider subagent even when the main model uses native 1m', () => {
+    const profile = resolveClaudeContextWindowProfile({
+      model: 'claude-opus-4-6[1m]',
+      contextWindow: 1_000_000,
+      subagentModel: 'provider/small',
+      subagentContextWindow: 128_000,
+    });
+
+    expect(profile.envValue).toBe('128000');
+    expect(profile.effectiveContextWindow).toBe(1_000_000);
+  });
+
+  it.each([
+    { model: 'claude-opus-4-6', contextWindow: 200_000, reason: 'native-claude' },
+    { model: 'gpt-5.5[1m]', contextWindow: 1_000_000, reason: 'native-1m' },
+    { model: 'provider/unknown', contextWindow: Number.NaN, reason: 'unknown-main-window' },
+    { model: 'provider/unsafe', contextWindow: Number.MAX_VALUE, reason: 'unknown-main-window' },
+  ])('writes the neutralizer for $reason', ({ model, contextWindow, reason }) => {
+    const profile = resolveClaudeContextWindowProfile({
+      model,
+      contextWindow,
+      subagentModel: 'claude-haiku-4-5',
+    });
+    const env: Record<string, string> = {
+      [CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV]: '999999',
+    };
+
+    applyClaudeContextWindowProfileEnv(env, profile);
+
+    expect(profile.reason).toBe(reason);
+    expect(env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV]).toBe('0');
+  });
+
+  it('overlays a parent-process residue for the Query without mutating process.env', async () => {
+    expect(SENSITIVE_ANTHROPIC_ENV_KEYS).not.toContain(CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV);
+    const previous = process.env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV];
+    process.env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV] = '999999';
+    try {
+      const env = await buildClaudeEnv(createAuthAdapter(), {});
+      expect(env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV]).toBe('999999');
+
+      applyClaudeContextWindowProfileEnv(env, resolveClaudeContextWindowProfile({
+        model: 'provider/unknown',
+      }));
+      expect(env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV]).toBe('0');
+      expect(process.env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV]).toBe('999999');
+    } finally {
+      if (previous === undefined) delete process.env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV];
+      else process.env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV] = previous;
+    }
   });
 });

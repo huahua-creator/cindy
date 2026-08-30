@@ -14,6 +14,176 @@ import type { AgentRuntimeConfig } from '../../interfaces/runtime-config.js';
 import { applyPlainTextTerminalEnv } from '../shared/terminal-output.js';
 
 export const MAKER_MODEL_CONTEXT_WINDOWS_ENV = 'XDT_MAKER_MODEL_CONTEXT_WINDOWS';
+export const CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV = 'CLAUDE_CODE_MAX_CONTEXT_TOKENS';
+
+const CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS = 200_000;
+const CLAUDE_CODE_NATIVE_ONE_MILLION_TOKENS = 1_000_000;
+const CLAUDE_CODE_NATIVE_MODEL_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
+
+export type ClaudeContextWindowProfileReason =
+  | 'native-claude'
+  | 'native-1m'
+  | 'verified-process-minimum'
+  | 'unknown-main-window'
+  | 'unknown-subagent-window'
+  | 'default-200k';
+
+export interface ClaudeContextWindowProfile {
+  /**
+   * Value written to the child Query env. `0` is an intentional neutralizer:
+   * Claude Code 2.1.219 ignores non-positive values and falls back to its
+   * native resolver, while still overriding a stale parent-process value in
+   * the SDK's `{ ...process.env, ...options.env }` spawn merge.
+   */
+  envValue: string;
+  effectiveContextWindow: number;
+  reason: ClaudeContextWindowProfileReason;
+}
+
+export interface ResolveClaudeContextWindowProfileInput {
+  model: string;
+  contextWindow?: number;
+  /**
+   * The process-wide forced subagent model. Undefined means per-agent / per-call
+   * model selection remains open and the process cannot prove a wider minimum.
+   */
+  subagentModel?: string;
+  subagentContextWindow?: number;
+  /** Explicit file/programmatic agent models reachable when no env override is active. */
+  additionalSubagentModels?: readonly {
+    model: string;
+    contextWindow?: number;
+  }[];
+}
+
+export function stripClaudeCodeOneMillionSuffix(model: string): string {
+  return model.endsWith('[1m]') ? model.slice(0, -'[1m]'.length) : model;
+}
+
+export function isNativeClaudeModel(model: string): boolean {
+  const bare = stripClaudeCodeOneMillionSuffix(model.trim()).toLowerCase();
+  return bare.startsWith('claude-') || CLAUDE_CODE_NATIVE_MODEL_ALIASES.has(bare);
+}
+
+export function isClaudeCodeNativeModelAlias(model: string): boolean {
+  const bare = stripClaudeCodeOneMillionSuffix(model.trim()).toLowerCase();
+  return CLAUDE_CODE_NATIVE_MODEL_ALIASES.has(bare);
+}
+
+/**
+ * Claude Code resolves native-looking names and `[1m]` before consulting MAX.
+ * A provider catalog that verifies a smaller window therefore cannot be made
+ * safe by setting the env variable: the action must be rejected instead.
+ * Undefined windows remain valid only for native-looking Claude models, whose
+ * bundled CLI resolver is the authority.
+ */
+export function isClaudeCodeIntrinsicWindowSafe(
+  model: string,
+  verifiedContextWindow: number | undefined,
+): boolean {
+  const normalized = model.trim().toLowerCase();
+  const nativeNamed = isNativeClaudeModel(normalized);
+  const oneMillionBranch = normalized.endsWith('[1m]');
+  if (verifiedContextWindow === undefined) {
+    return nativeNamed || !oneMillionBranch;
+  }
+  if (oneMillionBranch) {
+    return verifiedContextWindow >= CLAUDE_CODE_NATIVE_ONE_MILLION_TOKENS;
+  }
+  if (nativeNamed) {
+    return verifiedContextWindow >= CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS;
+  }
+  return true;
+}
+
+function safeContextWindow(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : undefined;
+}
+
+/**
+ * Resolve the one process-wide context-window value consumed by Claude Code.
+ *
+ * Claude Code 2.1.219 checks native Claude / `[1m]` branches before
+ * `CLAUDE_CODE_MAX_CONTEXT_TOKENS`; the variable only affects positive values
+ * on non-Claude, non-1m wire models. Subagents share the same CLI process, so a
+ * value may never exceed the smallest verified non-Claude window that can run
+ * in that process. The Agent tool's per-call model field is restricted by the
+ * bundled SDK to native aliases; explicit file/programmatic agent models are
+ * therefore the only additional provider windows that must join this minimum.
+ */
+export function resolveClaudeContextWindowProfile(
+  input: ResolveClaudeContextWindowProfileInput,
+): ClaudeContextWindowProfile {
+  const model = input.model.trim();
+  const mainWindow = safeContextWindow(input.contextWindow);
+  const mainUsesNativeOneMillion =
+    model.endsWith('[1m]') || (mainWindow !== undefined && mainWindow >= CLAUDE_CODE_NATIVE_ONE_MILLION_TOKENS);
+  const mainUsesNativeClaude = !mainUsesNativeOneMillion && isNativeClaudeModel(model);
+  const mainConsumesMaxContext = !mainUsesNativeOneMillion && !mainUsesNativeClaude;
+  let reason: ClaudeContextWindowProfileReason = mainUsesNativeOneMillion
+    ? 'native-1m'
+    : mainUsesNativeClaude
+      ? 'native-claude'
+      : mainWindow === undefined
+        ? 'unknown-main-window'
+        : 'verified-process-minimum';
+  const processCandidates: number[] = [];
+  if (mainConsumesMaxContext) {
+    processCandidates.push(mainWindow ?? CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS);
+  }
+
+  const subagentCandidates = [
+    ...(input.subagentModel?.trim()
+      ? [{ model: input.subagentModel.trim(), contextWindow: input.subagentContextWindow }]
+      : []),
+    ...(input.additionalSubagentModels ?? []),
+  ];
+  for (const candidate of subagentCandidates) {
+    const subagentModel = candidate.model.trim();
+    const subagentWindow = safeContextWindow(candidate.contextWindow);
+    if (
+      isNativeClaudeModel(subagentModel) ||
+      subagentModel.endsWith('[1m]') ||
+      (subagentWindow ?? 0) >= CLAUDE_CODE_NATIVE_ONE_MILLION_TOKENS
+    ) continue;
+    if (subagentWindow === undefined) {
+      processCandidates.push(CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS);
+      reason = 'unknown-subagent-window';
+    } else {
+      processCandidates.push(subagentWindow);
+      if (reason === 'native-claude' || reason === 'native-1m') {
+        reason = 'verified-process-minimum';
+      }
+    }
+  }
+
+  const processMinimum = processCandidates.length > 0
+    ? Math.min(...processCandidates)
+    : CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS;
+  const envValue = processMinimum === CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS
+    ? '0'
+    : String(processMinimum);
+  const effectiveContextWindow = mainUsesNativeOneMillion
+    ? CLAUDE_CODE_NATIVE_ONE_MILLION_TOKENS
+    : mainUsesNativeClaude
+      ? (mainWindow ?? CLAUDE_CODE_DEFAULT_CONTEXT_TOKENS)
+      : processMinimum;
+  return {
+    envValue,
+    effectiveContextWindow,
+    reason: reason === 'verified-process-minimum' && envValue === '0' ? 'default-200k' : reason,
+  };
+}
+
+/** Apply a resolved profile to one Query's child env without mutating process.env. */
+export function applyClaudeContextWindowProfileEnv(
+  env: Record<string, string>,
+  profile: ClaudeContextWindowProfile,
+): void {
+  env[CLAUDE_CODE_MAX_CONTEXT_TOKENS_ENV] = profile.envValue;
+}
 
 interface ModelContextWindowSource {
   id: string;

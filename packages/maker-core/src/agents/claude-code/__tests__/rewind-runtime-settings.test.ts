@@ -44,7 +44,7 @@ vi.mock('../../shared/image-resizer.js', () => ({
   getDefaultImageResizer: () => imageResizerMock,
 }));
 
-import { ClaudeCodeAgent } from '../index.js';
+import { ClaudeCodeAgent, setClaudeSupportedModelsListener } from '../index.js';
 
 const tempDirs: string[] = [];
 const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -66,6 +66,67 @@ const TEST_MODELS: ModelDescriptor[] = [
     defaultEffort: 'high',
   },
 ];
+
+const PROVIDER_372K: ModelDescriptor = {
+  id: 'gpt-5.6-terra',
+  displayName: 'GPT 5.6 Terra',
+  contextWindow: 372_000,
+  efforts: ['low', 'medium', 'high'],
+  defaultEffort: 'high',
+};
+
+const PROVIDER_272K: ModelDescriptor = {
+  id: 'gpt-5.6-luna',
+  displayName: 'GPT 5.6 Luna',
+  contextWindow: 272_000,
+  efforts: ['low', 'medium', 'high'],
+  defaultEffort: 'high',
+};
+
+type TestPreToolUseHook = (...args: never[]) => Promise<unknown>;
+type TestHookSet = {
+  PreToolUse?: Array<{ hooks: TestPreToolUseHook[] }>;
+};
+
+async function findDenyingPreToolUseHook(
+  hooks: TestHookSet | undefined,
+  input: Record<string, unknown>,
+): Promise<{ hook: TestPreToolUseHook; result: unknown }> {
+  for (const matcher of hooks?.PreToolUse ?? []) {
+    for (const hook of matcher.hooks) {
+      const result = await hook(
+        input as never,
+        undefined as never,
+        { signal: new AbortController().signal } as never,
+      );
+      if (
+        (result as { hookSpecificOutput?: { permissionDecision?: string } })
+          .hookSpecificOutput?.permissionDecision === 'deny'
+      ) return { hook, result };
+    }
+  }
+  throw new Error('expected a denying PreToolUse hook');
+}
+
+async function anyPreToolUseHookDenies(
+  hooks: TestHookSet | undefined,
+  input: Record<string, unknown>,
+): Promise<boolean> {
+  for (const matcher of hooks?.PreToolUse ?? []) {
+    for (const hook of matcher.hooks) {
+      const result = await hook(
+        input as never,
+        undefined as never,
+        { signal: new AbortController().signal } as never,
+      );
+      if (
+        (result as { hookSpecificOutput?: { permissionDecision?: string } })
+          .hookSpecificOutput?.permissionDecision === 'deny'
+      ) return true;
+    }
+  }
+  return false;
+}
 
 function createNoopLogger(onInfo?: (message: string) => void): Logger {
   const logger: Logger = {
@@ -177,8 +238,15 @@ function createFakeQuery(stream = createControlledStream()) {
     stream,
     [Symbol.asyncIterator]: () => stream[Symbol.asyncIterator](),
     setPermissionMode: vi.fn(async () => assertWritable()),
-    setModel: vi.fn(async () => assertWritable()),
+    setModel: vi.fn(async (_model: string) => assertWritable()),
     applyFlagSettings: vi.fn(async () => assertWritable()),
+    supportedAgents: vi.fn(async () => [
+      { name: 'general-purpose', description: 'inherits the parent model' },
+      { name: 'inherited-worker', description: 'explicit inherit', model: 'inherit' },
+      { name: 'Explore', description: 'native built-in', model: 'haiku' },
+      { name: 'Plan', description: 'native built-in', model: 'sonnet' },
+    ]),
+    supportedModels: vi.fn(async () => []),
     interrupt: vi.fn(async () => {}),
     send: vi.fn(async () => {}),
     close: vi.fn(() => {
@@ -205,6 +273,15 @@ async function startRewindableSession(
     idleTimeoutMs?: number;
     remoteHostId?: string;
     model?: string;
+    subagentModel?: string;
+    systemPrompt?: string;
+    additionalModels?: ModelDescriptor[];
+    localQueries?: ReturnType<typeof createFakeQuery>[];
+    remoteQueries?: ReturnType<typeof createFakeQuery>[];
+    resolveVerifiedContextWindow?: (
+      providerId: string | null | undefined,
+      modelId: string,
+    ) => number | null;
     shouldHandoffAfterContextAssessment?: (tokens: number, window: number) => boolean;
   } = {},
 ) {
@@ -214,13 +291,15 @@ async function startRewindableSession(
   process.env.XDT_CC_SSE_IDLE_TIMEOUT_MS = String(options.idleTimeoutMs ?? 0);
   const workingDir = await makeTempDir();
 
-  const firstQuery = createFakeQuery();
-  sdkMock.query.mockReturnValue(firstQuery);
+  const firstQuery = options.remoteQueries?.[0] ?? options.localQueries?.[0] ?? createFakeQuery();
+  let localQueryIndex = 0;
+  sdkMock.query.mockImplementation(() => options.localQueries?.[localQueryIndex++] ?? firstQuery);
   const remoteStartParams: Array<Record<string, unknown>> = [];
+  let remoteQueryIndex = 0;
   const remoteCcQueryFactory = options.remoteHostId
     ? (async (opts: { startParams: Record<string, unknown> }) => {
         remoteStartParams.push(opts.startParams);
-        return firstQuery as never;
+        return (options.remoteQueries?.[remoteQueryIndex++] ?? firstQuery) as never;
       })
     : undefined;
   const infoCalls: string[] = [];
@@ -230,12 +309,19 @@ async function startRewindableSession(
       {
         autoCompactThresholdPct: options.autoCompactThresholdPct,
         shouldHandoffAfterContextAssessment: options.shouldHandoffAfterContextAssessment,
+        subagentModel: options.subagentModel,
+        systemPrompt: options.systemPrompt,
       },
       (message) => {
         infoCalls.push(message);
       },
     ),
-    capabilityAdditions: { availableModels: TEST_MODELS },
+    capabilityAdditions: {
+      availableModels: [...TEST_MODELS, ...(options.additionalModels ?? [])],
+    },
+    ...(options.resolveVerifiedContextWindow
+      ? { resolveVerifiedContextWindow: options.resolveVerifiedContextWindow }
+      : {}),
     ...(remoteCcQueryFactory ? { remoteCcQueryFactory } : {}),
   });
   const handle = await agent.startSession({
@@ -250,6 +336,8 @@ async function startRewindableSession(
 }
 
 afterEach(async () => {
+  setClaudeSupportedModelsListener(null);
+  vi.useRealTimers();
   sdkMock.forkSession.mockReset();
   sdkMock.query.mockReset();
   imageResizerMock.process.mockReset();
@@ -291,8 +379,1460 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     await handle.close();
   });
 
-  it('widens the live Claude allowlist before switching to a later-loaded gateway model', async () => {
-    const { handle, firstQuery, agent } = await startRewindableSession();
+  it('sets the current verified provider window on the initial Query env', async () => {
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+    });
+
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { env?: Record<string, string> };
+    };
+    expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    expect(handle.getUsageSnapshot().contextWindow).toBe(372_000);
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    await handle.close();
+  });
+
+  it.each([
+    ['provider/glm-5.2[1m]', 'provider/glm-5.2[1m]', '0', 1_000_000],
+    ['provider/glm-5.2', 'provider/glm-5.2', '0', 200_000],
+  ] as const)(
+    'keeps exact catalog product %s isolated from its suffix sibling',
+    async (model, expectedWire, expectedEnv, expectedWindow) => {
+      const base: ModelDescriptor = {
+        id: 'provider/glm-5.2',
+        displayName: 'GLM base',
+        contextWindow: 200_000,
+        efforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      };
+      const oneMillion: ModelDescriptor = {
+        ...base,
+        id: 'provider/glm-5.2[1m]',
+        displayName: 'GLM 1M product',
+        contextWindow: 1_000_000,
+      };
+      const { handle } = await startRewindableSession({
+        model,
+        additionalModels: [base, oneMillion],
+        resolveVerifiedContextWindow: (_providerId, modelId) => {
+          if (modelId === oneMillion.id) return oneMillion.contextWindow;
+          if (modelId === base.id) return base.contextWindow;
+          return null;
+        },
+      });
+      const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+        options: { model?: string; env?: Record<string, string> };
+      };
+      expect(startArgs.options.model).toBe(expectedWire);
+      expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe(expectedEnv);
+      expect(handle.getUsageSnapshot().contextWindow).toBe(expectedWindow);
+      await handle.close();
+    },
+  );
+
+  it.each([null, 500_000] as const)(
+    'rejects an exact [1m] main product whose provider window is %s',
+    async (exactWindow) => {
+      const exactProduct: ModelDescriptor = {
+        id: 'provider/exact-product[1m]',
+        displayName: 'Exact 1M product',
+        contextWindow: 1_000_000,
+        efforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      };
+      await expect(startRewindableSession({
+        model: exactProduct.id,
+        additionalModels: [exactProduct],
+        resolveVerifiedContextWindow: (_providerId, modelId) =>
+          modelId === exactProduct.id ? exactWindow : null,
+      })).rejects.toThrow('[CLAUDE_CONTEXT_WINDOW_MODEL_UNSAFE]');
+      expect(sdkMock.query).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([null, 500_000] as const)(
+    'rejects switching to an exact [1m] product whose provider window is %s',
+    async (exactWindow) => {
+      const exactProduct: ModelDescriptor = {
+        id: 'provider/exact-switch[1m]',
+        displayName: 'Exact switch product',
+        contextWindow: 1_000_000,
+        efforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      };
+      const { handle, firstQuery } = await startRewindableSession({
+        model: PROVIDER_372K.id,
+        additionalModels: [PROVIDER_372K, exactProduct],
+        resolveVerifiedContextWindow: (_providerId, modelId) => {
+          if (modelId === PROVIDER_372K.id) return PROVIDER_372K.contextWindow;
+          if (modelId === exactProduct.id) return exactWindow;
+          return null;
+        },
+      });
+      await expect(handle.setModel?.(exactProduct.id)).rejects.toThrow(
+        '[CLAUDE_CONTEXT_WINDOW_MODEL_UNSAFE]',
+      );
+      expect(handle.model).toBe(PROVIDER_372K.id);
+      expect(firstQuery.setModel).not.toHaveBeenCalled();
+      await handle.close();
+    },
+  );
+
+  it('denies an unverified exact [1m] subagent product without routing to its sibling', async () => {
+    const exactProduct: ModelDescriptor = {
+      id: 'provider/exact-worker[1m]',
+      displayName: 'Exact worker product',
+      contextWindow: 1_000_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    const first = createFakeQuery();
+    first.supportedAgents.mockResolvedValue([
+      { name: 'exact-worker', description: 'exact product', model: exactProduct.id },
+    ]);
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K, exactProduct],
+      localQueries: [first],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === PROVIDER_372K.id ? PROVIDER_372K.contextWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { settings?: { availableModels?: string[] }; hooks?: TestHookSet };
+    };
+    expect(startArgs.options.settings?.availableModels).toContain(exactProduct.id);
+    expect(startArgs.options.settings?.availableModels).not.toContain('provider/exact-worker');
+    expect(await anyPreToolUseHookDenies(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'exact-worker' },
+    })).toBe(true);
+    await handle.close();
+  });
+
+  it('rebuilds before input when supportedAgents exposes a smaller provider model', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const inventory = [
+      { name: 'general-purpose', description: 'inherits' },
+      { name: 'small-plugin', description: 'plugin worker', model: 'provider/small' },
+    ];
+    first.supportedAgents.mockResolvedValue(inventory);
+    replacement.supportedAgents.mockResolvedValue(inventory);
+
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      systemPrompt: 'stable prefix across inventory correction',
+      additionalModels: [
+        PROVIDER_372K,
+        {
+          id: 'provider/small',
+          displayName: 'Small provider model',
+          contextWindow: 128_000,
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'high',
+        },
+      ],
+      localQueries: [first, replacement],
+    });
+
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(first.send).not.toHaveBeenCalled();
+    expect(replacement.send).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const initialArgs = sdkMock.query.mock.calls[0]?.[0] as { options: Record<string, unknown> };
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as { options: Record<string, unknown> };
+    expect((initialArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('372000');
+    expect((replacementArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('128000');
+    expect(replacementArgs.options.systemPrompt).toEqual(initialArgs.options.systemPrompt);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(128_000);
+
+    await handle.close();
+  });
+
+  it('preserves a provisional candidate after close rejection and retires it before retry build', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const inventory = [
+      { name: 'general-purpose', description: 'inherits' },
+      { name: 'small-plugin', description: 'plugin worker', model: 'provider/small' },
+    ];
+    first.supportedAgents.mockResolvedValue(inventory);
+    replacement.supportedAgents.mockResolvedValue(inventory);
+    first.close.mockRejectedValueOnce(new Error('provisional close not acknowledged'));
+
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [
+        PROVIDER_372K,
+        {
+          id: 'provider/small',
+          displayName: 'Small provider model',
+          contextWindow: 128_000,
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'high',
+        },
+      ],
+      localQueries: [first, replacement],
+    });
+
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+    expect(first.close).toHaveBeenCalledTimes(1);
+    const provisionalArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    expect(provisionalArgs.prompt.pending).toBe(0);
+
+    await handle.send({ type: 'user', content: 'explicit retry after provisional close' });
+    expect(first.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('128000');
+    expect(replacementArgs.prompt.pending).toBe(1);
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('explicit retry after provisional close');
+
+    await handle.close();
+  });
+
+  it('keeps an initial provisional retirement tombstone when desired profile reverts during close failure', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    let workerWindow = 128_000;
+    const inventory = [
+      { name: 'dynamic-worker', description: 'dynamic provider worker', model: 'provider/dynamic-worker' },
+    ];
+    first.supportedAgents.mockResolvedValue(inventory);
+    replacement.supportedAgents.mockResolvedValue(inventory);
+    first.close.mockImplementationOnce(async () => {
+      workerWindow = 500_000;
+      throw new Error('initial provisional close ACK lost');
+    });
+
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first, replacement],
+      resolveVerifiedContextWindow: (_providerId, modelId) => {
+        if (modelId === PROVIDER_372K.id) return PROVIDER_372K.contextWindow;
+        if (modelId === 'provider/dynamic-worker') return workerWindow;
+        return null;
+      },
+    });
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    await handle.send({ type: 'user', content: 'retry reverted initial profile' });
+    expect(first.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    expect(replacementArgs.prompt.pending).toBe(1);
+    await handle.close();
+  });
+
+  it('checks supportedAgents even when a native 1m main model provisionally uses env zero', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const inventory = [
+      { name: 'general-purpose', description: 'inherits' },
+      { name: 'small-plugin', description: 'plugin worker', model: 'provider/small' },
+    ];
+    first.supportedAgents.mockResolvedValue(inventory);
+    replacement.supportedAgents.mockResolvedValue(inventory);
+
+    const { handle } = await startRewindableSession({
+      additionalModels: [{
+        id: 'provider/small',
+        displayName: 'Small provider model',
+        contextWindow: 128_000,
+        efforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      }],
+      localQueries: [first, replacement],
+    });
+
+    expect(first.supportedAgents).toHaveBeenCalledTimes(1);
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(first.send).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const initialArgs = sdkMock.query.mock.calls[0]?.[0] as { options: Record<string, unknown> };
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as { options: Record<string, unknown> };
+    expect((initialArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('0');
+    expect((replacementArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('128000');
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
+
+    await handle.close();
+  });
+
+  it.each(['provider/not-in-catalog', 'provider/not-in-catalog[1m]', 'gpt-5.5', 'deepseek-v4'])(
+    'keeps the main Query usable but denies an unverified custom agent model %s',
+    async (unsafeModel) => {
+    const first = createFakeQuery();
+    first.supportedAgents.mockResolvedValue([
+      { name: 'unknown-plugin', description: 'unknown', model: unsafeModel },
+    ]);
+
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first],
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: {
+        env?: Record<string, string>;
+        hooks?: TestHookSet;
+      };
+    };
+    const { result } = await findDenyingPreToolUseHook(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'unknown-plugin' },
+    });
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    expect(first.close).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+    await handle.close();
+  });
+
+  it('denies a native-shaped custom agent whose verified provider window is below the CLI floor', async () => {
+    const first = createFakeQuery();
+    first.supportedAgents.mockResolvedValue([
+      { name: 'claude-shaped-plugin', description: 'custom provider', model: 'claude-custom' },
+    ]);
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [
+        PROVIDER_372K,
+        {
+          id: 'claude-custom',
+          displayName: 'Custom Claude-shaped model',
+          contextWindow: 128_000,
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'high',
+        },
+      ],
+      localQueries: [first],
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    const { result } = await findDenyingPreToolUseHook(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'claude-shaped-plugin' },
+    });
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(first.close).not.toHaveBeenCalled();
+    await handle.close();
+  });
+
+  it('denies provider-aware custom Claude agent definitions when the base id is unverified', async () => {
+    const first = createFakeQuery();
+    first.supportedAgents.mockResolvedValue([
+      { name: 'custom-claude', description: 'provider definition', model: 'claude-custom' },
+    ]);
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === PROVIDER_372K.id ? PROVIDER_372K.contextWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    expect(await anyPreToolUseHookDenies(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'custom-claude' },
+    })).toBe(true);
+    await handle.close();
+  });
+
+  it('denies a provider-aware forced custom Claude model when its base id is unverified', async () => {
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-custom',
+      additionalModels: [PROVIDER_372K],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === PROVIDER_372K.id ? PROVIDER_372K.contextWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    expect(await anyPreToolUseHookDenies(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'general-purpose' },
+    })).toBe(true);
+    await handle.close();
+  });
+
+  it.each([
+    ['inventory', 1_000_000, false],
+    ['inventory', 500_000, true],
+    ['forced', 1_000_000, false],
+    ['forced', 500_000, true],
+  ] as const)(
+    '%s [1m] subagent uses the verified base-id window %i (denied=%s)',
+    async (source, verifiedSubagentWindow, denied) => {
+      const declaredModel = 'provider/declared[1m]';
+      const first = createFakeQuery();
+      if (source === 'inventory') {
+        first.supportedAgents.mockResolvedValue([
+          { name: 'declared-worker', description: 'wire-suffixed definition', model: declaredModel },
+        ]);
+      }
+      const { handle } = await startRewindableSession({
+        model: PROVIDER_372K.id,
+        ...(source === 'forced' ? { subagentModel: declaredModel } : {}),
+        additionalModels: [PROVIDER_372K],
+        localQueries: [first],
+        resolveVerifiedContextWindow: (_providerId, modelId) => {
+          if (modelId === PROVIDER_372K.id) return PROVIDER_372K.contextWindow;
+          if (modelId === 'provider/declared') return verifiedSubagentWindow;
+          return null;
+        },
+      });
+      const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+        options: { env?: Record<string, string>; hooks?: TestHookSet };
+      };
+      expect(await anyPreToolUseHookDenies(startArgs.options.hooks, {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Agent',
+        tool_input: { subagent_type: source === 'forced' ? 'general-purpose' : 'declared-worker' },
+      })).toBe(denied);
+      expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+      await handle.close();
+    },
+  );
+
+  it('rejects a native-shaped main model whose provider window is below the CLI floor', async () => {
+    await expect(startRewindableSession({
+      model: 'claude-custom',
+      additionalModels: [{
+        id: 'claude-custom',
+        displayName: 'Custom Claude-shaped model',
+        contextWindow: 128_000,
+        efforts: ['low', 'medium', 'high'],
+        defaultEffort: 'high',
+      }],
+    })).rejects.toThrow('[CLAUDE_CONTEXT_WINDOW_MODEL_UNSAFE]');
+    expect(sdkMock.query).not.toHaveBeenCalled();
+  });
+
+  it('uses the intrinsic 200k usage window for an unsuffixed Claude-shaped 372k provider model', async () => {
+    const claudeCustom: ModelDescriptor = {
+      id: 'claude-custom',
+      displayName: 'Custom Claude-shaped model',
+      contextWindow: 372_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    const { handle } = await startRewindableSession({
+      model: claudeCustom.id,
+      additionalModels: [claudeCustom],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === claudeCustom.id ? claudeCustom.contextWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { env?: Record<string, string>; model?: string };
+    };
+    expect(startArgs.options.model).toBe(claudeCustom.id);
+    expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('0');
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
+    await handle.close();
+  });
+
+  it.each(['provider/not-in-catalog', 'provider/not-in-catalog[1m]'])(
+    'keeps the main Query usable but denies all subagents for unverified forced model %s',
+    async (forcedModel) => {
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: forcedModel,
+      additionalModels: [PROVIDER_372K],
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: {
+        env?: Record<string, string>;
+        hooks?: TestHookSet;
+      };
+    };
+    const { result } = await findDenyingPreToolUseHook(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'anything', model: 'sonnet' },
+    });
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(startArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+    await handle.close();
+  });
+
+  it('keeps the main Query usable but denies all subagents when supportedAgents is unavailable', async () => {
+    const first = createFakeQuery();
+    first.supportedAgents.mockRejectedValue(new Error('supportedAgents unavailable'));
+
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first],
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    const { result } = await findDenyingPreToolUseHook(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Task',
+      tool_input: { model: 'sonnet' },
+    });
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(first.close).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+    await handle.close();
+  });
+
+  it('times out a stuck supportedAgents inventory and keeps only the main Query usable', async () => {
+    vi.useFakeTimers();
+    const first = createFakeQuery();
+    first.supportedAgents.mockImplementation(() => new Promise(() => {}));
+
+    const starting = startRewindableSession({
+      model: PROVIDER_372K.id,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first],
+    });
+    await vi.waitFor(() => expect(first.supportedAgents).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(5_000);
+    const { handle } = await starting;
+
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    const { result } = await findDenyingPreToolUseHook(startArgs.options.hooks, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'general-purpose' },
+    });
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+    expect(first.close).not.toHaveBeenCalled();
+    await handle.close();
+  });
+
+  it('keeps subagents denied while a newly verified forced model needs a profile rebuild', async () => {
+    let forcedWindow: number | null = null;
+    const forcedModel = 'provider/dynamic-subagent';
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: forcedModel,
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first, replacement],
+      resolveVerifiedContextWindow: (_providerId, modelId) => {
+        if (modelId === PROVIDER_372K.id) return 372_000;
+        if (modelId === forcedModel) return forcedWindow;
+        return null;
+      },
+    });
+    const initialArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { hooks?: TestHookSet };
+    };
+    const agentInput = {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Agent',
+      tool_input: { subagent_type: 'anything' },
+    };
+    const { hook: guard, result } = await findDenyingPreToolUseHook(
+      initialArgs.options.hooks,
+      agentInput,
+    );
+    const agentCall = [
+      agentInput as never,
+      undefined as never,
+      { signal: new AbortController().signal } as never,
+    ] as const;
+
+    expect(result).toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    forcedWindow = 128_000;
+    await expect(guard(...agentCall)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+
+    await handle.send({ type: 'user', content: 'rebuild before enabling forced subagent' });
+    expect(first.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('128000');
+    await expect(guard(...agentCall)).resolves.toEqual({ continue: true });
+
+    await handle.close();
+  });
+
+  it('keeps a profile-changing model switch lazy, then closes before rebuilding on send', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      systemPrompt: 'stable cache prefix for context-profile rebuild',
+      additionalModels: [PROVIDER_372K],
+    });
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+
+    await handle.setModel?.(PROVIDER_372K.id);
+
+    expect(firstQuery.setModel).not.toHaveBeenCalled();
+    expect(firstQuery.close).not.toHaveBeenCalled();
+
+    await handle.send({ type: 'user', content: 'use the wider provider window' });
+
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      options: { env?: Record<string, string>; resume?: string; systemPrompt?: unknown };
+    };
+    const initialArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { systemPrompt?: unknown };
+    };
+    expect(rebuildArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    expect((rebuildArgs.options as { model?: string }).model).toBe(PROVIDER_372K.id);
+    expect(rebuildArgs.options.systemPrompt).toEqual(initialArgs.options.systemPrompt);
+
+    await handle.close();
+  });
+
+  it('rechecks model generation after replacement replay before accepting input', async () => {
+    const aliasC: ModelDescriptor = {
+      ...PROVIDER_272K,
+      id: 'provider/luna-alias-c',
+      displayName: 'Luna alias C',
+    };
+    const aliasD: ModelDescriptor = {
+      ...PROVIDER_272K,
+      id: 'provider/luna-alias-d',
+      displayName: 'Luna alias D',
+    };
+    const { handle, firstQuery } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, PROVIDER_272K, aliasC, aliasD],
+    });
+    await handle.setModel?.(PROVIDER_272K.id);
+
+    const second = createFakeQuery();
+    let notifyReplayStarted!: () => void;
+    let releaseReplay!: () => void;
+    const replayStarted = new Promise<void>((resolve) => { notifyReplayStarted = resolve; });
+    const replayHold = new Promise<void>((resolve) => { releaseReplay = resolve; });
+    second.setModel.mockImplementationOnce(async () => {
+      notifyReplayStarted();
+      await replayHold;
+    });
+    sdkMock.query.mockImplementationOnce(() => {
+      void handle.setModel?.(aliasC.id);
+      return second;
+    });
+
+    const sendPromise = handle.send({ type: 'user', content: 'latest generation only' });
+    await replayStarted;
+    const postReplayDrift = replayHold.then(() => handle.setModel?.(aliasD.id));
+    releaseReplay();
+    await postReplayDrift;
+    await sendPromise;
+
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    expect(second.setModel).toHaveBeenCalledWith(aliasC.id);
+    expect(second.setModel).toHaveBeenLastCalledWith(aliasD.id);
+    expect(second.close).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const secondArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: Record<string, unknown>;
+    };
+    expect(secondArgs.options.model).toBe(PROVIDER_272K.id);
+    expect(secondArgs.prompt.pending).toBe(1);
+    const promptIter = secondArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('latest generation only');
+    expect(handle.model).toBe(aliasD.id);
+
+    await handle.close();
+  });
+
+  it('does not enqueue converted input after a cross-window switch during acceptance', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, PROVIDER_272K],
+    });
+    let releaseResize!: (path: string) => void;
+    imageResizerMock.process.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { releaseResize = resolve; }),
+    );
+    const sendPromise = handle.send({
+      type: 'user',
+      content: [{ type: 'image', path: path.join(os.tmpdir(), 'slow-profile-switch.png') }],
+    });
+    await vi.waitFor(() => expect(imageResizerMock.process).toHaveBeenCalledTimes(1));
+
+    await handle.setModel?.(PROVIDER_272K.id);
+    releaseResize(path.join(os.tmpdir(), 'slow-profile-switch-resized.png'));
+    await expect(sendPromise).rejects.toThrow(
+      '[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE]',
+    );
+    const initialArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending?: number };
+    };
+    expect(initialArgs.prompt.pending).toBe(0);
+    expect(firstQuery.close).not.toHaveBeenCalled();
+
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+    await handle.send({ type: 'user', content: 'explicit retry after profile switch' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }>;
+      options: Record<string, unknown>;
+    };
+    expect((replacementArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('272000');
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('explicit retry after profile switch');
+
+    await handle.close();
+  });
+
+  it('applies permission, effort, and fast-mode controls while content conversion is awaiting', async () => {
+    const { handle, firstQuery } = await startRewindableSession();
+    let releaseResize!: (path: string) => void;
+    imageResizerMock.process.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { releaseResize = resolve; }),
+    );
+    const sendPromise = handle.send({
+      type: 'user',
+      content: [{ type: 'image', path: path.join(os.tmpdir(), 'slow-runtime-controls.png') }],
+    });
+    await vi.waitFor(() => expect(imageResizerMock.process).toHaveBeenCalledTimes(1));
+
+    await handle.setPermissionMode?.('bypassPermissions');
+    await handle.setEffort?.('low');
+    await handle.setFastMode?.(true);
+    expect(firstQuery.setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
+    expect(firstQuery.applyFlagSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ effortLevel: 'low' }),
+    );
+    expect(firstQuery.applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
+
+    releaseResize(path.join(os.tmpdir(), 'slow-runtime-controls-resized.png'));
+    await sendPromise;
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    expect(startArgs.prompt.pending).toBe(1);
+    await handle.close();
+  });
+
+  it('rejects steer while a cross-window switch is pending, then rebuilds on the next send', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const { handle } = await startRewindableSession({
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first, replacement],
+    });
+    void (async () => {
+      try {
+        for await (const event of handle.events()) void event;
+      } catch {
+        /* ignore */
+      }
+    })();
+    const firstArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+
+    await handle.send({ type: 'user', content: 'active native turn' });
+    expect(firstArgs.prompt.pending).toBe(1);
+    await handle.setModel?.(PROVIDER_372K.id);
+    await expect(
+      handle.steer?.({ type: 'user', content: 'must not enter the old Query' }),
+    ).rejects.toThrow('[CLAUDE_STEER_CONTEXT_PROFILE_PENDING]');
+    expect(firstArgs.prompt.pending).toBe(1);
+
+    first.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 10, output_tokens: 10 },
+    });
+    await vi.waitFor(() => expect(handle.isTurnRunning?.()).toBe(false));
+
+    await handle.send({ type: 'user', content: 'retry as a new turn' });
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+    expect(replacementArgs.prompt.pending).toBe(1);
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('retry as a new turn');
+
+    await handle.close();
+  });
+
+  it('hot-switches provider models that share the same process context profile', async () => {
+    const sameWindowModel: ModelDescriptor = {
+      ...PROVIDER_372K,
+      id: 'provider/terra-alias',
+      displayName: 'Terra Alias',
+    };
+    const { handle, firstQuery } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, sameWindowModel],
+    });
+
+    await handle.setModel?.(sameWindowModel.id);
+
+    expect(firstQuery.setModel).toHaveBeenCalledWith(sameWindowModel.id);
+    expect(firstQuery.close).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    await handle.close();
+  });
+
+  it('does not compact the old Query when a turn selects a smaller process profile', async () => {
+    const provider128: ModelDescriptor = {
+      id: 'provider/small-128k',
+      displayName: 'Small 128k',
+      contextWindow: 128_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const { handle } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, provider128],
+      autoCompactThresholdPct: 50,
+      localQueries: [first, replacement],
+    });
+    void (async () => {
+      try { for await (const _event of handle.events()) { /* drain */ } } catch { /* ignore */ }
+    })();
+    const firstArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+
+    await handle.send({ type: 'user', content: 'wide-model turn' });
+    first.stream.emit({
+      type: 'stream_event',
+      event: { type: 'message_delta', usage: { input_tokens: 100_000, output_tokens: 0 } },
+    });
+    await handle.setModel?.(provider128.id);
+    first.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 100_000, output_tokens: 20 },
+    });
+    await vi.waitFor(() => expect(handle.isTurnRunning?.()).toBe(false));
+    expect(firstArgs.prompt.pending).toBe(1);
+    expect(first.close).not.toHaveBeenCalled();
+    expect(handle.getUsageSnapshot().contextWindow).toBe(372_000);
+
+    await handle.send({ type: 'user', content: 'small-model turn after rebuild' });
+    expect(first.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('128000');
+    expect(replacementArgs.prompt.pending).toBe(2);
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('/compact');
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('small-model turn after rebuild');
+
+    await handle.close();
+  });
+
+  it('refreshes the effective window on same-env hot switches in both directions', async () => {
+    const provider200: ModelDescriptor = {
+      id: 'provider/standard-200k',
+      displayName: 'Provider 200k',
+      contextWindow: 200_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    const { handle, firstQuery } = await startRewindableSession({
+      additionalModels: [provider200],
+    });
+    void (async () => {
+      try { for await (const _event of handle.events()) { /* drain */ } } catch { /* ignore */ }
+    })();
+
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
+    await handle.setModel?.(provider200.id);
+    expect(firstQuery.setModel).toHaveBeenLastCalledWith(provider200.id);
+    expect(firstQuery.close).not.toHaveBeenCalled();
+    await handle.send({ type: 'user', content: 'provider turn' });
+    firstQuery.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 120_000, output_tokens: 20 },
+    });
+    await vi.waitFor(() => expect(handle.isTurnRunning?.()).toBe(false));
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
+
+    await handle.setModel?.('claude-opus-4-6');
+    expect(firstQuery.setModel).toHaveBeenLastCalledWith('claude-opus-4-6[1m]');
+    expect(firstQuery.close).not.toHaveBeenCalled();
+    await handle.send({ type: 'user', content: 'native turn' });
+    firstQuery.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 140_000, output_tokens: 20 },
+    });
+    await vi.waitFor(() => expect(handle.isTurnRunning?.()).toBe(false));
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
+
+    await handle.close();
+  });
+
+  it('synchronizes a changed native wire suffix before accepting catalog-refresh input', async () => {
+    const dynamicModel = 'claude-haiku-dynamic';
+    let verifiedWindow = 1_000_000;
+    const { handle, firstQuery } = await startRewindableSession({
+      model: dynamicModel,
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === dynamicModel ? verifiedWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      options: { model?: string };
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+    expect(startArgs.options.model).toBe(`${dynamicModel}[1m]`);
+
+    verifiedWindow = 200_000;
+    await handle.send({ type: 'user', content: 'after native window downgrade' });
+
+    expect(firstQuery.setModel).toHaveBeenCalledWith(dynamicModel);
+    expect(firstQuery.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      firstQuery.setModel.mock.invocationCallOrder[0],
+    );
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
+    expect(startArgs.prompt.pending).toBe(1);
+    const promptIter = startArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('after native window downgrade');
+    await handle.close();
+  });
+
+  it('keeps catalog-refresh input out when native wire synchronization fails', async () => {
+    const dynamicModel = 'claude-haiku-dynamic';
+    let verifiedWindow = 1_000_000;
+    const { handle, firstQuery } = await startRewindableSession({
+      model: dynamicModel,
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === dynamicModel ? verifiedWindow : null,
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    verifiedWindow = 200_000;
+    firstQuery.setModel.mockRejectedValueOnce(new Error('wire downgrade rejected'));
+
+    await expect(
+      handle.send({ type: 'user', content: 'must not use stale 1m wire' }),
+    ).rejects.toThrow('[CLAUDE_CONTEXT_PROFILE_WIRE_SYNC_FAILED]');
+    expect(startArgs.prompt.pending).toBe(0);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
+    expect(handle.isTurnRunning?.()).toBe(false);
+    await handle.close();
+  });
+
+  it('fails closed when a same-env model switch races a pre-acceptance wire sync', async () => {
+    const dynamicModel = 'claude-haiku-dynamic';
+    let verifiedWindow = 1_000_000;
+    const { handle, firstQuery } = await startRewindableSession({
+      model: dynamicModel,
+      resolveVerifiedContextWindow: (_providerId, modelId) => {
+        if (modelId === dynamicModel) return verifiedWindow;
+        if (modelId === 'claude-sonnet-5') return 500_000;
+        return null;
+      },
+    });
+    const startArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    verifiedWindow = 200_000;
+    let notifyWireSync!: () => void;
+    let releaseWireSync!: () => void;
+    const wireSyncStarted = new Promise<void>((resolve) => { notifyWireSync = resolve; });
+    const wireSyncHold = new Promise<void>((resolve) => { releaseWireSync = resolve; });
+    firstQuery.setModel.mockImplementationOnce(async () => {
+      notifyWireSync();
+      await wireSyncHold;
+    });
+
+    const sendPromise = handle.send({ type: 'user', content: 'racing wire sync' });
+    await wireSyncStarted;
+    await handle.setModel?.('claude-sonnet-5');
+    releaseWireSync();
+    await expect(sendPromise).rejects.toThrow(
+      '[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE]',
+    );
+    expect(startArgs.prompt.pending).toBe(0);
+    expect(firstQuery.setModel).toHaveBeenCalledTimes(1);
+    expect(handle.model).toBe('claude-sonnet-5');
+    await handle.close();
+  });
+
+  it('serializes concurrent same-profile model switches in invocation order', async () => {
+    const aliasB: ModelDescriptor = {
+      ...PROVIDER_272K,
+      id: 'provider/serial-b',
+      displayName: 'Serial B',
+    };
+    const aliasC: ModelDescriptor = {
+      ...PROVIDER_272K,
+      id: 'provider/serial-c',
+      displayName: 'Serial C',
+    };
+    const { handle, firstQuery } = await startRewindableSession({
+      model: PROVIDER_272K.id,
+      additionalModels: [PROVIDER_272K, aliasB, aliasC],
+    });
+    let notifyBStarted!: () => void;
+    let releaseB!: () => void;
+    const bStarted = new Promise<void>((resolve) => { notifyBStarted = resolve; });
+    const bHold = new Promise<void>((resolve) => { releaseB = resolve; });
+    firstQuery.setModel.mockImplementationOnce(async () => {
+      notifyBStarted();
+      await bHold;
+    });
+
+    const switchB = handle.setModel?.(aliasB.id);
+    await bStarted;
+    const switchC = handle.setModel?.(aliasC.id);
+    expect(firstQuery.setModel).toHaveBeenCalledTimes(1);
+    releaseB();
+    await Promise.all([switchB, switchC]);
+
+    expect(firstQuery.setModel.mock.calls.map(([model]) => model)).toEqual([
+      aliasB.id,
+      aliasC.id,
+    ]);
+    expect(handle.model).toBe(aliasC.id);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(PROVIDER_272K.contextWindow);
+    await handle.close();
+  });
+
+  it('retires a Query after a hot setModel ACK failure before accepting more input', async () => {
+    const { handle, firstQuery } = await startRewindableSession();
+    let daemonModel = 'claude-opus-4-6[1m]';
+    firstQuery.setModel.mockImplementationOnce(async (model: string) => {
+      daemonModel = model;
+      throw new Error('setModel ACK lost');
+    });
+    await expect(handle.setModel?.('claude-sonnet-5')).rejects.toThrow('setModel ACK lost');
+    expect(daemonModel).toBe('claude-sonnet-5');
+    expect(handle.model).toBe('claude-opus-4-6');
+
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+    await handle.send({ type: 'user', content: 'only after uncertain Query retirement' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    const firstArgs = sdkMock.query.mock.calls[0]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+    expect(firstArgs.prompt.pending).toBe(0);
+    expect(replacementArgs.prompt.pending).toBe(1);
+    await handle.close();
+  });
+
+  it('keeps an SSH Query retryable after a remote setModel rejection', async () => {
+    const first = createFakeQuery();
+    first.setModel.mockRejectedValueOnce(new Error('remote setModel rejected'));
+    const { handle, remoteStartParams } = await startRewindableSession({
+      remoteHostId: 'ssh-host-1',
+      additionalModels: [PROVIDER_372K],
+      remoteQueries: [first],
+    });
+
+    await expect(handle.setModel?.(PROVIDER_372K.id)).rejects.toThrow(
+      'remote setModel rejected',
+    );
+    expect(handle.model).toBe('claude-opus-4-6');
+
+    await expect(handle.setModel?.(PROVIDER_372K.id)).resolves.toBeUndefined();
+    expect(first.setModel).toHaveBeenCalledTimes(2);
+    expect(first.setModel).toHaveBeenLastCalledWith(PROVIDER_372K.id);
+    expect(handle.model).toBe(PROVIDER_372K.id);
+
+    await handle.send({ type: 'user', content: 'ordinary remote send after explicit retry' });
+    expect(first.close).not.toHaveBeenCalled();
+    expect(remoteStartParams).toHaveLength(1);
+    await handle.close();
+  });
+
+  it('keeps live controls writable while a profile rebuild is only pending', async () => {
+    const first = createFakeQuery();
+    let notifyCloseStarted!: () => void;
+    let releaseClose!: () => void;
+    const closeStarted = new Promise<void>((resolve) => { notifyCloseStarted = resolve; });
+    const closeHold = new Promise<void>((resolve) => { releaseClose = resolve; });
+    first.close.mockImplementationOnce(async () => {
+      notifyCloseStarted();
+      await closeHold;
+    });
+    const replacement = createFakeQuery();
+    const { handle } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K],
+      localQueries: [first, replacement],
+    });
+
+    await handle.setModel?.(PROVIDER_372K.id);
+    expect(first.setModel).not.toHaveBeenCalled();
+
+    await handle.setEffort?.('low');
+    await handle.setFastMode?.(true);
+    await handle.setPermissionMode?.('ask');
+    expect(first.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'low' });
+    expect(first.applyFlagSettings).toHaveBeenCalledWith({ fastMode: true });
+    expect(first.setPermissionMode).toHaveBeenCalledWith('default');
+
+    const oldFlagCallCount = first.applyFlagSettings.mock.calls.length;
+    const oldPermissionCallCount = first.setPermissionMode.mock.calls.length;
+    const send = handle.send({ type: 'user', content: 'send only after retirement' });
+    await closeStarted;
+
+    await handle.setEffort?.('high');
+    await handle.setFastMode?.(false);
+    await handle.setPermissionMode?.('bypassPermissions');
+    expect(first.applyFlagSettings).toHaveBeenCalledTimes(oldFlagCallCount);
+    expect(first.setPermissionMode).toHaveBeenCalledTimes(oldPermissionCallCount);
+
+    releaseClose();
+    await send;
+    expect(first.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      options: {
+        effort?: string;
+        permissionMode?: string;
+        settings?: { fastMode?: boolean };
+      };
+    };
+    expect(replacementArgs.options.effort).toBe('high');
+    expect(replacementArgs.options.permissionMode).toBe('default');
+    expect(replacementArgs.options.settings?.fastMode).toBeUndefined();
+    expect(replacement.applyFlagSettings).toHaveBeenCalledWith({ effortLevel: 'high' });
+    expect(replacement.applyFlagSettings).toHaveBeenCalledWith({ fastMode: false });
+    expect(replacement.setPermissionMode).toHaveBeenCalledWith('bypassPermissions');
+
+    await handle.close();
+  });
+
+  it('coalesces A→B→A before send without spawning an intermediate Query', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      model: PROVIDER_372K.id,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, PROVIDER_272K],
+    });
+
+    await handle.setModel?.(PROVIDER_272K.id);
+    await handle.setModel?.(PROVIDER_372K.id);
+
+    expect(firstQuery.close).not.toHaveBeenCalled();
+    expect(firstQuery.setModel).toHaveBeenCalledWith(PROVIDER_372K.id);
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    await handle.close();
+  });
+
+  it('keeps the context rebuild pending when close fails and retries on the next send', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K],
+    });
+    const replacement = createFakeQuery();
+    firstQuery.close.mockImplementationOnce(() => {
+      throw new Error('remote close not acknowledged');
+    });
+    sdkMock.query.mockReturnValue(replacement);
+
+    await handle.setModel?.(PROVIDER_372K.id);
+    await expect(
+      handle.send({ type: 'user', content: 'first attempt' }),
+    ).rejects.toThrow('remote close not acknowledged');
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    await handle.send({ type: 'user', content: 'retry after close acknowledgement' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+
+    await handle.close();
+  });
+
+  it('does not coalesce back to A after retirement has ended the old input queue', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K],
+    });
+    firstQuery.close.mockRejectedValueOnce(new Error('retirement ACK lost'));
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+
+    await handle.setModel?.(PROVIDER_372K.id);
+    await expect(
+      handle.send({ type: 'user', content: 'failed B attempt' }),
+    ).rejects.toThrow('retirement ACK lost');
+    await handle.setModel?.('claude-opus-4-6');
+
+    await handle.send({ type: 'user', content: 'A only after strict retry' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(2);
+    expect(firstQuery.setModel).not.toHaveBeenCalled();
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('0');
+    expect(replacementArgs.prompt.pending).toBe(1);
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('A only after strict retry');
+    await handle.close();
+  });
+
+  it('tombstones the fifth unstable context candidate and retires it on explicit retry', async () => {
+    const dynamicModel: ModelDescriptor = {
+      id: 'provider/dynamic-rebuild',
+      displayName: 'Dynamic rebuild model',
+      contextWindow: 372_000,
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+    };
+    let verifiedWindow = 372_000;
+    const initial = createFakeQuery();
+    const candidates = Array.from({ length: 6 }, () => createFakeQuery());
+    const { handle } = await startRewindableSession({
+      model: dynamicModel.id,
+      additionalModels: [dynamicModel],
+      localQueries: [initial, ...candidates],
+      resolveVerifiedContextWindow: (_providerId, modelId) =>
+        modelId === dynamicModel.id ? verifiedWindow : null,
+    });
+    verifiedWindow = 272_000;
+    let notifications = 0;
+    setClaudeSupportedModelsListener(() => {
+      notifications += 1;
+      if (notifications <= 5) {
+        verifiedWindow = verifiedWindow === 272_000 ? 128_000 : 272_000;
+      }
+    });
+
+    await expect(
+      handle.send({ type: 'user', content: 'must not enter unstable candidate' }),
+    ).rejects.toThrow('[CLAUDE_CONTEXT_PROFILE_REBUILD_UNSTABLE]');
+    expect(sdkMock.query).toHaveBeenCalledTimes(6);
+    expect(candidates[4].close).not.toHaveBeenCalled();
+    for (let call = 1; call <= 5; call += 1) {
+      const args = sdkMock.query.mock.calls[call]?.[0] as {
+        prompt: AsyncIterable<unknown> & { pending: number };
+      };
+      expect(args.prompt.pending).toBe(0);
+    }
+
+    await handle.send({ type: 'user', content: 'stable explicit retry' });
+    expect(candidates[4].close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(7);
+    const stableArgs = sdkMock.query.mock.calls[6]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(stableArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('128000');
+    expect(stableArgs.prompt.pending).toBe(1);
+    const promptIter = stableArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('stable explicit retry');
+    await handle.close();
+  });
+
+  it('blocks a rewind replacement until a failed close succeeds on explicit retry', async () => {
+    const { handle, firstQuery } = await startRewindableSession();
+    firstQuery.close.mockRejectedValueOnce(new Error('rewind close not acknowledged'));
+
+    await expect(
+      handle.commitRewindFiles?.('user-uuid-1', 'assistant-uuid-1'),
+    ).rejects.toThrow('rewind close not acknowledged');
+    expect(sdkMock.query).toHaveBeenCalledTimes(1);
+
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+    await handle.send({ type: 'user', content: 'explicit retry after rewind close' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const retryArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      options: Record<string, unknown>;
+      prompt: AsyncIterable<{ message?: { content?: unknown } }>;
+    };
+    expect(retryArgs.options.resumeSessionAt).toBe('assistant-uuid-1');
+    expect(retryArgs.options.forkSession).toBe(true);
+    const promptIter = retryArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('explicit retry after rewind close');
+
+    await handle.close();
+  });
+
+  it('retries an unacknowledged provisional rewind candidate before creating its successor', async () => {
+    const initial = createFakeQuery();
+    const provisional = createFakeQuery();
+    const replacement = createFakeQuery();
+    const smallInventory = [
+      { name: 'small-plugin', description: 'small provider worker', model: 'provider/small' },
+    ];
+    provisional.supportedAgents.mockResolvedValue(smallInventory);
+    replacement.supportedAgents.mockResolvedValue(smallInventory);
+    provisional.close.mockRejectedValueOnce(new Error('provisional rewind close not acknowledged'));
+
+    const { handle } = await startRewindableSession({
+      additionalModels: [
+        PROVIDER_372K,
+        {
+          id: 'provider/small',
+          displayName: 'Small provider model',
+          contextWindow: 128_000,
+          efforts: ['low', 'medium', 'high'],
+          defaultEffort: 'high',
+        },
+      ],
+      localQueries: [initial, provisional, replacement],
+    });
+    await handle.commitRewindFiles?.('user-uuid-1', 'assistant-uuid-1');
+    await handle.setModel?.(PROVIDER_372K.id);
+
+    await expect(
+      handle.send({ type: 'user', content: 'first rewind attempt' }),
+    ).rejects.toThrow('[CLAUDE_CONTEXT_PROFILE_CANDIDATE_CLOSE_FAILED]');
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    expect(provisional.close).toHaveBeenCalledTimes(1);
+    const provisionalArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    expect(provisionalArgs.prompt.pending).toBe(0);
+
+    await handle.send({ type: 'user', content: 'explicit retry after provisional rewind close' });
+    expect(provisional.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(3);
+    const replacementArgs = sdkMock.query.mock.calls[2]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+      options: { env?: Record<string, string> };
+    };
+    expect(replacementArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('128000');
+    expect(replacementArgs.prompt.pending).toBe(1);
+    const promptIter = replacementArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('explicit retry after provisional rewind close');
+
+    await handle.close();
+  });
+
+  it('keeps the context rebuild pending when Query creation fails and retries without replaying input', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K],
+    });
+    const replacement = createFakeQuery();
+    sdkMock.query
+      .mockImplementationOnce(() => {
+        throw new Error('replacement Query failed to start');
+      })
+      .mockReturnValue(replacement);
+
+    await handle.setModel?.(PROVIDER_372K.id);
+    await expect(
+      handle.send({ type: 'user', content: 'must not be replayed' }),
+    ).rejects.toThrow('replacement Query failed to start');
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+
+    await handle.send({ type: 'user', content: 'explicit retry' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(2);
+    expect(sdkMock.query).toHaveBeenCalledTimes(3);
+    const retryArgs = sdkMock.query.mock.calls[2]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }>;
+      options: { env?: Record<string, string> };
+    };
+    expect(retryArgs.options.env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('372000');
+    const promptIter = retryArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content).toBe('explicit retry');
+
+    await handle.close();
+  });
+
+  it('leaves SSH MAX_CONTEXT unmanaged and preserves the existing hot-switch path', async () => {
+    const first = createFakeQuery();
+    const { handle, remoteStartParams } = await startRewindableSession({
+      remoteHostId: 'ssh-host-1',
+      additionalModels: [PROVIDER_372K],
+      remoteQueries: [first],
+    });
+
+    await handle.setModel?.(PROVIDER_372K.id);
+
+    expect(remoteStartParams).toHaveLength(1);
+    expect(
+      (remoteStartParams[0]?.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS,
+    ).toBeUndefined();
+    expect(first.setModel).toHaveBeenCalledWith(PROVIDER_372K.id);
+    expect(first.close).not.toHaveBeenCalled();
+    expect(handle.getUsageSnapshot().contextWindow).toBe(372_000);
+
+    await handle.close();
+  });
+
+  it('rebuilds when a newly selected provider model needs a different process profile', async () => {
+    const first = createFakeQuery();
+    const replacement = createFakeQuery();
+    const { handle, firstQuery, agent } = await startRewindableSession({
+      localQueries: [first, replacement],
+    });
 
     agent.capabilities.availableModels.push({
       id: 'x-ai/grok-4.6',
@@ -305,14 +1845,14 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
 
     await handle.setModel?.('x-ai/grok-4.6');
+    expect(firstQuery.setModel).not.toHaveBeenCalled();
+    await handle.send({ type: 'user', content: 'switch to grok' });
 
-    expect(firstQuery.applyFlagSettings).toHaveBeenCalledWith({
-      availableModels: ['claude-opus-4-6[1m]', 'claude-sonnet-5', 'x-ai/grok-4.6'],
-    });
-    expect(firstQuery.setModel).toHaveBeenCalledWith('x-ai/grok-4.6');
-    expect(firstQuery.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
-      firstQuery.setModel.mock.invocationCallOrder[0],
-    );
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as { options: Record<string, unknown> };
+    expect((rebuildArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('256000');
     expect(handle.getUsageSnapshot().contextWindow).toBe(256_000);
 
     await handle.close();
@@ -333,7 +1873,7 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     });
 
     const agent = new ClaudeCodeAgent({
-      ...createDeps(),
+      ...createDeps({ subagentModel: 'claude-haiku-4-5' }),
       capabilityAdditions: {
         availableModels: [
           ...TEST_MODELS,
@@ -358,6 +1898,13 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     await handle.setModel?.('shared-model', { providerId: 'xd' });
 
     expect(resolveVerifiedContextWindow).toHaveBeenCalledWith('xd', 'shared-model');
+    // The selected profile is pending; usage still describes the live Query.
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
+
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+    await handle.send({ type: 'user', content: 'apply provider-specific profile' });
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
     expect(handle.getUsageSnapshot().contextWindow).toBe(256_000);
 
     await handle.close();
@@ -396,12 +1943,12 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
       permissionMode: 'acceptEdits',
     });
 
-    expect(handle.getUsageSnapshot().contextWindow).toBe(0);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
 
     await handle.setModel?.('shared-model', { providerId: 'xd' });
 
     expect(resolveVerifiedContextWindow).toHaveBeenCalledWith('xd', 'shared-model');
-    expect(handle.getUsageSnapshot().contextWindow).toBe(0);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(200_000);
 
     await handle.close();
   });
@@ -531,6 +2078,30 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     await handle.close();
   });
 
+  it('merges a pending context-profile change into the rewind three-part rebuild', async () => {
+    const { handle } = await startRewindableSession({
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K],
+    });
+    await handle.commitRewindFiles?.('user-uuid-1', 'assistant-uuid-1');
+    await handle.setModel?.(PROVIDER_372K.id);
+
+    const replacement = createFakeQuery();
+    sdkMock.query.mockReturnValue(replacement);
+    await handle.send({ type: 'user', content: 'rewind with the new context profile' });
+
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      options: Record<string, unknown>;
+    };
+    expect(rebuildArgs.options.resumeSessionAt).toBe('assistant-uuid-1');
+    expect(rebuildArgs.options.forkSession).toBe(true);
+    expect((rebuildArgs.options.env as Record<string, string>).CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+      .toBe('372000');
+
+    await handle.close();
+  });
+
   it('setPlanMode armed during rewind window does not throw and rebuild starts in plan mode', async () => {
     const { handle, firstQuery } = await startRewindableSession();
 
@@ -582,6 +2153,91 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
       secondQuery.setModel.mock.invocationCallOrder[0],
     );
 
+    await handle.close();
+  });
+
+  it('fails before input when same-env model replay on a replacement Query is rejected', async () => {
+    const { handle, firstQuery } = await startRewindableSession();
+    await handle.commitRewindFiles?.('user-uuid-1', 'assistant-uuid-1');
+
+    const secondQuery = createFakeQuery();
+    secondQuery.setModel.mockRejectedValueOnce(new Error('replacement rejected setModel'));
+    sdkMock.query.mockReturnValue(secondQuery);
+    const sendPromise = handle.send({ type: 'user', content: 'must stay out of replacement' });
+    await expect(handle.setModel?.('claude-sonnet-5')).resolves.toBeUndefined();
+    expect(firstQuery.setModel).not.toHaveBeenCalled();
+
+    await expect(sendPromise).rejects.toThrow('[CLAUDE_CONTEXT_PROFILE_REPLAY_MODEL_FAILED]');
+    const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending?: number };
+    };
+    expect(rebuildArgs.prompt.pending).toBe(0);
+    expect(secondQuery.send).not.toHaveBeenCalled();
+    expect(handle.isTurnRunning?.()).toBe(false);
+
+    const thirdQuery = createFakeQuery();
+    sdkMock.query.mockReturnValue(thirdQuery);
+    await handle.send({ type: 'user', content: 'explicit retry keeps rewind intent' });
+    expect(secondQuery.close).toHaveBeenCalledTimes(1);
+    expect(sdkMock.query).toHaveBeenCalledTimes(3);
+    const retryArgs = sdkMock.query.mock.calls[2]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }>;
+      options: Record<string, unknown>;
+    };
+    expect(retryArgs.options.resumeSessionAt).toBe('assistant-uuid-1');
+    expect(retryArgs.options.forkSession).toBe(true);
+    const promptIter = retryArgs.prompt[Symbol.asyncIterator]();
+    expect((await promptIter.next()).value?.message?.content)
+      .toBe('explicit retry keeps rewind intent');
+
+    await handle.close();
+  });
+
+  it('fails before input when replacement replay rejects effort drift', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      additionalModels: [PROVIDER_372K],
+    });
+    await handle.setModel?.(PROVIDER_372K.id);
+    const replacement = createFakeQuery();
+    replacement.applyFlagSettings.mockRejectedValueOnce(new Error('replacement rejected effort'));
+    sdkMock.query.mockImplementationOnce(() => {
+      void handle.setEffort?.('low');
+      return replacement;
+    });
+
+    await expect(
+      handle.send({ type: 'user', content: 'must stay outside failed effort replay' }),
+    ).rejects.toThrow('[CLAUDE_RUNTIME_REPLAY_EFFORT_FAILED]');
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    expect(replacementArgs.prompt.pending).toBe(0);
+    expect(handle.isTurnRunning?.()).toBe(false);
+    await handle.close();
+  });
+
+  it('fails before input when replacement replay rejects fast-mode drift', async () => {
+    const { handle, firstQuery } = await startRewindableSession({
+      additionalModels: [PROVIDER_372K],
+    });
+    await handle.setModel?.(PROVIDER_372K.id);
+    const replacement = createFakeQuery();
+    replacement.applyFlagSettings.mockRejectedValueOnce(new Error('replacement rejected fast mode'));
+    sdkMock.query.mockImplementationOnce(() => {
+      void handle.setFastMode?.(true);
+      return replacement;
+    });
+
+    await expect(
+      handle.send({ type: 'user', content: 'must stay outside failed fast-mode replay' }),
+    ).rejects.toThrow('[CLAUDE_RUNTIME_REPLAY_FAST_MODE_FAILED]');
+    expect(firstQuery.close).toHaveBeenCalledTimes(1);
+    const replacementArgs = sdkMock.query.mock.calls[1]?.[0] as {
+      prompt: AsyncIterable<unknown> & { pending: number };
+    };
+    expect(replacementArgs.prompt.pending).toBe(0);
+    expect(handle.isTurnRunning?.()).toBe(false);
     await handle.close();
   });
 
@@ -683,7 +2339,7 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
 
     await expect(handle.setModel?.('claude-sonnet-5')).resolves.toBeUndefined();
 
-    expect(handle.getUsageSnapshot().contextWindow).toBe(500_000);
+    expect(handle.getUsageSnapshot().contextWindow).toBe(1_000_000);
     // 修复前这里会立即注入 /compact 到即将被重建丢弃的 inputQueue, 并把 turnInFlight 置 true。
     expect(handle.isTurnRunning?.()).toBe(false);
 
@@ -793,6 +2449,7 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     const { handle, firstQuery, infoCalls } = await startRewindableSession({
       autoCompactThresholdPct: 50,
       remoteHostId: 'remote-1',
+      model: 'claude-sonnet-5',
       shouldHandoffAfterContextAssessment: () => true,
     });
     void (async () => {
@@ -813,10 +2470,16 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
       usage: { input_tokens: 400_000, output_tokens: 20 },
     });
     await vi.waitFor(() => {
-      expect(handle.isTurnRunning?.()).toBe(false);
+      expect(infoCalls.filter((message) => message === 'auto-compact triggered')).toHaveLength(1);
     });
+    firstQuery.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 20_000, output_tokens: 20 },
+    });
+    await vi.waitFor(() => expect(handle.isTurnRunning?.()).toBe(false));
 
-    await handle.setModel?.('claude-sonnet-5');
     expect(handle.getUsageSnapshot().contextWindow).toBe(500_000);
     expect(infoCalls.filter((message) => message === 'auto-compact triggered')).toEqual([
       'auto-compact triggered',
@@ -1775,6 +3438,76 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
 
     await handle.close();
   });
+
+  it('keeps an abandoned context-profile bridge tombstoned across a same-env model switch', async () => {
+    const sameProfileAlias: ModelDescriptor = {
+      ...PROVIDER_372K,
+      id: 'provider/terra-alias',
+      displayName: 'Terra alias',
+    };
+    const first = createFakeQuery();
+    const second = createFakeQuery();
+    let releaseClose!: () => void;
+    const closeAck = new Promise<void>((resolve) => { releaseClose = resolve; });
+    second.close.mockImplementationOnce(() => closeAck);
+    const third = createFakeQuery();
+    const { handle } = await startRewindableSession({
+      autoCompactThresholdPct: 50,
+      subagentModel: 'claude-haiku-4-5',
+      additionalModels: [PROVIDER_372K, sameProfileAlias],
+      localQueries: [first, second, third],
+    });
+
+    await handle.send({ type: 'user', content: 'establish usage before profile switch' });
+    first.stream.emit({
+      type: 'stream_event',
+      event: { type: 'message_delta', usage: { input_tokens: 250_000, output_tokens: 0 } },
+    });
+    first.stream.emit({
+      type: 'result',
+      stop_reason: 'end_turn',
+      total_cost_usd: 0,
+      usage: { input_tokens: 250_000, output_tokens: 20 },
+    });
+    await vi.waitFor(() => {
+      expect(handle.isTurnRunning?.()).toBe(false);
+      expect(handle.getUsageSnapshot().contextTokens).toBe(250_000);
+    });
+    await handle.setModel?.(PROVIDER_372K.id);
+    imageResizerMock.process.mockRejectedValueOnce(new Error('profile bridge resize failed'));
+
+    await expect(
+      handle.send({
+        type: 'user',
+        content: [{ type: 'image', path: path.join(os.tmpdir(), 'profile-bridge.png') }],
+      }),
+    ).rejects.toThrow('profile bridge resize failed');
+    expect(second.close).toHaveBeenCalledTimes(1);
+
+    await handle.setModel?.(sameProfileAlias.id);
+    expect(second.setModel).not.toHaveBeenCalled();
+
+    const retry = handle.send({ type: 'user', content: 'retry after profile bridge close ACK' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sdkMock.query).toHaveBeenCalledTimes(2);
+    expect(second.close).toHaveBeenCalledTimes(1);
+
+    releaseClose();
+    await retry;
+    expect(sdkMock.query).toHaveBeenCalledTimes(3);
+    const retryArgs = sdkMock.query.mock.calls[2]?.[0] as {
+      options: { model?: string };
+      prompt: AsyncIterable<{ message?: { content?: unknown } }>;
+    };
+    expect(retryArgs.options.model).toBe(sameProfileAlias.id);
+    const retryPrompt = retryArgs.prompt[Symbol.asyncIterator]();
+    expect((await retryPrompt.next()).value?.message?.content).toBe('/compact');
+    expect((await retryPrompt.next()).value?.message?.content)
+      .toBe('retry after profile bridge close ACK');
+
+    await handle.close();
+  });
+
   it('send failure after bridge compact has already ended still cancels bridge query', async () => {
     // 反馈原型 (Codex review 3539298190): /compact result 可能先于图片/文件
     // content conversion 失败到达,此时 queuedBridgeTurns 已被 onTurnEnd 消费为 0,
@@ -2363,11 +4096,10 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     await handle.close();
   });
 
-  it('cancels a post-rebuild send if Stop arrives during accept replay', async () => {
-    // 反馈原型 (Codex review 3541310178): rebuild 后 turnInFlight/status 已登记,
-    // acceptingRebuiltSend 的第二轮 runtime drift replay 仍可能 await control request。
-    // 此时 Stop 若让 send 在真实用户输入 push 前 reject,必须补齐 terminal boundary,
-    // 否则 isTurnRunning 会永久停在 true。
+  it('cancels replacement stabilization before starting a turn', async () => {
+    // Replacement stabilization can still be awaiting a control mutation before the
+    // user input is accepted. Stop must retire that candidate without creating a
+    // synthetic product turn or leaking the rejected input into the next Query.
     const { handle } = await startRewindableSession();
     const events: AgentEvent[] = [];
     void (async () => {
@@ -2377,31 +4109,48 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
     await handle.commitRewindFiles?.('user-uuid-1', 'assistant-uuid-1');
 
     const secondQuery = createFakeQuery();
-    let setModelCalls = 0;
+    const thirdQuery = createFakeQuery();
+    let resolveFirstReplay!: () => void;
+    let notifyFirstReplayStarted!: () => void;
     let resolveAcceptReplay!: () => void;
     let notifyAcceptReplayStarted!: () => void;
+    const firstReplayStarted = new Promise<void>((resolve) => { notifyFirstReplayStarted = resolve; });
+    const firstReplayHold = new Promise<void>((resolve) => { resolveFirstReplay = resolve; });
     const acceptReplayStarted = new Promise<void>((resolve) => { notifyAcceptReplayStarted = resolve; });
     const acceptReplayHold = new Promise<void>((resolve) => { resolveAcceptReplay = resolve; });
+    let setModelCalls = 0;
     secondQuery.setModel.mockImplementation(async () => {
       setModelCalls += 1;
-      if (setModelCalls <= 5) {
-        throw new Error('temporary replay failure');
+      if (setModelCalls === 1) {
+        notifyFirstReplayStarted();
+        await firstReplayHold;
+        return;
       }
       notifyAcceptReplayStarted();
       await acceptReplayHold;
     });
-    sdkMock.query.mockImplementationOnce(() => {
-      void handle.setModel?.('claude-sonnet-5');
-      return secondQuery;
-    });
+    sdkMock.query
+      .mockImplementationOnce(() => {
+        void handle.setModel?.('claude-sonnet-5');
+        return secondQuery;
+      })
+      .mockReturnValue(thirdQuery);
     const controller = new AbortController();
 
     const sendPromise = handle.send(
       { type: 'user', content: 'cancel during accept replay' },
       { signal: controller.signal },
     );
+    await firstReplayStarted;
+    resolveFirstReplay();
+    // The replay continuation runs first, then this microtask changes mutable
+    // state while the outer send is yielding at its final rebuild barrier.
+    // That creates genuine drift for the separate acceptance replay.
+    queueMicrotask(() => {
+      queueMicrotask(() => { void handle.setModel?.('claude-opus-4-6'); });
+    });
     await acceptReplayStarted;
-    expect(handle.isTurnRunning?.()).toBe(true);
+    expect(handle.isTurnRunning?.()).toBe(false);
 
     controller.abort();
     await handle.abort();
@@ -2409,20 +4158,20 @@ describe('ClaudeCodeAgent runtime settings during rewind window', () => {
 
     await expect(sendPromise).rejects.toThrow('Claude send cancelled before acceptance');
     expect(handle.isTurnRunning?.()).toBe(false);
-    await vi.waitFor(() => {
-      expect(
-        events.some((e) => e.type === 'done' && (e.data as { reason?: string }).reason === 'send_cancelled_before_acceptance'),
-      ).toBe(true);
-    });
-    expect(secondQuery.close).not.toHaveBeenCalled();
+    expect(events.some((e) => e.type === 'done')).toBe(false);
+    expect(secondQuery.close).toHaveBeenCalledTimes(1);
 
     const rebuildArgs = sdkMock.query.mock.calls[1]?.[0] as {
       prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
     };
     expect(rebuildArgs.prompt.pending).toBe(0);
     await handle.send({ type: 'user', content: 'next after accept replay cancellation' });
-    expect(sdkMock.query).toHaveBeenCalledTimes(2);
-    const promptIter = rebuildArgs.prompt[Symbol.asyncIterator]();
+    expect(sdkMock.query).toHaveBeenCalledTimes(3);
+    const retryArgs = sdkMock.query.mock.calls[2]?.[0] as {
+      prompt: AsyncIterable<{ message?: { content?: unknown } }> & { pending: number };
+    };
+    expect(retryArgs.prompt.pending).toBe(1);
+    const promptIter = retryArgs.prompt[Symbol.asyncIterator]();
     expect((await promptIter.next()).value?.message?.content).toBe('next after accept replay cancellation');
 
     await handle.close();

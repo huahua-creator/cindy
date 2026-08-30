@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  buildClaudeSubagentContextWindowGuardHooks,
   buildClaudeSubagentModelGuardHooks,
   effectiveClaudeSubagentModel,
 } from '../subagent-model-access.js';
@@ -88,5 +89,73 @@ describe('Claude subagent model access guard', () => {
     expect(effectiveClaudeSubagentModel(undefined, 'Agent', {})).toBeUndefined();
     expect(effectiveClaudeSubagentModel(undefined, 'Task', { model: 'inherit' })).toBeUndefined();
     expect(effectiveClaudeSubagentModel(undefined, 'Read', { model: 'sonnet' })).toBeUndefined();
+  });
+});
+
+describe('Claude subagent context-window guard', () => {
+  const hookFor = (snapshot: Parameters<typeof buildClaudeSubagentContextWindowGuardHooks>[0]) => {
+    const hook = buildClaudeSubagentContextWindowGuardHooks(snapshot)
+      .PreToolUse?.[0]?.hooks[0];
+    if (!hook) throw new Error('expected subagent context-window guard');
+    return hook;
+  };
+
+  it('blocks only an unsafe named definition and allows a native model override', async () => {
+    const hook = hookFor(() => ({
+      status: 'ready',
+      unsafeAgentNames: ['small-plugin'],
+    }));
+    const context = { signal: new AbortController().signal };
+
+    await expect(hook({
+      ...agentInput(),
+      tool_input: { subagent_type: 'small-plugin' },
+    }, undefined, context)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(hook({
+      ...agentInput(),
+      tool_input: { subagent_type: 'small-plugin', model: 'sonnet' },
+    }, undefined, context)).resolves.toEqual({ continue: true });
+    await expect(hook({
+      ...agentInput(),
+      tool_input: { subagent_type: 'small-plugin', model: 'claude-custom' },
+    }, undefined, context)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+  });
+
+  it('blocks every Agent/Task when inventory or the forced model is unsafe', async () => {
+    const context = { signal: new AbortController().signal };
+    const unavailable = hookFor(() => ({ status: 'inventory-unavailable' }));
+    const forcedUnknown = hookFor(() => ({
+      status: 'forced-model-unknown',
+      model: 'provider/unknown',
+    }));
+
+    await expect(unavailable(agentInput('sonnet'), undefined, context)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await expect(forcedUnknown(agentInput('sonnet'), undefined, context)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    const transition = hookFor(() => ({ status: 'profile-transition' }));
+    await expect(transition(agentInput('sonnet'), undefined, context)).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+  });
+
+  it('uses general-purpose for an omitted subagent_type', async () => {
+    const hook = hookFor(() => ({
+      status: 'ready',
+      unsafeAgentNames: ['general-purpose'],
+    }));
+    await expect(hook(
+      agentInput(),
+      undefined,
+      { signal: new AbortController().signal },
+    )).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
   });
 });

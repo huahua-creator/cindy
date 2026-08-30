@@ -47,8 +47,11 @@ import {
   type ResolveSubagentModelDefaultResult,
 } from './subagent-model-default.js';
 import {
+  buildClaudeSubagentContextWindowGuardHooks,
   buildClaudeSubagentModelGuardHooks,
 } from './subagent-model-access.js';
+
+const CLAUDE_SUPPORTED_AGENTS_TIMEOUT_MS = 5_000;
 import Anthropic, { APIError } from '@anthropic-ai/sdk';
 
 import {
@@ -106,10 +109,17 @@ import { formatManagedImageReferences } from '../shared/managed-image-reference.
 import { pickTurnStartStatus, type OneShotState } from '../shared/turn-start-phrases.js';
 import { ToolLoopGuard } from '../shared/loop-guard.js';
 import {
+  applyClaudeContextWindowProfileEnv,
   applyOAuthSpawnEntrypointGate,
   applySubagentModelEnv,
   buildClaudeEnv,
+  isClaudeCodeIntrinsicWindowSafe,
+  isClaudeCodeNativeModelAlias,
+  isNativeClaudeModel,
   REMOTE_ROUTE_OVERRIDE_ENV_KEYS,
+  resolveClaudeContextWindowProfile,
+  stripClaudeCodeOneMillionSuffix,
+  type ClaudeContextWindowProfile,
 } from './env-builder.js';
 import { buildClaudeFlagSettings } from './flag-settings.js';
 import {
@@ -896,13 +906,51 @@ export class ClaudeCodeAgent extends BaseAgent {
    * catalog id → SDK wire 串,[1m] 由目录 contextWindow 驱动(见 toSdkModelString)。
    * 模型不在 capabilities(目录外/host 未注入)时窗口传 undefined → 走 legacy 兜底链。
    */
-  private sdkModelFor(model: string): string {
-    const descriptor = this.capabilities.availableModels.find((m) => m.id === model);
-    const window =
-      descriptor && Number.isFinite(descriptor.contextWindow) && descriptor.contextWindow > 0
-        ? descriptor.contextWindow
-        : undefined;
-    return toSdkModelString(model, window);
+  private verifiedContextWindowFor(model: string, providerId: string | null): number | undefined {
+    const normalizedModel = model.trim();
+    const bareModel = stripClaudeCodeOneMillionSuffix(normalizedModel);
+    const exactDescriptor = this.capabilities.availableModels.find((m) => m.id === normalizedModel);
+    const resolveVerified = this.deps.resolveVerifiedContextWindow;
+    if (resolveVerified) {
+      const exact = resolveVerified(providerId, normalizedModel);
+      if (typeof exact === 'number' && Number.isFinite(exact) && exact > 0) return exact;
+      // A `[1m]` id present in the catalog is an independent product: null is
+      // authoritative and must not borrow a sibling's window. Only a raw SDK
+      // wire suffix absent from the catalog may normalize to its base id.
+      if (bareModel !== normalizedModel && !exactDescriptor) {
+        const base = resolveVerified(providerId, bareModel);
+        if (typeof base === 'number' && Number.isFinite(base) && base > 0) return base;
+      }
+      return undefined;
+    }
+    const descriptor = exactDescriptor
+      ?? (bareModel !== normalizedModel
+        ? this.capabilities.availableModels.find((m) => m.id === bareModel)
+        : undefined);
+    return descriptor && Number.isFinite(descriptor.contextWindow) && descriptor.contextWindow > 0
+      ? descriptor.contextWindow
+      : undefined;
+  }
+
+  private sdkModelFor(model: string, providerId: string | null): string {
+    const normalizedModel = model.trim();
+    const resolveVerified = this.deps.resolveVerifiedContextWindow;
+    const verified = this.verifiedContextWindowFor(normalizedModel, providerId);
+    if (
+      normalizedModel.endsWith('[1m]')
+      && this.capabilities.availableModels.some((descriptor) => descriptor.id === normalizedModel)
+    ) {
+      // An exact suffixed catalog id is a distinct product, never a formatting
+      // hint. Preserve its identity; safety checks reject null/<1M routes.
+      return normalizedModel;
+    }
+    if (resolveVerified && !(typeof verified === 'number' && Number.isFinite(verified) && verified > 0)) {
+      // A provider-aware resolver returning null is an explicit "unverified",
+      // not permission to reuse a flattened catalog entry or legacy [1m]
+      // heuristic. Keep the wire model on the native 200k-safe branch.
+      return toSdkModelString(normalizedModel, 200_000);
+    }
+    return toSdkModelString(normalizedModel, verified);
   }
 
   /**
@@ -1155,9 +1203,16 @@ export class ClaudeCodeAgent extends BaseAgent {
       authState.authSource,
     );
 
+    // 运行时模型 / 来源要在 wire-model resolver 之前声明:同一个 catalog id 在不同
+    // provider 下可能有不同窗口，[1m] 选择与 MAX_CONTEXT profile 必须读同一来源事实。
+    let mutableModel = opts.model;
+    let mutableProviderId = opts.providerId ?? null;
+    let modelSelectionGeneration = 0;
+
     // 箭头别名捕获 this —— 下方 replayRuntimeDrift(普通 function)与 handle 对象
     // 字面量方法里没有类实例 this,统一经它取 wire 串。
-    const sdkModelFor = (model: string): string => this.sdkModelFor(model);
+    const sdkModelFor = (model: string, providerId: string | null = mutableProviderId): string =>
+      this.sdkModelFor(model, providerId);
     const resolveRemoteClaudeRoute = this.deps.resolveRemoteClaudeRoute?.bind(this.deps);
     const getAuthEnv = this.deps.auth.getAuthEnv.bind(this.deps.auth);
     const sdkModel = sdkModelFor(opts.model);
@@ -1213,12 +1268,13 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 子进程真正会用的那份 env —— CLAUDE_CONFIG_DIR 在里面。
           env,
         });
-        subagentDefault = resolveSubagentModelDefault({
+        const resolvedSubagentDefault = resolveSubagentModelDefault({
           configuredDefault: configuredSubagentDefault,
           discovered,
           // 校验 agent 声明的 model 是否真的可用 —— 清单就是 host 从目录派生的那份。
           availableModelIds: this.capabilities.availableModels.map((m) => m.id),
         });
+        subagentDefault = resolvedSubagentDefault;
         for (const d of subagentDefault.diagnostics) {
           log.warn('subagent model diagnostic', { ...d });
         }
@@ -1239,9 +1295,16 @@ export class ClaudeCodeAgent extends BaseAgent {
     // 只负责展示，不参与 deny；账号切换时 resolver 会立即看到新快照或 unknown。
     const resolveSubagentModelAccess = this.deps.resolveClaudeSubagentModelAccess
       ? (model: string) => this.deps.resolveClaudeSubagentModelAccess!({
-          providerId: opts.providerId ?? null,
-          parentModel: opts.model,
-          credentialMode: effectiveCredentialMode,
+          providerId: mutableProviderId,
+          parentModel: mutableModel,
+          credentialMode: resolveEffectiveCredentialModeFromAuthSource(
+            resolveAgentCredentialMode({
+              agentKind: 'claude-code',
+              providerId: mutableProviderId,
+              model: mutableModel,
+            }),
+            authState.authSource,
+          ),
           model,
         })
       : undefined;
@@ -1533,6 +1596,63 @@ export class ClaudeCodeAgent extends BaseAgent {
     // which do not call handle.send again. The next explicit send replaces it.
     let activeTurnPermissionPolicy: TurnPermissionPolicy | null = null;
     let activeCapabilitySelectionText = '';
+    type SupportedAgentInventory =
+      | 'unresolved'
+      | 'unavailable'
+      | Array<{ name: string; model?: string }>;
+    // Populated from each local candidate's final SDK/settings view before
+    // that Query can accept input. The hook reads this live snapshot so an
+    // unknown definition disables only the risky Agent/Task action.
+    let supportedAgentInventory: SupportedAgentInventory = 'unresolved';
+    const isVerifiedSubagentContextWindowSafe = (
+      model: string,
+      verifiedWindow: number | undefined,
+    ): boolean => {
+      if (verifiedWindow !== undefined) {
+        return isClaudeCodeIntrinsicWindowSafe(model, verifiedWindow);
+      }
+      if (this.deps.resolveVerifiedContextWindow) {
+        return !model.trim().toLowerCase().endsWith('[1m]')
+          && isClaudeCodeNativeModelAlias(model);
+      }
+      return isNativeClaudeModel(model);
+    };
+    function currentSubagentContextSafety() {
+      // SSH does not participate in MAX_CONTEXT synchronization yet; preserve
+      // its pre-feature Agent/Task behavior instead of treating the deliberately
+      // unavailable remote inventory as a local safety failure.
+      if (opts.remoteHostId) {
+        return { status: 'ready' as const, unsafeAgentNames: [], forcedModelActive: true };
+      }
+      const desiredProfile = resolveContextWindowProfile();
+      if (
+        pendingContextProfileRebuild
+        || contextProfileRetirementRequired
+        || contextProfileRebuildGate !== null
+        || desiredProfile.envValue !== activeQueryContextProfile?.envValue
+      ) {
+        return { status: 'profile-transition' as const };
+      }
+      const forcedModel = subagentDefault.envSubagentModel?.trim();
+      if (forcedModel) {
+        const forcedWindow = resolveModelContextWindow(forcedModel, mutableProviderId);
+        return !isVerifiedSubagentContextWindowSafe(forcedModel, forcedWindow)
+          ? { status: 'forced-model-unknown' as const, model: forcedModel }
+          : { status: 'ready' as const, unsafeAgentNames: [], forcedModelActive: true };
+      }
+      if (!Array.isArray(supportedAgentInventory)) {
+        return { status: 'inventory-unavailable' as const };
+      }
+      const unsafeAgentNames = supportedAgentInventory.flatMap((agent) => {
+        if (!agent.model) return [];
+        const verifiedWindow = resolveModelContextWindow(agent.model, mutableProviderId);
+        // A custom declaration's [1m] suffix is user input, not verification.
+        return !isVerifiedSubagentContextWindowSafe(agent.model, verifiedWindow)
+          ? [agent.name]
+          : [];
+      });
+      return { status: 'ready' as const, unsafeAgentNames };
+    }
     const appendActiveCapabilitySelectionText = (text: string | undefined): void => {
       if (!text) return;
       activeCapabilitySelectionText = [activeCapabilitySelectionText, text]
@@ -1649,6 +1769,12 @@ export class ClaudeCodeAgent extends BaseAgent {
             PostToolUse: [{ hooks: [turnChangeCaptureHook] }],
             PostToolUseFailure: [{ hooks: [turnChangeCaptureHook] }],
           },
+          buildClaudeSubagentContextWindowGuardHooks(
+            currentSubagentContextSafety,
+            (reason) => {
+              log.warn('subagent denied by context-window safety guard', { reason });
+            },
+          ),
           // Keep the existing local routing/capture hooks first: callers and tests
           // rely on their observable order. The exact-match Orca provenance guard
           // still runs for send_to_lead after those hooks and denies descendants.
@@ -2202,25 +2328,114 @@ export class ClaudeCodeAgent extends BaseAgent {
     // Claude Code 把 availableModels 当成组织白名单。目录 + 当前/目标模型都走同一
     // 个 catalog-id → wire-string 映射,启动与热切共用,后加载的网关模型(如
     // x-ai/grok-4.6)也能进名单。
-    const currentAvailableSdkModels = (selectedModel: string): string[] => [
+    const currentAvailableSdkModels = (
+      selectedModel: string,
+      selectedProviderId: string | null = mutableProviderId,
+    ): string[] => [
       ...new Set([
-        ...this.capabilities.availableModels.map(({ id }) => sdkModelFor(id)),
-        sdkModelFor(selectedModel),
+        ...this.capabilities.availableModels.map(({ id }) => sdkModelFor(id, selectedProviderId)),
+        sdkModelFor(selectedModel, selectedProviderId),
       ]),
     ];
-    const resolveModelContextWindow = (model: string): number | undefined => {
+    const resolveModelContextWindow = (
+      model: string,
+      providerId: string | null = mutableProviderId,
+    ): number | undefined => {
       // 核实窗口按会话实际来源取。host 注入了 resolver 时,null = 不要收敛
       // (同 id 多来源 / 未核实兜底),采信 SDK 上报,不能再拿扁平目录首见值覆盖。
       // 只有未注入 resolver 的路径(测试 / 无 host)才退回扁平目录。
-      const resolveVerified = this.deps.resolveVerifiedContextWindow;
-      if (resolveVerified) {
-        const verified = resolveVerified(mutableProviderId, model);
-        return typeof verified === 'number' && verified > 0 ? verified : undefined;
+      return this.verifiedContextWindowFor(model, providerId);
+    };
+    // Final Query-visible inventory from bundled SDK supportedAgents(). The
+    // first local candidate may use a provisional main-model-only profile, but
+    // it cannot receive user input until buildQueryWithStableContextProfile()
+    // has resolved this inventory and retired/rebuilt the candidate if needed.
+    const resolveContextWindowProfile = (
+      model: string = mutableModel,
+      providerId: string | null = mutableProviderId,
+    ): ClaudeContextWindowProfile => {
+      // The remote daemon does not expose an authoritative supportedAgents()
+      // inventory, and RemoteQuery.close() cannot prove a daemon-side close ACK.
+      // Keep SSH outside this feature until that protocol exists. The marker
+      // stays constant so model changes never enter the local close/rebuild
+      // path, while the effective window keeps the pre-feature catalog value
+      // for host usage/UI. buildQuery deliberately does not write MAX_CONTEXT
+      // on SSH.
+      if (opts.remoteHostId) {
+        const unmanaged = resolveClaudeContextWindowProfile({
+          model: sdkModelFor(model, providerId),
+          contextWindow: resolveModelContextWindow(model, providerId),
+        });
+        return { ...unmanaged, envValue: '0' };
       }
-      const descriptor = this.capabilities.availableModels.find((item) => item.id === model);
-      return descriptor && Number.isFinite(descriptor.contextWindow) && descriptor.contextWindow > 0
-        ? descriptor.contextWindow
+      const subagentModel = subagentDefault.envSubagentModel?.trim() || undefined;
+      const forcedSubagentWindow = subagentModel
+        ? resolveModelContextWindow(subagentModel, providerId)
         : undefined;
+      const safeForcedSubagentModel = subagentModel
+        && isVerifiedSubagentContextWindowSafe(subagentModel, forcedSubagentWindow)
+        ? subagentModel
+        : undefined;
+      const inventoryModels = subagentModel
+        ? undefined
+        : !Array.isArray(supportedAgentInventory)
+          ? undefined
+          : supportedAgentInventory.flatMap((agent) => {
+              const declaredModel = agent.model?.trim();
+              if (!declaredModel) return [];
+              const contextWindow = resolveModelContextWindow(declaredModel, providerId);
+              // Unsafe definitions are excluded from MAX calculation and are
+              // denied at PreToolUse. They must never drag the safe main Query
+              // to CLI fallback or execute under its wider MAX value.
+              if (!isVerifiedSubagentContextWindowSafe(declaredModel, contextWindow)) return [];
+              return [{
+                model: sdkModelFor(declaredModel, providerId),
+                contextWindow,
+              }];
+            });
+      const sdkMainModel = sdkModelFor(model, providerId);
+      const mainContextWindow = resolveModelContextWindow(model, providerId);
+      // In the provider-aware production path, an unsuffixed native-looking
+      // wire model is governed by Claude Code's intrinsic 200k branch, not the
+      // host catalog or MAX_CONTEXT. Legacy embedders without the route-aware
+      // resolver retain their historical catalog reporting behavior.
+      const expressibleMainContextWindow =
+        this.deps.resolveVerifiedContextWindow !== undefined
+        && isNativeClaudeModel(sdkMainModel)
+        && !sdkMainModel.endsWith('[1m]')
+          ? 200_000
+          : mainContextWindow;
+      const unsafeExactOneMillionProduct =
+        model.trim().endsWith('[1m]')
+        && this.capabilities.availableModels.some(
+          (descriptor) => descriptor.id === model.trim(),
+        )
+        && (
+          mainContextWindow === undefined
+          || !isClaudeCodeIntrinsicWindowSafe(model.trim(), mainContextWindow)
+        );
+      if (
+        unsafeExactOneMillionProduct
+        || (
+          mainContextWindow !== undefined
+          && !isClaudeCodeIntrinsicWindowSafe(sdkMainModel, mainContextWindow)
+        )
+      ) {
+        throw new Error(
+          `[CLAUDE_CONTEXT_WINDOW_MODEL_UNSAFE] model "${sdkMainModel}" has no context window compatible with Claude Code's intrinsic resolver`,
+        );
+      }
+      return resolveClaudeContextWindowProfile({
+        model: sdkMainModel,
+        contextWindow: expressibleMainContextWindow,
+        subagentModel: safeForcedSubagentModel
+          ? sdkModelFor(safeForcedSubagentModel, providerId)
+          : undefined,
+        subagentContextWindow: safeForcedSubagentModel
+          ? resolveModelContextWindow(safeForcedSubagentModel, providerId)
+          : undefined,
+        additionalSubagentModels: inventoryModels,
+      });
     };
 
     // SDK settings 对象 (优先级最高, 覆盖 user/project/local 文件层) — 本地分支
@@ -2274,8 +2489,6 @@ export class ClaudeCodeAgent extends BaseAgent {
     // model / effort / permissionMode 在 setX 后会变, handle 通过 getter 读 mutable 引用;
     // translator ctx 也通过 getter 读, 让 turn start/end 日志反映"当前真实值"而不是创建时的值。
     // 必须在 buildQuery / forward loop 之前声明, 否则 ctx getter 会捕获到 TDZ。
-    let mutableModel = opts.model;
-    let mutableProviderId = opts.providerId ?? null;
     let mutableAutoReviewCredentialMode = effectiveCredentialMode;
     let nativeAutoReviewUnavailable = false;
     let currentAutoReviewIntent = '';
@@ -2451,7 +2664,7 @@ export class ClaudeCodeAgent extends BaseAgent {
     // handle.getUsageSnapshot 也读它, 形成"SDK 原始 usage → tracker → status event / handle snapshot"
     // 单一可信源. 窗口跟白名单同一份实时目录,不冻启动快照。
     const usageTracker = new UsageTracker();
-    usageTracker.setContextWindow(resolveModelContextWindow(mutableModel) ?? 0);
+    usageTracker.setContextWindow(resolveContextWindowProfile().effectiveContextWindow);
 
     // ── 跨 turn 共享状态 ───────────────────────────────────────────────────
     let configuredResumeSessionId: string | undefined = opts.resumeSessionId;
@@ -2556,7 +2769,7 @@ export class ClaudeCodeAgent extends BaseAgent {
     // 用户 turn 结束后由 completeTranslatedTurnEnd / setModel 注入的静默 /compact。
     // 不能复用 queuedBridgeTurns：那会 suppress 终态、并把 isTurnRunning 卡在 true。
     let hostAutoCompactInFlight = false;
-    type ActiveBridgeKind = 'rewind' | 'cancellation';
+    type ActiveBridgeKind = 'rewind' | 'cancellation' | 'context-profile';
     let activeBridgeKind: ActiveBridgeKind | null = null;
     // Bridge /compact 由 rewind 或 cancellation rebuild 尾部注入。若用户 Stop 打在该 bridge turn
     // 上, 已被 SDK eager-drain 的后续真实用户输入无法再从 inputQueue.clear() 追回;
@@ -2567,6 +2780,48 @@ export class ClaudeCodeAgent extends BaseAgent {
     const bridgeStateActive = (): boolean =>
       queuedBridgeTurns > 0 || activeBridgeKind !== null || activeBridgeRewindResumeAt !== undefined;
     let q: Query;
+    // MAX_CONTEXT 是 Claude Code CLI 进程级 spawn 配置。每个 Query 记下实际烤入
+    // 子进程的 profile；setModel / send 用它判断可热切还是必须 close-first 重建。
+    const queryContextProfiles = new WeakMap<Query, ClaudeContextWindowProfile>();
+    const queryWireModels = new WeakMap<Query, string>();
+    let activeQueryContextProfile: ClaudeContextWindowProfile | null = null;
+    let activeQueryWireModel: string | null = null;
+    let pendingContextProfileRebuild = false;
+    // Once retirement starts, A→B→A is no longer coalescible: the input queue
+    // may already be ended and close() may be unacknowledged. Keep this
+    // tombstone until a replacement Query has fully stabilized.
+    let contextProfileRetirementRequired = false;
+    let contextProfileGeneration = 0;
+    let contextProfileRebuildGate: Promise<void> | null = null;
+    const installActiveQueryContextProfile = (query: Query): void => {
+      const installed = queryContextProfiles.get(query);
+      if (!installed) {
+        throw new Error('Claude Query missing context-window profile metadata');
+      }
+      activeQueryContextProfile = installed;
+      activeQueryWireModel = queryWireModels.get(query) ?? null;
+      usageTracker.setContextWindow(installed.effectiveContextWindow);
+      autoCompactController?.onContextWindowChanged(installed.effectiveContextWindow);
+      if (
+        !contextProfileRetirementRequired
+        && resolveContextWindowProfile().envValue === installed.envValue
+      ) {
+        pendingContextProfileRebuild = false;
+      }
+    };
+    const installCompatibleActiveContextProfile = (
+      query: Query,
+      profile: ClaudeContextWindowProfile,
+      wireModel?: string,
+    ): void => {
+      queryContextProfiles.set(query, profile);
+      if (wireModel) queryWireModels.set(query, wireModel);
+      activeQueryContextProfile = profile;
+      activeQueryWireModel = wireModel ?? queryWireModels.get(query) ?? activeQueryWireModel;
+      if (!contextProfileRetirementRequired) pendingContextProfileRebuild = false;
+      usageTracker.setContextWindow(profile.effectiveContextWindow);
+      autoCompactController?.onContextWindowChanged(profile.effectiveContextWindow);
+    };
     // Query-scoped lifecycle fact: modelUsage is cumulative within the SDK
     // process. A query created without a resume id starts that counter at zero;
     // resumed queries may include prior transcript usage and must establish a
@@ -2851,6 +3106,12 @@ export class ClaudeCodeAgent extends BaseAgent {
         pendingRewindTo = rewindResumeAt;
       } else if (kind === 'cancellation') {
         continuationCancellationRequiresQueryRebuild = true;
+      } else if (kind === 'context-profile') {
+        pendingContextProfileRebuild = true;
+        // The bridge owner has already ended this Query's input queue and
+        // started close(). This is a committed retirement, not the lazy
+        // A→B selection state that may coalesce back to A.
+        contextProfileRetirementRequired = true;
       }
       // Caller may preserve a retry target before clearing this state.
     }
@@ -2873,6 +3134,19 @@ export class ClaudeCodeAgent extends BaseAgent {
     }): Promise<Query> => {
       const currentSdkModel = sdkModelFor(mutableModel);
       const currentSdkEffort = getSdkEffortForModel(mutableModel, mutableEffort);
+      const contextProfile = resolveContextWindowProfile();
+      const queryEnv = { ...(opts.remoteHostId ? (remoteEnv ?? env) : env) };
+      if (!opts.remoteHostId) applyClaudeContextWindowProfileEnv(queryEnv, contextProfile);
+      log.info('claude-code context-window profile', {
+        model: currentSdkModel,
+        providerId: mutableProviderId,
+        effectiveContextWindow: contextProfile.effectiveContextWindow,
+        maxContextTokensInjected: contextProfile.envValue !== '0',
+        reason: contextProfile.reason,
+        managedByHost: !opts.remoteHostId,
+        generation: contextProfileGeneration,
+        remote: Boolean(opts.remoteHostId),
+      });
       const baseResumeAt = vo.resumeSessionAt as string | undefined;
       const baseFork = vo.forkSession as boolean | undefined;
       const finalResumeAt = extra?.fresh ? undefined : (extra?.resumeSessionAt ?? baseResumeAt);
@@ -3028,7 +3302,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           // remoteEnv 在 startSession 顶部已经 build (opts.remoteHostId 非空时
           // 才 build), 这里 ! 是合理的 — 走到这分支 remoteCcQueryFactory 也已经
           // gate 过 remoteHostId 非空。
-          env: remoteEnv ?? env,
+          env: queryEnv,
           permissionMode: remotePermissionMode,
           // cc-manager 的 QueryStartParams 已原生支持 allowedTools; 传副本避免 RPC
           // 序列化前后任一侧原地改写 session 快照。
@@ -3362,8 +3636,12 @@ export class ClaudeCodeAgent extends BaseAgent {
           // refreshSubscriptionTokenInPlace。
           ...(remoteEnv?.CLAUDE_CODE_OAUTH_TOKEN && this.deps.auth.getFreshSubscriptionToken
             ? {
-                onOAuthRefresh: async (): Promise<unknown> => ({
-                  token: await this.refreshSubscriptionTokenInPlace(remoteEnv),
+              onOAuthRefresh: async (): Promise<unknown> => ({
+                  token: await (async () => {
+                    const token = await this.refreshSubscriptionTokenInPlace(remoteEnv);
+                    if (token) queryEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
+                    return token;
+                  })(),
                 }),
               }
             : {}),
@@ -3421,6 +3699,7 @@ export class ClaudeCodeAgent extends BaseAgent {
 
         if (finalRemotePermissionMode === 'auto') nativeAutoQueries.add(remoteQuery);
         if (modelUsageCumulativeStartsAtZero) modelUsageStartsAtZeroQueries.add(remoteQuery);
+        queryContextProfiles.set(remoteQuery, contextProfile);
         return remoteQuery;
       }
 
@@ -3434,7 +3713,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       if (resumeSdkSid && opts.workingDir) {
         try {
           const claudeConfigDir =
-            env.CLAUDE_CONFIG_DIR ??
+            queryEnv.CLAUDE_CONFIG_DIR ??
             process.env.CLAUDE_CONFIG_DIR ??
             path.join(os.homedir(), '.claude');
           const outcome = await ensureClaudeTranscriptInWorkingDir({
@@ -3557,7 +3836,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           enableFileCheckpointing,
           ...(finalResumeAt ? { resumeSessionAt: finalResumeAt } : {}),
           ...(finalFork ? { forkSession: true } : {}),
-          env,
+          env: queryEnv,
           ...(this.deps.registerLocalAgentProcess
             ? {
                 spawnClaudeCodeProcess: (spawnOptions) =>
@@ -3586,10 +3865,13 @@ export class ClaudeCodeAgent extends BaseAgent {
           // (tengu_oauth_401_sdk_callback_refreshed), 回调超时/失败后还会直接重读系统
           // 凭证库兜底 (tengu_oauth_401_recovered_from_disk) —— host 刷新总是写回凭证库,
           // 所以即使回调超时返回 null, 第二条路仍能捡到新 token, 排障时两条都要看。
-          ...(env.CLAUDE_CODE_OAUTH_TOKEN && this.deps.auth.getFreshSubscriptionToken
+          ...(queryEnv.CLAUDE_CODE_OAUTH_TOKEN && this.deps.auth.getFreshSubscriptionToken
             ? {
                 getOAuthToken: (): Promise<string | null> =>
-                  this.refreshSubscriptionTokenInPlace(env),
+                  this.refreshSubscriptionTokenInPlace(env).then((token) => {
+                    if (token) queryEnv.CLAUDE_CODE_OAUTH_TOKEN = token;
+                    return token;
+                  }),
               }
             : {}),
           // 第一方只读工具由 host 精确列名, 直接走 SDK public allowlist, 避免
@@ -3626,9 +3908,125 @@ export class ClaudeCodeAgent extends BaseAgent {
             : {}),
         },
       });
-      if (sdkStartPermissionMode === 'auto') nativeAutoQueries.add(query);
-      if (modelUsageCumulativeStartsAtZero) modelUsageStartsAtZeroQueries.add(query);
-      return query;
+      // sdkQuery is synchronous in production, but awaiting here also keeps
+      // test/adapter thenables attached to the metadata of the resolved Query
+      // rather than to the transient Promise wrapper.
+      const resolvedQuery = await Promise.resolve(query);
+      if (sdkStartPermissionMode === 'auto') nativeAutoQueries.add(resolvedQuery);
+      if (modelUsageCumulativeStartsAtZero) modelUsageStartsAtZeroQueries.add(resolvedQuery);
+      queryContextProfiles.set(resolvedQuery, contextProfile);
+      queryWireModels.set(resolvedQuery, currentSdkModel);
+      return resolvedQuery;
+    };
+
+    /**
+     * Query creation contains async work (remote daemon RPC, transcript repair,
+     * auth). A concurrent A→B→A model change may therefore alter the desired
+     * process profile before the candidate is installed. Retire stale
+     * candidates before they can accept user input and retry against the latest
+     * profile; at most one candidate is live at a time.
+     */
+    type StableContextProfileQueryBuild = {
+      query: Query;
+      /** Candidate was preserved because its strict close was not acknowledged. */
+      retirementError?: unknown;
+    };
+    const supportedAgentsWithTimeout = async (candidate: Query): Promise<unknown> => {
+      if (typeof candidate.supportedAgents !== 'function') {
+        throw new Error('Query.supportedAgents is unavailable');
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          candidate.supportedAgents(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(
+                `[CLAUDE_SUPPORTED_AGENTS_TIMEOUT] inventory did not initialize within ${CLAUDE_SUPPORTED_AGENTS_TIMEOUT_MS}ms`,
+              )),
+              CLAUDE_SUPPORTED_AGENTS_TIMEOUT_MS,
+            );
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const buildQueryWithStableContextProfile = async (
+      extra?: Parameters<typeof buildQuery>[0],
+    ): Promise<StableContextProfileQueryBuild> => {
+      for (let pass = 0; pass < 5; pass += 1) {
+        const candidate = await buildQuery(extra);
+        const installed = queryContextProfiles.get(candidate);
+        // `supportedAgents()` is the authoritative post-settings inventory: it
+        // includes built-ins, project/user definitions, managed settings and
+        // plugins. Resolve it before startForwardLoop or any inputQueue.push so
+        // a provisional wide MAX_CONTEXT can never reach a subagent call.
+        if (
+          !opts.remoteHostId
+          && !subagentDefault.envSubagentModel
+        ) {
+          supportedAgentInventory = 'unresolved';
+          try {
+            const agents = await supportedAgentsWithTimeout(candidate);
+            if (!Array.isArray(agents)) throw new Error('Query.supportedAgents returned a non-array');
+            supportedAgentInventory = agents.map((agent) => {
+              if (!agent || typeof agent.name !== 'string' || !agent.name.trim()) {
+                throw new Error('Query.supportedAgents returned an invalid agent entry');
+              }
+              if (agent.model !== undefined && typeof agent.model !== 'string') {
+                throw new Error(`Query.supportedAgents returned an invalid model for ${agent.name}`);
+              }
+              const rawModel = agent.model?.trim();
+              const model = rawModel?.toLowerCase() === 'inherit' ? undefined : rawModel;
+              return {
+                name: agent.name.trim(),
+                ...(model ? { model } : {}),
+              };
+            });
+          } catch (error) {
+            supportedAgentInventory = 'unavailable';
+            log.warn('claude-code subagent inventory unavailable; Agent/Task disabled for this Query', {
+              error: String(error),
+            });
+          }
+        }
+        const desired = resolveContextWindowProfile();
+        if (installed?.envValue === desired.envValue) return { query: candidate };
+
+        pendingContextProfileRebuild = true;
+        log.warn('claude-code context profile changed during Query build; retiring stale candidate', {
+          pass: pass + 1,
+          installed: installed?.effectiveContextWindow,
+          desired: desired.effectiveContextWindow,
+          generation: contextProfileGeneration,
+        });
+        rewindTransitionQueries.add(candidate);
+        try {
+          inputQueue.end();
+        } catch (error) {
+          log.warn('context-profile retry: candidate input queue end threw', { error: String(error) });
+        }
+        // A failed remote close means the daemon may still own this candidate;
+        // fail closed instead of opening a second Query for the same session.
+        try {
+          await Promise.resolve(candidate.close());
+        } catch (error) {
+          // Keep the exact unacknowledged candidate reachable. Initial startup
+          // can expose a guarded idle handle; runtime callers assign it to q
+          // and reject the current action. The next explicit send must retry
+          // this same close before any second candidate is created.
+          log.warn('context-profile provisional candidate close rejected; preserving retirement tombstone', {
+            error: String(error),
+          });
+          return { query: candidate, retirementError: error };
+        }
+        inputQueue = createAsyncQueue<SdkUserInput>();
+        abortController = new AbortController();
+        runtimeState.lastResultUsageAggregate = null;
+      }
+      throw new Error('Claude context-window profile kept changing while rebuilding; retry the message');
     };
 
     // ── 死 handle 终结器 —— U2 (远端 daemon 突死) 与 crash (SDK 流异常) 共用 ──
@@ -4519,7 +4917,12 @@ export class ClaudeCodeAgent extends BaseAgent {
       clearUpstreamResponseIdle();
       // 本轮已经是静默 /compact。瞬时失败由 onCompactCanceled 打开重试，等下一轮用户
       // turn 结束再压；这里立刻再注入会把 401/过载打成紧循环。
-      if (!endingHostAutoCompact) triggerAutoCompactIfNeeded();
+      // A cross-profile selection made during this turn has not reached the
+      // live Query. Never inject /compact into that retired model/window; the
+      // next explicit send rebuilds first and queues the bridge on the new q.
+      if (!endingHostAutoCompact && !pendingContextProfileRebuild) {
+        triggerAutoCompactIfNeeded();
+      }
     }
     function startForwardLoop(currentQ: Query): void {
       // q 换代: 上一代 q 的 pending interrupted result 不可能从新 q drain 出来,
@@ -4692,7 +5095,9 @@ export class ClaudeCodeAgent extends BaseAgent {
               log,
               getModel: () => mutableModel,
               getProviderId: () => mutableProviderId,
-              getModelContextWindow: () => resolveModelContextWindow(mutableModel),
+              getModelContextWindow: () =>
+                activeQueryContextProfile?.effectiveContextWindow
+                ?? resolveContextWindowProfile().effectiveContextWindow,
               getEffort: () => mutableEffort,
               getPermissionMode: () => mutablePermissionMode,
               getFastMode: () => mutableFastMode,
@@ -5091,8 +5496,15 @@ export class ClaudeCodeAgent extends BaseAgent {
       try { inputQueue.end(); } catch (error) {
         log.debug('invalid resume recovery: old input queue end failed', { error: String(error) });
       }
-      try { await Promise.resolve(currentQ.close()); } catch (error) {
-        log.debug('invalid resume recovery: old query close failed', { error: String(error) });
+      try {
+        await Promise.resolve(currentQ.close());
+      } catch (error) {
+        releaseGate();
+        surfaceUnrecoverableInvalidResume(new Error(
+          '[CLAUDE_INVALID_RESUME_CLOSE_FAILED] could not retire the invalid Query; refusing to create a replacement',
+          { cause: error },
+        ));
+        return true;
       }
       if (closed) {
         // close 赢了竞态:handle.close 已 end 队列 / abort controller,这里不能再重建,
@@ -5112,6 +5524,8 @@ export class ClaudeCodeAgent extends BaseAgent {
       // 避免新 query 带旧 model/flags 起跑而 handle getter 报新值。
       const runtimeSnapshot: QueryRuntimeSnapshot = {
         model: mutableModel,
+        providerId: mutableProviderId,
+        modelSelectionGeneration,
         effort: mutableEffort,
         fastMode: mutableFastMode,
         sdkPermissionMode: currentTurnSdkPermissionMode(),
@@ -5125,7 +5539,11 @@ export class ClaudeCodeAgent extends BaseAgent {
         turnInFlight = true;
       }
       try {
-        q = await buildQuery({ permissionMode: runtimeSnapshot.sdkPermissionMode, fresh: true });
+        const queryBuild = await buildQueryWithStableContextProfile({
+          permissionMode: runtimeSnapshot.sdkPermissionMode,
+          fresh: true,
+        });
+        q = queryBuild.query;
         if (closed) {
           // close 在 buildQuery 期间赢了竞态:teardown 只拆得到当时存在的 query,刚建的
           // 替换 query 必须在这里立即关掉,不 startForwardLoop。
@@ -5139,8 +5557,27 @@ export class ClaudeCodeAgent extends BaseAgent {
           log.debug('invalid resume recovery aborted: handle closed during rebuild');
           return true;
         }
+        installActiveQueryContextProfile(q);
         startForwardLoop(q);
-        await replayRuntimeDrift(runtimeSnapshot, 'invalid resume rebuild');
+        if (queryBuild.retirementError) {
+          throw new Error(
+            '[CLAUDE_CONTEXT_PROFILE_CANDIDATE_CLOSE_FAILED] could not retire a provisional replacement Query',
+            { cause: queryBuild.retirementError },
+          );
+        }
+        const acceptanceSnapshot = await stabilizeReplacementQuery(runtimeSnapshot, 'invalid resume rebuild', undefined, {
+          permissionMode: runtimeSnapshot.sdkPermissionMode,
+          fresh: true,
+        });
+        if (!runtimeSnapshotMatches(runtimeSnapshot)) {
+          pendingContextProfileRebuild = true;
+          throw new Error(
+            '[CLAUDE_REPLACEMENT_RUNTIME_UNSTABLE] invalid resume runtime changed after stabilization; retry the message',
+          );
+        }
+        if (acceptanceSnapshot) {
+          assertContextProfileWireAccepted(acceptanceSnapshot, 'invalid resume replay acceptance');
+        }
         releaseGate();
         if (replayInput) {
           if (!inputQueue.push(replayInput)) throw new Error('fresh retry input queue rejected replay');
@@ -5185,8 +5622,19 @@ export class ClaudeCodeAgent extends BaseAgent {
     }
 
     // ── 首次起 q + 启动 forward loop ─────────────────────────────────────────
-    q = await buildQuery();
+    const initialQueryBuild = await buildQueryWithStableContextProfile();
+    q = initialQueryBuild.query;
+    if (initialQueryBuild.retirementError) {
+      pendingContextProfileRebuild = true;
+      contextProfileRetirementRequired = true;
+    }
+    installActiveQueryContextProfile(q);
     startForwardLoop(q);
+    if (initialQueryBuild.retirementError) {
+      log.warn('claude-code started with a guarded provisional Query; first send will retry retirement', {
+        error: String(initialQueryBuild.retirementError),
+      });
+    }
     // Anthropic 清单动态发现:init 后 fire-and-forget 捕获 supportedModels(见文件顶注)。
     notifySupportedModels(q);
 
@@ -5195,6 +5643,11 @@ export class ClaudeCodeAgent extends BaseAgent {
     // 这个窗口里的 runtime setter 只能更新闭包,不能直接写新 q:否则 plan arm / auto-compact
     // 可能污染当前正在接受的普通 send。send 登记 turn state 后再解除。
     let acceptingRebuiltSend = false;
+    // A rewind replacement can fail while replaying a same-profile model
+    // switch, before any user input reaches it. Preserve the three-part rewind
+    // intent and require this failed candidate to cross a close barrier before
+    // a later explicit send is allowed to rebuild again.
+    let rewindAcceptanceNeedsRetirement = false;
     // invalid-resume 恢复期间的门禁(从 CAS 清 id 起、到重建完成或放弃为止):这段
     // 窗口里旧 inputQueue 会被 end、q 被替换,send 会把消息推进死队列或未连接的新队列。
     // 非 null = 恢复进行中。send / rewind 入口 await 它而不是抛错 —— Session.send 的
@@ -5203,6 +5656,12 @@ export class ClaudeCodeAgent extends BaseAgent {
     let idleResumeRebuildGate: Promise<void> | null = null;
     // Idle-resume recovery and cancelled-continuation rebuilds have independent gates.
     let cancellationRebuildGate: Promise<void> | null = null;
+    // Serialize Query model writes against the final input-acceptance barrier.
+    // An already-running setter makes acceptance fail closed; setters arriving
+    // during synchronization update only mutable state for the next rebuild.
+    let queryRuntimeSyncInFlight = false;
+    let modelSelectionOperationsInFlight = 0;
+    let setModelSerialTail: Promise<void> | null = null;
     // runtime control request 可写性判定: commitRewindFiles 后旧 Query 已 close、新 Query
     // 等下一次 send 重建;或 bridge Stop/watchdog 已 close 当前 Query、等待下一次
     // send 从同一 rewind point 重建。这些窗口里对 q 发 control request 会抛
@@ -5216,10 +5675,19 @@ export class ClaudeCodeAgent extends BaseAgent {
       pendingRewindTo !== undefined ||
       acceptingRebuiltSend ||
       idleResumeRebuildGate !== null ||
+      contextProfileRebuildGate !== null ||
+      contextProfileRetirementRequired ||
       continuationCancellationRequiresQueryRebuild ||
       canceledBridgeQueries.has(q);
+    const modelControlRequestsBlocked = (): boolean =>
+      controlRequestsBlocked()
+      || pendingContextProfileRebuild
+      || sendInAcceptPhase
+      || queryRuntimeSyncInFlight;
     type QueryRuntimeSnapshot = {
       model: string;
+      providerId: string | null;
+      modelSelectionGeneration: number;
       effort: Effort;
       fastMode: boolean;
       sdkPermissionMode: SdkPermissionMode;
@@ -5227,20 +5695,48 @@ export class ClaudeCodeAgent extends BaseAgent {
     async function replayRuntimeDrift(snapshot: QueryRuntimeSnapshot, label: string): Promise<void> {
       for (let pass = 0; pass < 5; pass += 1) {
         let replayed = false;
-        if (mutableModel !== snapshot.model) {
+        if (modelSelectionGeneration !== snapshot.modelSelectionGeneration) {
           replayed = true;
           const targetModel = mutableModel;
+          const targetProviderId = mutableProviderId;
+          const targetGeneration = modelSelectionGeneration;
+          const desiredProfile = resolveContextWindowProfile(targetModel, targetProviderId);
+          if (desiredProfile.envValue !== activeQueryContextProfile?.envValue) {
+            pendingContextProfileRebuild = true;
+            log.info(`${label}: model drift requires a new Claude Code process profile`, {
+              model: targetModel,
+              desiredContextWindow: desiredProfile.effectiveContextWindow,
+              activeContextWindow: activeQueryContextProfile?.effectiveContextWindow,
+              generation: contextProfileGeneration,
+            });
+            return;
+          }
           try {
             // 与 live setModel 同序:先扩白名单再切。buildQuery await 期间切到的
             // 目录外模型,新 Query 的启动名单还是旧快照,直接 setModel 会撞组织限制。
             await q.applyFlagSettings({
-              availableModels: currentAvailableSdkModels(targetModel),
+              availableModels: currentAvailableSdkModels(targetModel, targetProviderId),
             });
-            await q.setModel(sdkModelFor(targetModel));
+            const targetWireModel = sdkModelFor(targetModel, targetProviderId);
+            await q.setModel(targetWireModel);
+            installCompatibleActiveContextProfile(q, desiredProfile, targetWireModel);
             snapshot.model = targetModel;
-            log.debug(`${label}: replayed setModel`, { model: targetModel });
+            snapshot.providerId = targetProviderId;
+            snapshot.modelSelectionGeneration = targetGeneration;
+            log.debug(`${label}: replayed setModel`, {
+              model: targetModel,
+              providerId: targetProviderId,
+              generation: targetGeneration,
+            });
           } catch (e) {
-            log.warn(`${label}: replay setModel failed`, { error: String(e) });
+            pendingContextProfileRebuild = true;
+            log.warn(`${label}: replay setModel failed; refusing Query acceptance`, {
+              error: String(e),
+            });
+            throw new Error(
+              `[CLAUDE_CONTEXT_PROFILE_REPLAY_MODEL_FAILED] ${label} could not apply model "${targetModel}" to the replacement Query`,
+              { cause: e },
+            );
           }
         }
         if (mutableEffort !== snapshot.effort) {
@@ -5260,7 +5756,14 @@ export class ClaudeCodeAgent extends BaseAgent {
                 downgraded: appliedEffort !== sdkEffort,
               });
             } catch (e) {
-              log.warn(`${label}: replay setEffort failed`, { error: String(e) });
+              pendingContextProfileRebuild = true;
+              log.warn(`${label}: replay setEffort failed; refusing Query acceptance`, {
+                error: String(e),
+              });
+              throw new Error(
+                `[CLAUDE_RUNTIME_REPLAY_EFFORT_FAILED] ${label} could not apply effort "${targetEffort}" to the replacement Query`,
+                { cause: e },
+              );
             }
           }
           snapshot.effort = targetEffort;
@@ -5272,7 +5775,14 @@ export class ClaudeCodeAgent extends BaseAgent {
             await q.applyFlagSettings({ fastMode: targetFastMode });
             log.debug(`${label}: replayed setFastMode`, { fastMode: targetFastMode });
           } catch (e) {
-            log.warn(`${label}: replay setFastMode failed`, { error: String(e) });
+            pendingContextProfileRebuild = true;
+            log.warn(`${label}: replay setFastMode failed; refusing Query acceptance`, {
+              error: String(e),
+            });
+            throw new Error(
+              `[CLAUDE_RUNTIME_REPLAY_FAST_MODE_FAILED] ${label} could not apply fast mode to the replacement Query`,
+              { cause: e },
+            );
           }
           snapshot.fastMode = targetFastMode;
         }
@@ -5291,7 +5801,280 @@ export class ClaudeCodeAgent extends BaseAgent {
         }
         if (!replayed) return;
       }
+      if (modelSelectionGeneration !== snapshot.modelSelectionGeneration) {
+        pendingContextProfileRebuild = true;
+        throw new Error(
+          '[CLAUDE_RUNTIME_MODEL_DRIFT_UNSTABLE] model/provider kept changing while accepting a replacement Query; retry the message',
+        );
+      }
       log.warn(`${label}: runtime drift kept changing while replaying; leaving remaining drift to the next setter/rebuild`);
+    }
+    const runtimeSnapshotMatches = (snapshot: QueryRuntimeSnapshot): boolean =>
+      snapshot.modelSelectionGeneration === modelSelectionGeneration
+      && snapshot.model === mutableModel
+      && snapshot.providerId === mutableProviderId
+      && snapshot.effort === mutableEffort
+      && snapshot.fastMode === mutableFastMode
+      && snapshot.sdkPermissionMode === currentTurnSdkPermissionMode();
+    type ContextProfileWireSnapshot = {
+      query: Query;
+      model: string;
+      providerId: string | null;
+      modelSelectionGeneration: number;
+      profile: ClaudeContextWindowProfile;
+      wireModel: string;
+    };
+    const contextProfilesMatch = (
+      left: ClaudeContextWindowProfile,
+      right: ClaudeContextWindowProfile | null,
+    ): boolean => right !== null
+      && left.envValue === right.envValue
+      && left.effectiveContextWindow === right.effectiveContextWindow
+      && left.reason === right.reason;
+    const captureContextProfileWireSnapshot = (): ContextProfileWireSnapshot => ({
+      query: q,
+      model: mutableModel,
+      providerId: mutableProviderId,
+      modelSelectionGeneration,
+      profile: resolveContextWindowProfile(),
+      wireModel: sdkModelFor(mutableModel, mutableProviderId),
+    });
+    const contextProfileWireSnapshotStillCurrent = (
+      snapshot: ContextProfileWireSnapshot,
+    ): boolean => {
+      if (
+        q !== snapshot.query
+        || mutableModel !== snapshot.model
+        || mutableProviderId !== snapshot.providerId
+        || modelSelectionGeneration !== snapshot.modelSelectionGeneration
+        || modelSelectionOperationsInFlight > 0
+      ) return false;
+      const currentProfile = resolveContextWindowProfile();
+      return contextProfilesMatch(snapshot.profile, currentProfile)
+        && sdkModelFor(mutableModel, mutableProviderId) === snapshot.wireModel;
+    };
+    const assertContextProfileWireAccepted = (
+      snapshot: ContextProfileWireSnapshot,
+      label: string,
+    ): void => {
+      if (
+        contextProfileWireSnapshotStillCurrent(snapshot)
+        && contextProfilesMatch(snapshot.profile, activeQueryContextProfile)
+        && activeQueryWireModel === snapshot.wireModel
+      ) return;
+      pendingContextProfileRebuild = true;
+      throw new Error(
+        `[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE] ${label} changed while synchronizing the Claude Query; retry before sending input`,
+      );
+    };
+    async function syncCompatibleContextProfileAndWire(
+      profile: ClaudeContextWindowProfile,
+      label: string,
+    ): Promise<ContextProfileWireSnapshot> {
+      const snapshot = captureContextProfileWireSnapshot();
+      if (!contextProfilesMatch(profile, snapshot.profile) || modelSelectionOperationsInFlight > 0) {
+        pendingContextProfileRebuild = true;
+        throw new Error(
+          `[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE] ${label} started from a stale model/window snapshot; retry before sending input`,
+        );
+      }
+      queryRuntimeSyncInFlight = true;
+      try {
+        if (snapshot.wireModel !== activeQueryWireModel) {
+          try {
+            await snapshot.query.applyFlagSettings({
+              availableModels: currentAvailableSdkModels(snapshot.model, snapshot.providerId),
+            });
+            await snapshot.query.setModel(snapshot.wireModel);
+          } catch (error) {
+            pendingContextProfileRebuild = true;
+            contextProfileRetirementRequired = true;
+            throw new Error(
+              `[CLAUDE_CONTEXT_PROFILE_WIRE_SYNC_FAILED] ${label} could not synchronize wire model "${snapshot.wireModel}" before accepting input`,
+              { cause: error },
+            );
+          }
+        }
+        if (!contextProfileWireSnapshotStillCurrent(snapshot)) {
+          pendingContextProfileRebuild = true;
+          throw new Error(
+            `[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE] ${label} model/window changed during Query synchronization; retry before sending input`,
+          );
+        }
+        installCompatibleActiveContextProfile(snapshot.query, snapshot.profile, snapshot.wireModel);
+        return snapshot;
+      } finally {
+        queryRuntimeSyncInFlight = false;
+      }
+    }
+    async function rebuildPendingContextProfileQuery(
+      signal?: AbortSignal,
+      extra?: Parameters<typeof buildQuery>[0],
+    ): Promise<boolean> {
+      while (contextProfileRebuildGate) await contextProfileRebuildGate;
+      const desiredAtEntry = resolveContextWindowProfile();
+      if (
+        !pendingContextProfileRebuild &&
+        !contextProfileRetirementRequired &&
+        desiredAtEntry.envValue === activeQueryContextProfile?.envValue
+      ) return false;
+
+      let releaseGate: (() => void) | undefined;
+      contextProfileRebuildGate = new Promise<void>((resolve) => { releaseGate = resolve; });
+      acceptingRebuiltSend = true;
+      try {
+        for (let pass = 0; pass < 5; pass += 1) {
+          const staleQuery = q;
+          const runtimeSnapshot: QueryRuntimeSnapshot = {
+            model: mutableModel,
+            providerId: mutableProviderId,
+            modelSelectionGeneration,
+            effort: mutableEffort,
+            fastMode: mutableFastMode,
+            sdkPermissionMode: currentTurnSdkPermissionMode(),
+          };
+          pendingContextProfileRebuild = true;
+          contextProfileRetirementRequired = true;
+          rewindTransitionQueries.add(staleQuery);
+          try {
+            inputQueue.end();
+          } catch (error) {
+            log.warn('context-profile rebuild: old input queue end threw', { error: String(error) });
+          }
+          // Local Query.close() is the process retirement barrier. A bridge
+          // cancellation may already have started it; wait for that exact ACK
+          // instead of issuing a second close against the same process. A
+          // rejected ACK is forgotten so the next explicit send can retry,
+          // while the retirement tombstone remains set.
+          const recordedClose = canceledQueryClosePromises.get(staleQuery);
+          if (recordedClose) {
+            try {
+              await recordedClose;
+            } catch (error) {
+              canceledQueryClosePromises.delete(staleQuery);
+              log.warn('context-profile query close rejected; rebuild remains blocked', {
+                error: String(error),
+              });
+              throw error;
+            }
+          } else {
+            await Promise.resolve(staleQuery.close());
+          }
+          if (closed || signal?.aborted) {
+            throw new Error('Claude send cancelled before context-profile rebuild');
+          }
+          inputQueue = createAsyncQueue<SdkUserInput>();
+          abortController = new AbortController();
+          runtimeState.lastResultUsageAggregate = null;
+
+          const queryBuild = await buildQueryWithStableContextProfile({
+            ...extra,
+            permissionMode: runtimeSnapshot.sdkPermissionMode,
+          });
+          q = queryBuild.query;
+          if (closed || signal?.aborted) {
+            rewindTransitionQueries.add(q);
+            try { inputQueue.end(); } catch { /* best-effort teardown */ }
+            await Promise.resolve(q.close()).catch(() => undefined);
+            throw new Error('Claude send cancelled before context-profile acceptance');
+          }
+          installActiveQueryContextProfile(q);
+          startForwardLoop(q);
+          notifySupportedModels(q);
+          if (queryBuild.retirementError) {
+            throw new Error(
+              '[CLAUDE_CONTEXT_PROFILE_CANDIDATE_CLOSE_FAILED] could not retire a provisional context-profile Query; retry the message',
+              { cause: queryBuild.retirementError },
+            );
+          }
+          await replayRuntimeDrift(runtimeSnapshot, 'context-profile rebuild');
+
+          // A same-env setModel can arrive after the last awaited replay while
+          // the rebuild gate is still active. It updates only mutable state.
+          // Re-run this pass until the installed Query and all runtime settings
+          // match one atomic snapshot; env equality alone is insufficient.
+          if (!runtimeSnapshotMatches(runtimeSnapshot)) continue;
+
+          const desired = resolveContextWindowProfile();
+          if (
+            desired.envValue === activeQueryContextProfile?.envValue
+          ) {
+            contextProfileRetirementRequired = false;
+            pendingContextProfileRebuild = false;
+            log.info('claude-code context-profile rebuild ready', {
+              pass: pass + 1,
+              effectiveContextWindow: desired.effectiveContextWindow,
+              reason: desired.reason,
+              generation: contextProfileGeneration,
+              remote: Boolean(opts.remoteHostId),
+            });
+            return true;
+          }
+        }
+        // The final candidate has not accepted user input, but its process may
+        // still carry the previous same-env model. Keep an explicit rebuild
+        // tombstone so the next send cannot take the env-equality fast path;
+        // that retry must close this candidate before creating another Query.
+        pendingContextProfileRebuild = true;
+        contextProfileRetirementRequired = true;
+        rewindTransitionQueries.add(q);
+        try {
+          inputQueue.end();
+        } catch (error) {
+          log.warn('unstable context-profile candidate input queue end threw', {
+            error: String(error),
+          });
+        }
+        throw new Error(
+          '[CLAUDE_CONTEXT_PROFILE_REBUILD_UNSTABLE] context-window profile kept changing during runtime replay; retry the message',
+        );
+      } finally {
+        acceptingRebuiltSend = false;
+        contextProfileRebuildGate = null;
+        releaseGate?.();
+      }
+    }
+    async function stabilizeReplacementQuery(
+      snapshot: QueryRuntimeSnapshot,
+      label: string,
+      signal?: AbortSignal,
+      extra?: Parameters<typeof buildQuery>[0],
+    ): Promise<ContextProfileWireSnapshot | null> {
+      for (let pass = 0; pass < 5; pass += 1) {
+        await replayRuntimeDrift(snapshot, label);
+        await rebuildPendingContextProfileQuery(signal, extra);
+        if (opts.remoteHostId) {
+          if (runtimeSnapshotMatches(snapshot)) return null;
+          continue;
+        }
+        const desired = resolveContextWindowProfile();
+        if (desired.envValue !== activeQueryContextProfile?.envValue) {
+          pendingContextProfileRebuild = true;
+          continue;
+        }
+        let acceptanceSnapshot = captureContextProfileWireSnapshot();
+        if (
+          !contextProfilesMatch(desired, activeQueryContextProfile)
+          || acceptanceSnapshot.wireModel !== activeQueryWireModel
+        ) {
+          acceptanceSnapshot = await syncCompatibleContextProfileAndWire(
+            desired,
+            `${label} wire stabilization`,
+          );
+        }
+        if (
+          runtimeSnapshotMatches(snapshot)
+          && !pendingContextProfileRebuild
+          && !contextProfileRetirementRequired
+        ) {
+          assertContextProfileWireAccepted(acceptanceSnapshot, `${label} final barrier`);
+          return acceptanceSnapshot;
+        }
+      }
+      pendingContextProfileRebuild = true;
+      throw new Error(
+        '[CLAUDE_REPLACEMENT_RUNTIME_UNSTABLE] runtime settings kept changing while accepting a replacement Query; retry the message',
+      );
     }
     async function rebuildCancelledContinuationQuery(
       signal?: AbortSignal,
@@ -5310,6 +6093,8 @@ export class ClaudeCodeAgent extends BaseAgent {
         const staleQuery = q;
         const runtimeSnapshot: QueryRuntimeSnapshot = {
           model: mutableModel,
+          providerId: mutableProviderId,
+          modelSelectionGeneration,
           effort: mutableEffort,
           fastMode: mutableFastMode,
           sdkPermissionMode: currentTurnSdkPermissionMode(),
@@ -5325,20 +6110,26 @@ export class ClaudeCodeAgent extends BaseAgent {
           try {
             await recordedClose;
           } catch (error) {
-            log.warn('cancelled continuation query close rejected before rebuild', { error: String(error) });
+            // A rejected recorded close is not an acknowledgement. Forget the
+            // failed promise so the next explicit action can retry close, but
+            // keep the cancellation tombstone and do not create a replacement.
+            canceledQueryClosePromises.delete(staleQuery);
+            log.warn('cancelled continuation query close rejected; rebuild remains blocked', {
+              error: String(error),
+            });
+            throw error;
           }
         } else {
-          try {
-            await Promise.resolve(staleQuery.close());
-          } catch (e) {
-            log.warn('cancelled continuation query close threw before rebuild', { error: String(e) });
-          }
+          // close-first is a hard process barrier. A throw/rejection preserves
+          // continuationCancellationRequiresQueryRebuild for explicit retry.
+          await Promise.resolve(staleQuery.close());
         }
         try {
-          q = await buildQuery({
+          const queryBuild = await buildQueryWithStableContextProfile({
             permissionMode: runtimeSnapshot.sdkPermissionMode,
             fresh: true,
           });
+          q = queryBuild.query;
           if (signal?.aborted) {
             inputQueue.end();
             rewindTransitionQueries.add(q);
@@ -5351,9 +6142,19 @@ export class ClaudeCodeAgent extends BaseAgent {
             }
             throw new Error('Claude send cancelled before acceptance');
           }
+          installActiveQueryContextProfile(q);
           startForwardLoop(q);
           notifySupportedModels(q);
-          await replayRuntimeDrift(runtimeSnapshot, 'cancelled continuation rebuild');
+          if (queryBuild.retirementError) {
+            throw new Error(
+              '[CLAUDE_CONTEXT_PROFILE_CANDIDATE_CLOSE_FAILED] could not retire a provisional cancellation replacement Query; retry the message',
+              { cause: queryBuild.retirementError },
+            );
+          }
+          await stabilizeReplacementQuery(runtimeSnapshot, 'cancelled continuation rebuild', signal, {
+            permissionMode: runtimeSnapshot.sdkPermissionMode,
+            fresh: true,
+          });
           // Cancellation rebuilds used by send need the compact→user bridge for deferred
           // model/window drift. Rewind preview/commit use the same fresh-query isolation but
           // must not start a product turn or inject /compact before rewindFiles runs.
@@ -5559,10 +6360,37 @@ export class ClaudeCodeAgent extends BaseAgent {
             emitTurnBoundary(reason);
           }
         };
+        const retireFailedRewindAcceptance = async (
+          resumeAt: string,
+          error: unknown,
+        ): Promise<void> => {
+          pendingRewindTo = resumeAt;
+          clearBridgeState();
+          acceptingRebuiltSend = false;
+          inputQueue.clear();
+          try { inputQueue.end(); } catch { /* retry will replace the queue */ }
+          rewindTransitionQueries.add(q);
+          rewindAcceptanceNeedsRetirement = true;
+          try {
+            await Promise.resolve(q.close());
+            rewindAcceptanceNeedsRetirement = false;
+          } catch (closeError) {
+            log.warn('rewind acceptance failure: replacement close failed; retry remains blocked', {
+              replayError: String(error),
+              closeError: String(closeError),
+            });
+          }
+        };
+        let rewindReplayResumeAt: string | undefined;
         if (pendingRewindTo || activeBridgeRewindResumeAt) {
           const resumeAt = pendingRewindTo ?? activeBridgeRewindResumeAt;
           if (!resumeAt) {
             throw new Error('Claude rewind rebuild missing resume target');
+          }
+          if (rewindAcceptanceNeedsRetirement) {
+            rewindTransitionQueries.add(q);
+            await Promise.resolve(q.close());
+            rewindAcceptanceNeedsRetirement = false;
           }
           log.debug('send ▶ pendingRewindTo detected — rebuilding sdkQuery with 三件套', {
             resumeSessionAt: resumeAt,
@@ -5582,6 +6410,8 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 闭包值; await 期间若有切换到达(被 controlRequestsBlocked() 短路成"只更新闭包"),
           // 下方 diff 重放据此识别漂移项。
           const snapModel = mutableModel;
+          const snapProviderId = mutableProviderId;
+          const snapModelSelectionGeneration = modelSelectionGeneration;
           const snapEffort = mutableEffort;
           const snapFastMode = mutableFastMode;
           // 用 turn-scoped 档快照 (planTurnActive + mutablePermissionMode), 不含 mutablePlanMode
@@ -5595,22 +6425,26 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 不能再读包含 arm 态的 effectiveSdkPermissionMode()。否则 rewind 窗口里用户 arm
           // 了下一 turn 的 plan,但当前排队行显式 planMode:false 时,新 Query 会先以 plan
           // 起跑且 replay 看不到 diff,导致普通 turn 误跑成 plan turn (Codex review 3535801840)。
-          q = await buildQuery({
+          const queryBuild = await buildQueryWithStableContextProfile({
             resumeSessionAt: resumeAt,
             forkSession: true,
             permissionMode: snapSdkPermissionMode,
           });
+          q = queryBuild.query;
           if (sendOpts?.signal?.aborted) {
-            inputQueue.end();
-            canceledBridgeQueries.add(q);
-            try {
-              q.close();
-            } catch (e) {
-              log.warn('rewind rebuild cancellation: q.close threw', { error: String(e) });
-            }
-            throw new Error('Claude send cancelled before acceptance');
+            const cancellationError = new Error('Claude send cancelled before acceptance');
+            await retireFailedRewindAcceptance(resumeAt, cancellationError);
+            throw cancellationError;
           }
+          installActiveQueryContextProfile(q);
           startForwardLoop(q);
+          if (queryBuild.retirementError) {
+            rewindAcceptanceNeedsRetirement = true;
+            throw new Error(
+              '[CLAUDE_CONTEXT_PROFILE_CANDIDATE_CLOSE_FAILED] could not retire a provisional rewind replacement Query; retry the message',
+              { cause: queryBuild.retirementError },
+            );
+          }
           acceptingRebuiltSend = true;
           // 标记必须等 q 替换完才清 (不能在 await buildQuery 之前):
           //  - await 期间 runtime 切换 IPC 仍可能到达, controlRequestsBlocked()
@@ -5623,23 +6457,32 @@ export class ClaudeCodeAgent extends BaseAgent {
           clearBridgeState();
           runtimeReplaySnapshot = {
             model: snapModel,
+            providerId: snapProviderId,
+            modelSelectionGeneration: snapModelSelectionGeneration,
             effort: snapEffort,
             fastMode: snapFastMode,
             sdkPermissionMode: snapSdkPermissionMode,
           };
-          await replayRuntimeDrift(runtimeReplaySnapshot, 'rewind rebuild');
+          rewindReplayResumeAt = resumeAt;
+          try {
+            await stabilizeReplacementQuery(
+              runtimeReplaySnapshot,
+              'rewind rebuild',
+              sendOpts?.signal,
+              {
+              resumeSessionAt: resumeAt,
+              forkSession: true,
+              permissionMode: snapSdkPermissionMode,
+              },
+            );
+          } catch (error) {
+            await retireFailedRewindAcceptance(resumeAt, error);
+            throw error;
+          }
           if (sendOpts?.signal?.aborted) {
-            pendingRewindTo = resumeAt;
-            clearBridgeState();
-            acceptingRebuiltSend = false;
-            inputQueue.end();
-            canceledBridgeQueries.add(q);
-            try {
-              q.close();
-            } catch (e) {
-              log.warn('rewind rebuild replay cancellation: q.close threw', { error: String(e) });
-            }
-            throw new Error('Claude send cancelled before acceptance');
+            const cancellationError = new Error('Claude send cancelled before acceptance');
+            await retireFailedRewindAcceptance(resumeAt, cancellationError);
+            throw cancellationError;
           }
           // 补触发 auto-compact (Codex review P2):
           // 窗口期 setModel 大窗 → 小窗切换时跳过了 triggerAutoCompactIfNeeded (旧
@@ -5653,6 +6496,39 @@ export class ClaudeCodeAgent extends BaseAgent {
           bridgeCompactQueued = queueAutoCompactBridge('rewind', resumeAt);
           // 本次 send 的 bridge state 已注册;guard 继续保持到下面 turnInFlight=true,
           // 防止 runtime setter 在 user turn 尚未登记时把 /compact 注入成未标记 turn。
+        }
+
+        // Catalog/provider facts can refresh without a setModel IPC. Re-check at
+        // the last safe point before accepting real user input; a changed
+        // process profile must retire the old Query first. Rewind/cancellation
+        // rebuilds above may already have installed the right profile, making
+        // this a no-op.
+        if (!opts.remoteHostId) {
+          const desiredContextProfile = resolveContextWindowProfile();
+          let compatibleContextProfileRefreshed = false;
+          if (desiredContextProfile.envValue !== activeQueryContextProfile?.envValue) {
+            pendingContextProfileRebuild = true;
+            contextProfileGeneration += 1;
+          } else if (
+            desiredContextProfile.effectiveContextWindow
+              !== activeQueryContextProfile?.effectiveContextWindow
+            || desiredContextProfile.reason !== activeQueryContextProfile?.reason
+            || sdkModelFor(mutableModel, mutableProviderId) !== activeQueryWireModel
+          ) {
+            const refreshSnapshot = await syncCompatibleContextProfileAndWire(
+              desiredContextProfile,
+              'catalog context-profile refresh',
+            );
+            assertContextProfileWireAccepted(
+              refreshSnapshot,
+              'catalog context-profile refresh continuation',
+            );
+            compatibleContextProfileRefreshed = true;
+          }
+          const contextProfileRebuilt = await rebuildPendingContextProfileQuery(sendOpts?.signal);
+          if (contextProfileRebuilt || compatibleContextProfileRefreshed) {
+            bridgeCompactQueued = queueAutoCompactBridge('context-profile') || bridgeCompactQueued;
+          }
         }
 
         // 兜底重置 currentTurn —— 上一 turn 异常 / abort 时 endTurn 可能没跑,
@@ -5686,18 +6562,24 @@ export class ClaudeCodeAgent extends BaseAgent {
           },
           source: 'claude-code',
         });
-        if (acceptingRebuiltSend) {
-          acceptingRebuiltSend = false;
-          if (runtimeReplaySnapshot) {
-            await replayRuntimeDrift(runtimeReplaySnapshot, 'rewind accept');
-          }
-          if (sendOpts?.signal?.aborted) {
-            finishSendBeforeUserInput('send_cancelled_before_acceptance');
-            throw new Error('Claude send cancelled before acceptance');
-          }
-        }
         let userInputAccepted = false;
         try {
+          if (acceptingRebuiltSend) {
+            acceptingRebuiltSend = false;
+            if (runtimeReplaySnapshot) {
+              try {
+                await replayRuntimeDrift(runtimeReplaySnapshot, 'rewind accept');
+              } catch (error) {
+                if (rewindReplayResumeAt) {
+                  await retireFailedRewindAcceptance(rewindReplayResumeAt, error);
+                }
+                throw error;
+              }
+            }
+            if (sendOpts?.signal?.aborted) {
+              throw new Error('Claude send cancelled before acceptance');
+            }
+          }
           if (reviewMode) {
             await assertReviewMessageContentPaths(
               message.content,
@@ -5729,6 +6611,40 @@ export class ClaudeCodeAgent extends BaseAgent {
             parent_tool_use_id: null,
             ...(sendOpts?.messageUuid ? { uuid: sendOpts.messageUuid } : {}),
           };
+          // Content conversion/review can await for seconds after the earlier
+          // profile barrier. A concurrent cross-window setModel must not let
+          // this already-converted message fall into the old Query; fail before
+          // enqueue and require an explicit retry (never replay user input).
+          if (!opts.remoteHostId) {
+            const desiredBeforePush = resolveContextWindowProfile();
+            if (desiredBeforePush.envValue !== activeQueryContextProfile?.envValue) {
+              pendingContextProfileRebuild = true;
+              contextProfileGeneration += 1;
+              throw new Error(
+                '[CLAUDE_CONTEXT_PROFILE_CHANGED_BEFORE_ACCEPTANCE] model/window changed while preparing the message; retry to rebuild the Claude Query before sending',
+              );
+            }
+            let acceptanceSnapshot = captureContextProfileWireSnapshot();
+            if (
+              desiredBeforePush.effectiveContextWindow
+                !== activeQueryContextProfile?.effectiveContextWindow
+              || desiredBeforePush.reason !== activeQueryContextProfile?.reason
+              || sdkModelFor(mutableModel, mutableProviderId) !== activeQueryWireModel
+            ) {
+              acceptanceSnapshot = await syncCompatibleContextProfileAndWire(
+                desiredBeforePush,
+                'pre-acceptance context-profile refresh',
+              );
+              bridgeCompactQueued = queueAutoCompactBridge('context-profile') || bridgeCompactQueued;
+            }
+            // This assertion is synchronous with inputQueue.push below. It
+            // catches model/provider or catalog changes scheduled between an
+            // awaited wire sync and this continuation, leaving no await seam.
+            assertContextProfileWireAccepted(
+              acceptanceSnapshot,
+              'pre-acceptance final barrier',
+            );
+          }
           const accepted = inputQueue.push(sdkInput);
           if (!accepted) {
             // close() can win while content conversion is still preparing files or
@@ -5774,6 +6690,20 @@ export class ClaudeCodeAgent extends BaseAgent {
         if (!turnInFlight) {
           throw new Error('No active Claude turn to steer');
         }
+        const assertSteerContextProfileReady = (): void => {
+          if (opts.remoteHostId) return;
+          const desired = resolveContextWindowProfile();
+          if (
+            pendingContextProfileRebuild
+            || contextProfileRebuildGate !== null
+            || desired.envValue !== activeQueryContextProfile?.envValue
+          ) {
+            throw new Error(
+              '[CLAUDE_STEER_CONTEXT_PROFILE_PENDING] cannot steer while a context-window process rebuild is pending; let the active turn finish, then retry as a new message',
+            );
+          }
+        };
+        assertSteerContextProfileReady();
         log.debug('steer ▶ user message', {
           model: mutableModel,
           effort: mutableEffort,
@@ -5804,6 +6734,10 @@ export class ClaudeCodeAgent extends BaseAgent {
           // keeps the original queue/composer content and lets the user retry.
           throw new Error('No active Claude turn to steer');
         }
+        // setModel/provider facts can change while attachment conversion awaits.
+        // A steer cannot close/rebuild an in-flight Query and must never be
+        // replayed automatically, so reject before the only enqueue boundary.
+        assertSteerContextProfileReady();
         warnIfRemoteDesktopAttachment(message.content);
         // Same-turn steering deliberately does NOT call beginTurn(), reset the
         // tool-loop guard, or emit a new running status. Those are turn-start
@@ -6284,9 +7218,21 @@ export class ClaudeCodeAgent extends BaseAgent {
 
       async setModel(newModel: string, setModelOpts?: { providerId?: string | null }) {
         if (reviewMode) return;
-        const targetProviderId = setModelOpts?.providerId !== undefined
+        const previousSetModel = setModelSerialTail;
+        let releaseSetModel!: () => void;
+        const currentSetModel = new Promise<void>((resolve) => { releaseSetModel = resolve; });
+        setModelSerialTail = currentSetModel;
+        modelSelectionOperationsInFlight += 1;
+        // Do not introduce a microtask seam for the uncontended case: callers
+        // that change selection during Query acceptance must update mutable
+        // generation synchronously before the final no-await barrier.
+        if (previousSetModel) await previousSetModel;
+        try {
+          const targetProviderId = setModelOpts?.providerId !== undefined
           ? setModelOpts.providerId
           : mutableProviderId;
+        const selectionChanged =
+          newModel !== mutableModel || (targetProviderId ?? null) !== mutableProviderId;
         // 远端会话切换模型/来源:远端 env 在 spawn 时已烤进 daemon,无法热改。若新
         // 模型/来源解析出的路由与当前不一致(路由类型或 env 内容变化),继续用旧
         // env 会以错误 endpoint/凭证打新模型(401/404/错租户)。重新解析比对,
@@ -6314,8 +7260,6 @@ export class ClaudeCodeAgent extends BaseAgent {
                 // - ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN(自定义供应商 key,**无**
                 //   refresh 通道)的**值**:仍比对 —— 用户改 key 后远端 daemon 会持续
                 //   401,必须拒绝(Greptile 六轮)。存在性(在/不在)同样比对(路由类型)。
-                const SUBSCRIPTION_TOKEN_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
-                const PROVIDER_KEY_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']);
                 // 订阅身份元数据(scopes/subscriptionType/rateLimitTier)与 token 同源,
                 // 会在用户零操作下漂移(登录后 backfill 补齐 / 订阅计划变更刷新)——
                 // 与 token 同组按存在性比对,不按值(Fable 5 评估 B1:值比对会误拒)。
@@ -6371,18 +7315,62 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 才有)若被当成 spawn 声明,下次切模会与仍烤着旧快照的 remoteEnv 比对
           // 误拒(codex P2 #1035)。
         }
-        const sdkModel = sdkModelFor(newModel);
-        const isControlBlocked = controlRequestsBlocked();
-        log.debug('setModel', { from: mutableModel, to: newModel, sdk: sdkModel, controlRequestsBlocked: isControlBlocked });
-        if (!isControlBlocked) {
+        const sdkModel = sdkModelFor(newModel, targetProviderId ?? null);
+        const nextContextProfile = resolveContextWindowProfile(
+          newModel,
+          targetProviderId ?? null,
+        );
+        const requiresContextProfileRebuild =
+          nextContextProfile.envValue !== activeQueryContextProfile?.envValue;
+        if (requiresContextProfileRebuild) {
+          pendingContextProfileRebuild = true;
+          contextProfileGeneration += 1;
+        } else if (
+          contextProfileRebuildGate === null
+          && !contextProfileRetirementRequired
+        ) {
+          // A→B→A before the lazy rebuild starts: the still-live Query already
+          // has A's process profile, so the pending rebuild can be canceled and
+          // the ordinary hot model switch remains safe.
+          pendingContextProfileRebuild = false;
+        }
+        const isControlBlocked = modelControlRequestsBlocked();
+        log.debug('setModel', {
+          from: mutableModel,
+          to: newModel,
+          sdk: sdkModel,
+          controlRequestsBlocked: isControlBlocked,
+          requiresContextProfileRebuild,
+          activeContextWindow: activeQueryContextProfile?.effectiveContextWindow,
+          desiredContextWindow: nextContextProfile.effectiveContextWindow,
+          contextProfileReason: nextContextProfile.reason,
+          contextProfileGeneration,
+        });
+        if (!isControlBlocked && !requiresContextProfileRebuild) {
           // flag settings 只在 Query 创建时写入。热切若只调 setModel,Claude Code
           // 仍按启动时的组织白名单校验,后加载的网关模型会报
           // "restricted by your organization's settings"(2026-08-13)。applyFlagSettings
           // 是 merge,先把当前目录 + 目标模型并进去再切。
           await q.applyFlagSettings({
-            availableModels: currentAvailableSdkModels(newModel),
+            availableModels: currentAvailableSdkModels(newModel, targetProviderId ?? null),
           });
-          await q.setModel(sdkModel);
+          try {
+            await q.setModel(sdkModel);
+          } catch (error) {
+            // A local transport rejection does not prove the subprocess
+            // rejected the mutation. Retire that Query before accepting more
+            // input so an ACK-loss cannot leave q and the public selection
+            // divergent. SSH does not yet have a daemon-side close/rebuild
+            // acknowledgement, so preserve its pre-feature contract: surface
+            // the failure, keep mutable selection unchanged, and allow a later
+            // remote setModel retry instead of installing a local tombstone.
+            if (!opts.remoteHostId) {
+              pendingContextProfileRebuild = true;
+              contextProfileRetirementRequired = true;
+            }
+            throw error;
+          }
+          installCompatibleActiveContextProfile(q, nextContextProfile, sdkModel);
         }
         const usedNativeAutoReview = usesNativeClaudeAutoReview();
         mutableProviderId = targetProviderId ?? null;
@@ -6395,6 +7383,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           authState.authSource,
         );
         mutableModel = newModel;
+        if (selectionChanged) modelSelectionGeneration += 1;
         autoReviewDecisionCache.clear();
         // 换模型 / 换路由可能正好修掉了审阅器不可用的原因(目录解析失败、provider 被停用
         // 等);若换完又不可用,值得再提醒一次。
@@ -6402,6 +7391,7 @@ export class ClaudeCodeAgent extends BaseAgent {
         autoReviewConfirmUndeliveredNotice.reset();
         if (
           !isControlBlocked
+          && !requiresContextProfileRebuild
           && mutablePermissionMode === 'auto'
           && usedNativeAutoReview !== usesNativeClaudeAutoReview()
         ) {
@@ -6420,27 +7410,25 @@ export class ClaudeCodeAgent extends BaseAgent {
         }
         const newContextWindow = resolveModelContextWindow(mutableModel);
         if (newContextWindow === undefined) {
-          // setContextWindow(0) 是 no-op —— tracker 会静默沿用旧模型窗口直到下一个
-          // result 的 modelUsage 修正。UI 环 / auto-compact 期间按旧窗口算(偏乐观),
-          // 打一条 warn 让排查"切模型后窗口不对"时能看出来源陈旧。
-          log.warn('setModel: target model contextWindow unknown in capabilities; tracker keeps previous window until next result', {
+          // 未核实窗口按 CLI 2.1.219 的 200k fallback 收口，不能沿用上一模型窗口。
+          log.warn('setModel: target model contextWindow unknown; using Claude Code 200k fallback profile', {
             model: newModel,
           });
         }
-        usageTracker.setContextWindow(newContextWindow ?? 0);
-        if (newContextWindow !== undefined) {
-          // 大窗口 → 小窗口切换: 用新窗口重算 auto-compact ratio 并立即判定一次,
-          // 已越阈值时空闲即触发静默 /compact, 不等下一轮 send 撞小窗口上限。
-          // (turnInFlight 时 triggerAutoCompactIfNeeded 内部 no-op, 不打扰 in-flight turn。)
-          autoCompactController?.onContextWindowChanged(newContextWindow);
-          // control request 被阻塞时的 inputQueue 会在下一次 send 重建时被丢弃, 此时不能注入
-          // /compact 或置 turnInFlight; 重建后 forward loop 的 usage 更新会重新判定。
-          if (!isControlBlocked) {
-            triggerAutoCompactIfNeeded();
-          }
+        // usage/compact describe the model actually installed in q, not a
+        // deferred selection. installCompatibleActiveContextProfile already
+        // refreshed them for a successful same-profile hot switch; a pending
+        // rebuild refreshes them only after the replacement Query is installed.
+        if (!isControlBlocked && !requiresContextProfileRebuild) {
+          triggerAutoCompactIfNeeded();
         }
         // 适用性在 getToolLoopGuard 里按已更新的 mutableModel 逐 scope 判,这里只清状态。
         resetToolLoopGuards();
+        } finally {
+          modelSelectionOperationsInFlight -= 1;
+          if (setModelSerialTail === currentSetModel) setModelSerialTail = null;
+          releaseSetModel();
+        }
       },
 
       async setEffort(newEffort: Effort) {
@@ -6708,19 +7696,19 @@ export class ClaudeCodeAgent extends BaseAgent {
         //    顺序很重要 —— catch 是 microtask, q.close() 同步触发, 标记必须先设上。
         pendingRewindTo = priorAssistantUuid;
         rewindTransitionQueries.add(q);
+        rewindAcceptanceNeedsRetirement = true;
+        turnInFlight = false;
+        clearBridgeState();
         try {
-          q.close();
+          await Promise.resolve(q.close());
+          rewindAcceptanceNeedsRetirement = false;
           log.debug('commitRewindFiles: q.close() ok');
         } catch (err) {
-          log.warn('commitRewindFiles: q.close() threw', {
+          log.warn('commitRewindFiles: q.close() failed; rewind rebuild remains blocked', {
             error: err instanceof Error ? err.message : String(err),
           });
+          throw err;
         }
-        // turn 没在跑了, 清守卫标记 (rewind 必然在 idle 时调, 但兜底一把)
-        turnInFlight = false;
-        // bridge counter 兜底: rewind idle 时应该已经归零, 但如果上一轮 bridge 中途异常
-        // (SDK 崩 / abort 未 drain result) counter 可能残留, 会污染 rebuild 后的第一 turn。
-        clearBridgeState();
         log.info('commitRewindFiles ◀ pendingRewindTo set, awaiting next send to rebuild');
         return undefined;
       },

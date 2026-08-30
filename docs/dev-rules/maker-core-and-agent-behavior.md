@@ -19,6 +19,42 @@ Pi 读取独立的设置页百分比，在每次启动或恢复任务时冻结�
 `Agent.continue()` 语义压缩续接。Cindy 只消费 Pi 的 `compaction_start`／`compaction_end` 事件做
 UI、usage 与 digest 投影，不再向 Pi 注入 host 自动 compact RPC。
 
+Claude Code 的每个**本地** SDK `query()` 还必须冻结一份上下文窗口 profile：Cindy 根据当前
+provider/model catalog 写入该子进程的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`，让 bundled CLI 的原生
+auto-compact 与 Cindy 的 usage 阈值使用同一个窗口。provider 窗口已核验时写正整数；Claude 原生
+模型或 `[1m]` 模型在没有更小 provider 子代理时写 `0`，用显式无效值覆盖父进程残留并交回 CLI 原生判定。
+此键只写入 Query 子进程 env 的副本，不得增删 host `process.env`。
+
+子代理与主模型共用 CLI 进程。每个未强制单一子代理模型的本地候选 Query 在启动 forward loop、接受任何用户输入之前，必须先用
+bundled SDK `supportedAgents()` 读取最终可达清单（含 built-in、项目／用户定义、managed settings 与
+plugin）：省略模型或 `inherit` 继承主模型，Claude 原生模型不消费 MAX，自定义 provider 模型则把已核验
+窗口加入进程最小值。清单里的显式自定义模型若没有 provider-aware 的已核验窗口，不参与 MAX 计算，且
+本地 `PreToolUse` 必须在真正调用该命名 Agent/Task 时拒绝；显式 SDK 内置
+`sonnet`／`opus`／`haiku`／`fable` model override 可安全绕过该
+定义。forced subagent model 未核验时拒绝全部 Agent/Task。清单调用不可用时主 Query 保持可用，但本 Query
+的全部 Agent/Task 均拒绝，待下次 Query rebuild 重新读取；初始化等待上限为 5 秒，超时按不可用处理。
+`env=0` 的 200k fallback 不能作为自定义子代理
+至少 200k 的证据。候选 profile 与最终清单一致时不额外重建。
+
+`[1m]` 既可能是 SDK wire 后缀，也可能是 catalog 中独立商品：先按 provider + 精确 ID 核验；精确商品
+存在时不得借用无后缀 sibling 的窗口或静默改投 sibling，未核验或小于 1M 必须拒绝。只有 catalog 不存在
+该精确 ID 时，才允许把用户／agent 定义里的 wire 后缀剥掉后核验基础 ID。provider-aware 路径中的不带
+后缀 `claude-*` 仍受 bundled CLI 原生分支约束；MAX 不得被宣称为控制了该分支。
+
+MAX env 是进程级约束，不能在已有 Query 上热改：窗口 env 值相同的切换继续走串行化的 SDK `setModel()`，并同步
+刷新当前模型的 effective window 与实际 wire model（包括 catalog 刷新造成的 `[1m]` 增删）；env 值改变则锁存到下一次真实发送，先关闭旧 Query，再用最新
+OAuth/env 和相同 resume/rewind 意图重建。关闭或重建失败必须保留待重试状态，不能让消息落进旧窗，
+也不能 replay 可能已有副作用的用户输入。只有 retirement 尚未开始时，A→B→A 才可合并成零次重建；
+队列已结束、close ACK 不确定或 runtime replay 失败后必须重试同一个 close-first 屏障。usage/compact
+始终描述已安装到 active Query 的 profile，不能提前展示仅已选择但尚未应用的窗口。本特性不主动改
+system prompt、tool/MCP 注册或用户消息；配置稳定时重建前缀逐字节相同，但仍沿用既有 Query rebuild
+对 contacts 与 MCP 配置重新求值的语义。已经运行的 Query 不会被 retroactively 修改；设置或 catalog
+变化从下一次需要新 profile 的发送生效。
+
+SSH 暂不接入 MAX profile：远端 Query env 不写此键，host usage/UI 与模型热切保持既有 catalog
+口径，不进入本地 profile compare／close-first 路径。要支持 SSH，必须先给 cc-manager 增加权威
+`supportedAgents` RPC 与可证明的 daemon close ACK；在此之前不得宣称远端已修复此问题。
+
 本机占用 ≥ 100%，或 host／bridge 自动 compact 已确定性失败（空摘要、compact 路径上的
 invalid-request 400）时，走
 `host-controlled rollover + model-controlled bounded retrieval`：host 关闭旧原生窗口、写交接并
