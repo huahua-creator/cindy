@@ -10,9 +10,10 @@
 
 import { z } from 'zod';
 
-import { withStore } from './_shared.js';
+import { withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
+import { classifyMemoryLane } from './resolve-store.js';
 
 export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -39,12 +40,16 @@ export function registerMemoryConsolidateTool(registry: MemoryToolRegistry, deps
         body: z.string().min(1),
       }),
     },
-    handler: async ({ sources, target }) =>
-      withStore(deps, (store) =>
+    handler: async ({ sources, target }) => {
+      if (classifyMemoryLane(deps.getSessionContext?.()) === 'xdt') {
+        return xdtWriteForbiddenResult();
+      }
+      return withStore(deps, (store) =>
         store.consolidate({
           sources,
           target: { ...target },
         }),
-      ),
+      );
+    },
   });
 }

@@ -16,10 +16,11 @@
 
 import { z } from 'zod';
 
-import { withStore } from './_shared.js';
+import { withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
 import type { WriteOptions } from '@cindy/maker-core';
+import { classifyMemoryLane } from './resolve-store.js';
 
 export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -50,7 +51,11 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       body: z.string().min(1),
       mode: z.enum(['create', 'update', 'append']).optional(),
     },
-    handler: async (args) =>
-      withStore(deps, (store) => store.write(args as WriteOptions)),
+    handler: async (args) => {
+      if (classifyMemoryLane(deps.getSessionContext?.()) === 'xdt') {
+        return xdtWriteForbiddenResult();
+      }
+      return withStore(deps, (store) => store.write(args as WriteOptions));
+    },
   });
 }

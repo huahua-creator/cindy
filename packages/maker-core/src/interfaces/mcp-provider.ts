@@ -1,4 +1,5 @@
 import type { AgentKind } from '../types/common.js';
+import type { PreparedMemorySession, XdtMemoryBindingV1 } from '../memory/xdt-binding.js';
 
 export type McpCallerKind = 'root' | 'descendant' | 'unknown';
 
@@ -39,6 +40,13 @@ export interface McpProviderContext {
    * 这里的调用时 ctx，再回退到闭包 ctx；不要信任工具入参自报身份。
    */
   getSessionContext?: () => McpProviderContext | undefined;
+  /**
+   * Session-frozen XdtMemoryBindingV1. 仅第 2 路 xdt fixture 携带。
+   * 现网 internal cindy_memory 调用无此字段 = 第 1 路，不得当成第 3 路 disabled。
+   */
+  memoryBinding?: XdtMemoryBindingV1;
+  preparedMemorySessionId?: string;
+  preparedMemorySession?: PreparedMemorySession;
 }
 
 /**

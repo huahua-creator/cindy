@@ -302,6 +302,13 @@ export interface MemoryMcpDeps {
   workdir: string;
   getSessionContext?: () => LiziMcpSessionContext;
   /**
+   * Host-frozen xdt prepared session lookup. 仅第 2 路 tool-call 使用。
+   * 第 1 路现网 internal 无 binding 字段时不得走这条路径。
+   */
+  getPreparedMemorySession?: (
+    preparedMemorySessionId: string,
+  ) => import('@cindy/maker-core').PreparedMemorySession | undefined;
+  /**
    * 搜历史对话 (Hermes 风格). 复用 desktop messages 表挂的 FTS5 索引。
    * 缺省 = host 没启用 → session_search tool 不注册 (跟 art video registry 同模式)。
    */
@@ -944,6 +951,18 @@ export interface LiziMcpSessionContext {
   mcpCallerKind?: LiziMcpCallerKind;
   /** True only when the harness bridge has installed provenance enforcement. */
   mcpCallerAttested?: boolean;
+  /**
+   * Session-frozen XdtMemoryBindingV1. 仅第 2 路 xdt fixture 携带。
+   * 现网 internal cindy_memory 调用无此字段 = 第 1 路，不得当成第 3 路 disabled。
+   */
+  memoryBinding?: import('@cindy/maker-core').XdtMemoryBindingV1;
+  preparedMemorySessionId?: string;
+  preparedMemorySession?: import('@cindy/maker-core').PreparedMemorySession;
+  /**
+   * 调用方请求 xdt 但尚未签发 XdtMemoryBindingV1 时置 'xdt'。
+   * 无 confirmed UUID 时走第 3 路 disabled，不得回落第 1 路 manager store。
+   */
+  memoryProviderRequested?: 'xdt';
 }
 
 export interface CodexHttpMcpConfig {

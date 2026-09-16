@@ -154,6 +154,7 @@ import { applyPiDisabledSkillSettings, filterPiDisabledProjectSkills, piDisabled
 import type { ReviewableAction } from '../shared/auto-review.js';
 import { resolveMemoryScopeKey } from '../../memory/scope-resolver.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
+import { isXdtMemoryBinding } from '../../memory/xdt-binding.js';
 import type {
   Capabilities,
   ManualCompactResult,
@@ -2459,9 +2460,14 @@ export class PiAgent extends BaseAgent {
     const reviewMode = opts.reviewMode === true;
     const botMemoryScope = opts.makerMemoryScopeKey?.startsWith('bot:') === true;
     const sessionMemoryEnabled = !reviewMode
-      && (opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false) === true
-      && (botMemoryScope || (this.memoryOverride ?? true));
-    const compactionMemoryEnabled = sessionMemoryEnabled && !!this.deps.makerMemory;
+      && (
+        Boolean(opts.preparedMemorySession)
+        || (
+          (opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false) === true
+          && (botMemoryScope || (this.memoryOverride ?? true))
+        )
+      );
+    const compactionMemoryEnabled = sessionMemoryEnabled && !opts.preparedMemorySession && !!this.deps.makerMemory;
     const makerMemoryPromptEnabled =
       sessionMemoryEnabled &&
       (opts.makerMemoryIndexSnapshot !== undefined || !!this.deps.makerMemory);
@@ -3469,6 +3475,12 @@ export class PiAgent extends BaseAgent {
           mcpCallerKind: 'root',
           mcpCallerAttested: true,
           ...(opts.remoteHostId ? { remoteHostId: opts.remoteHostId } : {}),
+          ...(opts.preparedMemorySession
+            ? {
+                memoryBinding: opts.preparedMemorySession.binding,
+                preparedMemorySessionId: opts.preparedMemorySession.preparedMemorySessionId,
+              }
+            : {}),
           },
         );
         mcpBridge = extra?.mcpBridge ?? null;
@@ -3498,12 +3510,19 @@ export class PiAgent extends BaseAgent {
       { mcpServerCount: registeredMcpServerNames.size },
     );
 
+    const preparedMemory = opts.preparedMemorySession;
+    if (preparedMemory && !isXdtMemoryBinding(preparedMemory.binding)) {
+      throw new Error('PreparedMemorySession.binding must be XdtMemoryBindingV1');
+    }
     // 压缩即记忆:makerMemory 开启时,把 pi 压缩上下文时丢弃内容的摘要沉淀成 `digest`
     // 记忆(进 FTS 可 memory_search 检索,但排除出 MEMORY.md / system prompt,不污染
     // curated 记忆)。gate 与 CC 同口径;best-effort,失败只 warn,绝不阻断会话。
     // memoryScopeKey / compactionMemoryEnabled 已在 MCP 注册前解析并冻进 ctx。
+    // 第 2 路 xdt prepared session 不注册 Pi internal digest callback。
     let makerMemoryIndex = '';
-    if (makerMemoryPromptEnabled) {
+    if (preparedMemory) {
+      makerMemoryIndex = preparedMemory.indexSnapshot.content;
+    } else if (makerMemoryPromptEnabled) {
       try {
         makerMemoryIndex = opts.makerMemoryIndexSnapshot
           ?? await (await this.deps.makerMemory!.getStore(memoryScopeKey)).getIndex();
@@ -3553,10 +3572,10 @@ export class PiAgent extends BaseAgent {
       opts.botRuntimeProfile ? undefined : this.deps.runtimeConfig.systemPrompt?.trim(),
       ghostRosterPrompt.trim(),
       reviewMode ? undefined : opts.botProfileContextPrompt?.trim(),
-      makerMemoryPromptEnabled && !opts.makerMemoryScopeKey?.startsWith('bot:')
+      (preparedMemory || (makerMemoryPromptEnabled && !opts.makerMemoryScopeKey?.startsWith('bot:')))
         ? MAKER_MEMORY_RULES
         : undefined,
-      makerMemoryIndex.trim(),
+      (preparedMemory ? preparedMemory.indexSnapshot.content : makerMemoryIndex).trim(),
       reviewMode ? undefined : opts.botUserProfilePrompt?.trim(),
       reviewMode || opts.botRuntimeProfile ? undefined : opts.userPrompt?.trim(),
       piExtraDirsPrompt(mutableExtraDirs, mutableWritableDirs),

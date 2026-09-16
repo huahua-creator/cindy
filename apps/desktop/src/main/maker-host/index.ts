@@ -38,6 +38,7 @@ import {
   type AgentKind,
   type McpProvider,
 } from '@cindy/maker-core';
+import { getPreparedMemorySession } from './prepared-memory-sessions.js';
 import type { ProviderView } from '@cindy/model-providers';
 import {
   getActiveCatalog,
@@ -937,6 +938,7 @@ export function getMaker(): Maker {
       },
       getAppVersion: () => app.getVersion(),
       getMakerMemoryManager: () => makerMemoryManager,
+      getPreparedMemorySession,
       lspPool: getLspPool(),
       pluginRegistry,
       resolveIOSSimulatorAccess,
@@ -1052,9 +1054,12 @@ export function getMaker(): Maker {
           id: params.sessionId,
           agentKind: params.agentKind,
           remoteHostId: params.remoteHostId,
+          // 第 3 路旧 Orca persist：显式 false，避免 ??= isEnabled() 把远端
+          // cindy_memory 注入当成开启，也避免 SSH preflight 把缺 binding 当 true。
+          makerMemoryEnabled: false,
         };
         await getRemoteSessionStartEnsure()?.({ createOpts });
-        return { makerMemoryEnabled: createOpts.makerMemoryEnabled === true };
+        return { makerMemoryEnabled: false };
       },
       orcaTeamStore: orcaTeamStoreAdapter,
       readLeadHistory: async ({ leadSessionId, fromMs, limit, cursor }) => {
