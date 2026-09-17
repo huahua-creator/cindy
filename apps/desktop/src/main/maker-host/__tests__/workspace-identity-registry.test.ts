@@ -29,11 +29,17 @@ import {
   readRegistry,
   __testOnly,
 } from '../workspace-identity-registry';
+import { attachSessionWorkspaceIdentity } from '../attach-session-workspace-identity';
+import {
+  getSessionWorkspaceIdentity,
+  resetSessionWorkspaceIdentityForTest,
+} from '../session-workspace-identity';
 
 const OWNER = 'owner-fixture-1';
 const temps: string[] = [];
 
 afterEach(async () => {
+  resetSessionWorkspaceIdentityForTest();
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -403,6 +409,14 @@ describe('half-cutover: UUID does not enable xdt', () => {
       agents: { 'claude-code': createAgent(startSession) },
       storage: createStorage(),
       logger,
+      lifecycleHooks: {
+        prepareStartOptions: async (sessionId, opts) => {
+          await attachSessionWorkspaceIdentity(sessionId, opts, {
+            assertEligibleDir: (dir) => dir,
+            resolveOwner: () => ({ dataOwnerId, ownerRoot }),
+          });
+        },
+      },
     });
     await maker.createSession({
       id: 'session-registered-dir',
@@ -411,6 +425,10 @@ describe('half-cutover: UUID does not enable xdt', () => {
       model: 'claude-sonnet-4-5',
     });
     expect(identity.canonicalWorkspaceId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(getSessionWorkspaceIdentity('session-registered-dir')).toEqual({
+      canonicalWorkspaceId: identity.canonicalWorkspaceId,
+      locatorDigest: identity.locatorDigest,
+    });
   });
 
   it('win32 case variant of a registered dir still has no XdtMemoryBindingV1 on createSession', async () => {
@@ -431,10 +449,19 @@ describe('half-cutover: UUID does not enable xdt', () => {
         return logger;
       },
     };
+    const identity = await lookupLocalAlias({ dataOwnerId, ownerRoot, absDir });
     const maker = new Maker({
       agents: { 'claude-code': createAgent(startSession) },
       storage: createStorage(),
       logger,
+      lifecycleHooks: {
+        prepareStartOptions: async (sessionId, opts) => {
+          await attachSessionWorkspaceIdentity(sessionId, opts, {
+            assertEligibleDir: (dir) => dir,
+            resolveOwner: () => ({ dataOwnerId, ownerRoot }),
+          });
+        },
+      },
     });
     const workingDir = process.platform === 'win32'
       ? absDir.replace(/[a-z]/, (ch) => ch.toUpperCase())
@@ -444,6 +471,10 @@ describe('half-cutover: UUID does not enable xdt', () => {
       agentKind: 'claude-code',
       workingDir,
       model: 'claude-sonnet-4-5',
+    });
+    expect(getSessionWorkspaceIdentity('session-registered-case')).toEqual({
+      canonicalWorkspaceId: identity.canonicalWorkspaceId,
+      locatorDigest: identity.locatorDigest,
     });
   });
 });

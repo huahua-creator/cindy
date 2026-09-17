@@ -39,6 +39,8 @@ import {
   type McpProvider,
 } from '@cindy/maker-core';
 import { getPreparedMemorySession } from './prepared-memory-sessions.js';
+import { attachSessionWorkspaceIdentity } from './attach-session-workspace-identity.js';
+import { forgetSessionWorkspaceIdentity } from './session-workspace-identity.js';
 import type { ProviderView } from '@cindy/model-providers';
 import {
   getActiveCatalog,
@@ -2614,6 +2616,7 @@ export function getMaker(): Maker {
           }
           // 所有创建路径共用的派发边界,opts.providerId 此刻已是本次启动的终值。
           freezeSessionProviderAtStart(sessionId, opts.providerId);
+          await attachSessionWorkspaceIdentity(sessionId, opts);
           await preparePersistedOrcaSessionStart(sessionId, opts as MakerSessionCreateOpts);
           if (opts.agentKind === 'pi' && opts.thinkingEnabled === undefined) {
             const thinkingEnabled = getThinkingEnabledFromMemory(
@@ -2770,6 +2773,9 @@ export function getMaker(): Maker {
               desktopMakerLogger.warn('worktree runtime lease release postponed', { sessionId, code: (error as NodeJS.ErrnoException).code });
             });
           }
+          // 段 4 快照必须在 rehydrateCloseSuppression 之外 forget：resume 按当前
+          // workingDir 重新 lookup，不得从 sqlite 或被跳过的 close 副作用里恢复 UUID。
+          forgetSessionWorkspaceIdentity(sessionId);
           // rehydrate close suppression 只跳过 worktree / temp file 这类重副作用;
           // registry 必须先清,后续 resume 会在首个 /responses 前重新登记,避免旧 thread prompt 驻留。
           unregisterCodexProxyPrompt(sessionId);
