@@ -367,6 +367,13 @@ export const MAKER_INVOKE = {
   /** 把旧 renderer/native memory 的关闭意图迁移为 main 端 maker:false override。 */
   MEMORY_PRESERVE_LEGACY_MAKER_DISABLED: 'maker:memory:preserve-legacy-maker-disabled',
   MEMORY_RESET_SETTINGS: 'maker:memory:reset-settings',
+  /**
+   * 段 3：owner-scoped 本机一条 alias。有 UUID ≠ 启用 xdt。
+   * lookup/create 只收 absDir（create 另需 confirmed:true）。renderer 不得传 owner/UUID。
+   * 不进 CREATE_SESSION，不挂 bootstrap-electron 早期 MEMORY_GET_SETTINGS 链。
+   */
+  WORKSPACE_IDENTITY_LOOKUP: 'maker:workspace-identity:lookup',
+  WORKSPACE_IDENTITY_CREATE: 'maker:workspace-identity:create',
   /** IM 普通会话默认 agent/model/effort/provider；仅影响新 IM session 和 Feishu `/new`。 */
   IM_DEFAULT_SETTINGS_GET: 'maker:im-default-settings:get',
   IM_DEFAULT_SETTINGS_SET: 'maker:im-default-settings:set',

@@ -3195,6 +3195,33 @@
           "confirm": "リセット",
           "cancel": "キャンセル"
         }
+      },
+      "workspaceIdentity": {
+            "label": "ローカルワークスペース識別子",
+            "description": "現在のローカルプロジェクトフォルダを不透明な識別子として登録します。登録しても xdt メモリは有効になりません。",
+            "register": "このフォルダを登録",
+            "noDirectory": "登録できるローカルプロジェクトがありません。先にローカルプロジェクトを開いてください。",
+            "statusMissing": "未登録",
+            "statusBound": "バインド済み {{id}} · {{digest}}",
+            "statusUnknown": "登録状態を取得できません",
+            "confirm": {
+                  "title": "このフォルダを登録しますか？",
+                  "description": "現在のローカルプロジェクトフォルダに不透明な識別子を作成します。メモリ提供元は切り替わらず、xdt も有効になりません。",
+                  "confirm": "登録",
+                  "cancel": "キャンセル"
+            },
+            "toast": {
+                  "registered": "フォルダを登録しました",
+                  "registerFailed": "フォルダを登録できませんでした"
+            },
+            "ipcError": {
+                  "WORKSPACE_IDENTITY_REQUIRED": "登録するにはログインして確認が必要です",
+                  "WORKSPACE_IDENTITY_CONFLICT": "このフォルダは別のワークスペース識別子に既にバインドされています",
+                  "CONFIG_INVALID": "ワークスペース識別子の記録が破損しています。元のファイルは保持されました",
+                  "MAKER_MEMORY_NOT_READY": "このフォルダはまだ登録できません",
+                  "UNSUPPORTED_CAPABILITY": "リモート、ダイアログ、または管理 worktree フォルダは登録できません",
+                  "INVALID_PARAMS": "入力が無効です。内容を確認してやり直してください。"
+            }
       }
     },
     "subagentModels": {

@@ -3196,6 +3196,33 @@
           "confirm": "Reset",
           "cancel": "Cancel"
         }
+      },
+      "workspaceIdentity": {
+            "label": "Local workspace identity",
+            "description": "Register the current local project directory as an opaque identity. Registration does not enable xdt memory.",
+            "register": "Register this folder",
+            "noDirectory": "No local project folder is available. Open a local project first.",
+            "statusMissing": "Not registered",
+            "statusBound": "Bound {{id}} · {{digest}}",
+            "statusUnknown": "Registration status unavailable",
+            "confirm": {
+                  "title": "Register this folder?",
+                  "description": "This creates an opaque identity for the current local project folder. It does not switch the memory provider or enable xdt.",
+                  "confirm": "Register",
+                  "cancel": "Cancel"
+            },
+            "toast": {
+                  "registered": "Folder registered",
+                  "registerFailed": "Could not register this folder"
+            },
+            "ipcError": {
+                  "WORKSPACE_IDENTITY_REQUIRED": "Sign in and confirm before registering a folder",
+                  "WORKSPACE_IDENTITY_CONFLICT": "This folder is already bound to another workspace identity",
+                  "CONFIG_INVALID": "The workspace identity record is damaged; the original file was kept",
+                  "MAKER_MEMORY_NOT_READY": "This folder is not ready to register",
+                  "UNSUPPORTED_CAPABILITY": "Remote, dialogue, or managed worktree folders cannot be registered",
+                  "INVALID_PARAMS": "Invalid input. Please check and try again."
+            }
       }
     },
     "subagentModels": {

@@ -412,6 +412,40 @@ describe('half-cutover: UUID does not enable xdt', () => {
     });
     expect(identity.canonicalWorkspaceId).toMatch(/^[0-9a-f-]{36}$/);
   });
+
+  it('win32 case variant of a registered dir still has no XdtMemoryBindingV1 on createSession', async () => {
+    const { dataOwnerId, ownerRoot, absDir } = await scope();
+    await createLocalAlias({ dataOwnerId, ownerRoot, absDir, confirmed: true });
+    const startSession = async (opts: CreateSessionOptions) => {
+      expect(opts.preparedMemorySession).toBeUndefined();
+      return createHandle('thread-internal');
+    };
+    const logger = {
+      trace() {},
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+      fatal() {},
+      child() {
+        return logger;
+      },
+    };
+    const maker = new Maker({
+      agents: { 'claude-code': createAgent(startSession) },
+      storage: createStorage(),
+      logger,
+    });
+    const workingDir = process.platform === 'win32'
+      ? absDir.replace(/[a-z]/, (ch) => ch.toUpperCase())
+      : absDir;
+    await maker.createSession({
+      id: 'session-registered-case',
+      agentKind: 'claude-code',
+      workingDir,
+      model: 'claude-sonnet-4-5',
+    });
+  });
 });
 
 describe('locator digest material', () => {

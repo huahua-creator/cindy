@@ -461,6 +461,7 @@ import { isBotCanonicalReplacementBusy } from './botCanonicalReplacementGuard.js
 import { configureBotCanonicalReplacementCoordinator } from './botCanonicalReplacementCoordinator.js';
 import { botSessionInputBlockReason } from './botSessionInputGuard.js';
 import { configureBotRuntimeEpochRefreshRequest } from './botRuntimeEpochRefreshSignal.js';
+import { createWorkspaceIdentityIpc } from './workspace-identity-ipc.js';
 import { createGitSnapshotCoordinator } from '../maker-host/git-snapshot-host.js';
 import {
   cancelCodexAuthModeChange,
@@ -1583,6 +1584,11 @@ const agentResourceSettingsIpc = createAgentResourceSettingsIpc({
   readState: readAgentResourceSettingsState,
   write: writeAgentResourceSetting,
   reset: resetAgentResourceSettings,
+});
+
+const workspaceIdentityIpc = createWorkspaceIdentityIpc({
+  assertTrustedSender: (event) =>
+    assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]),
 });
 
 function memorySettingsWire() {
@@ -18169,6 +18175,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     log.info('maker-memory:reset');
     return maker.makerMemory.resetAll();
   });
+
+  // 段 3：owner-scoped 本机一条 alias。不进 CREATE_SESSION，不挂早期 MEMORY_GET_SETTINGS。
+  ipcMain.handle(MAKER_INVOKE.WORKSPACE_IDENTITY_LOOKUP, async (event, body: unknown) =>
+    workspaceIdentityIpc.lookup(event, body),
+  );
+  ipcMain.handle(MAKER_INVOKE.WORKSPACE_IDENTITY_CREATE, async (event, body: unknown) =>
+    workspaceIdentityIpc.create(event, body),
+  );
 
   // 占位：MetaAgent 入口
   ipcMain.handle(MAKER_INVOKE.RUN, () => {

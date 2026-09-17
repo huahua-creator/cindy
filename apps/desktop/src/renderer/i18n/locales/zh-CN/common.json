@@ -3195,6 +3195,33 @@
           "confirm": "重置",
           "cancel": "取消"
         }
+      },
+      "workspaceIdentity": {
+            "label": "本机工作区身份",
+            "description": "把当前本机项目目录登记为一条不透明身份。登记不等于启用 xdt 记忆。",
+            "register": "登记此目录",
+            "noDirectory": "没有本机项目目录可登记。打开一个本地项目后再试。",
+            "statusMissing": "未登记",
+            "statusBound": "已绑定 {{id}} · {{digest}}",
+            "statusUnknown": "无法读取登记状态",
+            "confirm": {
+                  "title": "登记此目录？",
+                  "description": "将为当前本机项目目录生成一条不透明身份。这不会切换记忆来源，也不会启用 xdt。",
+                  "confirm": "登记",
+                  "cancel": "取消"
+            },
+            "toast": {
+                  "registered": "目录已登记",
+                  "registerFailed": "登记目录失败"
+            },
+            "ipcError": {
+                  "WORKSPACE_IDENTITY_REQUIRED": "需要已登录账号并确认后才能登记",
+                  "WORKSPACE_IDENTITY_CONFLICT": "该目录已绑定另一条工作区身份",
+                  "CONFIG_INVALID": "工作区身份记录已损坏，未改动原文件",
+                  "MAKER_MEMORY_NOT_READY": "当前目录还不能登记",
+                  "UNSUPPORTED_CAPABILITY": "远程、对话或托管 worktree 目录不能登记",
+                  "INVALID_PARAMS": "输入无效，请检查后重试"
+            }
       }
     },
     "subagentModels": {
