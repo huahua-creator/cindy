@@ -20,21 +20,47 @@ export function resolveXdtMemoryRoot(explicit?: string): string {
   return explicit ?? process.env.XDT_MEMORY_REPO ?? DEFAULT_XDT_MEMORY_ROOT;
 }
 
-function loadValidator(root: string): {
+export interface XdtSchemaValidator {
   validateUtf8Object: (input: {
     kind: string;
     utf8Bytes: string | Buffer | Uint8Array;
   }) => { ok: boolean; code?: string; message?: string };
-  KIND: { binding: string; frozenIndex: string; nativeProof: string };
-} {
+  KIND: {
+    binding: string;
+    frozenIndex: string;
+    nativeProof: string;
+    registryMin: string;
+    registry: string;
+    registryTransaction: string;
+  };
+  SETTINGS_UNCHANGED_SENTINEL: {
+    generation: string;
+    digest: string;
+  };
+}
+
+function loadValidator(root: string): XdtSchemaValidator {
   const validatorPath = path.join(root, 'src/schema-validator/index.mjs');
+  const patternsPath = path.join(root, 'src/schema-validator/patterns.mjs');
   try {
-    return require(validatorPath) as {
-      validateUtf8Object: (input: {
-        kind: string;
-        utf8Bytes: string | Buffer | Uint8Array;
-      }) => { ok: boolean; code?: string; message?: string };
-      KIND: { binding: string; frozenIndex: string; nativeProof: string };
+    const validator = require(validatorPath) as Omit<XdtSchemaValidator, 'SETTINGS_UNCHANGED_SENTINEL'> & {
+      SETTINGS_UNCHANGED_SENTINEL?: XdtSchemaValidator['SETTINGS_UNCHANGED_SENTINEL'];
+    };
+    const patterns = require(patternsPath) as {
+      KIND: XdtSchemaValidator['KIND'];
+      SETTINGS_UNCHANGED_SENTINEL: XdtSchemaValidator['SETTINGS_UNCHANGED_SENTINEL'];
+    };
+    const sentinel = validator.SETTINGS_UNCHANGED_SENTINEL ?? patterns.SETTINGS_UNCHANGED_SENTINEL;
+    if (!sentinel?.generation || !sentinel.digest) {
+      throw new Error('SETTINGS_UNCHANGED_SENTINEL missing from xdt-memory patterns.mjs');
+    }
+    if (!patterns.KIND?.registry || !patterns.KIND.registryTransaction || !patterns.KIND.registryMin) {
+      throw new Error('xdt-memory KIND.registry family missing; require origin/main ≥ 80c9b04');
+    }
+    return {
+      validateUtf8Object: validator.validateUtf8Object,
+      KIND: validator.KIND ?? patterns.KIND,
+      SETTINGS_UNCHANGED_SENTINEL: sentinel,
     };
   } catch (err) {
     throw new XdtPrepareError(
@@ -42,6 +68,10 @@ function loadValidator(root: string): {
       `xdt-memory schema-validator unavailable at ${validatorPath}: ${String(err)}`,
     );
   }
+}
+
+export function loadXdtSchemaValidator(root?: string): XdtSchemaValidator {
+  return loadValidator(resolveXdtMemoryRoot(root));
 }
 
 function assertSchemaOk(
