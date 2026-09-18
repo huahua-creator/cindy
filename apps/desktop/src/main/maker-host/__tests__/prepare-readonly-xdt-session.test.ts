@@ -3,10 +3,10 @@
  * 测试 UUID / data 只服务独立 temp git/data 树，禁止读生产 vault 或生产 xdt data。
  */
 
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -598,6 +598,184 @@ describe('prepareReadonlyXdtSession', () => {
     expect(await readFile(path.join(userData, 'codex-home', 'config.toml'), 'utf8')).toContain(
       '[mcp_servers.xdt-memory]',
     );
+  });
+
+  it('prepares a registered Codex session from a live sandbox toml copy without stanza', async () => {
+    const sandboxTomlPath = path.join(
+      process.env.APPDATA ?? path.join(homedir(), 'AppData', 'Roaming'),
+      'Cindy-dev2-xdtseg6',
+      'codex-home',
+      'config.toml',
+    );
+    const sandboxToml = await readFile(sandboxTomlPath, 'utf8');
+    const sandboxSha = createHash('sha256').update(sandboxToml, 'utf8').digest('hex');
+    expect(sandboxToml).not.toContain('[mcp_servers.xdt-memory]');
+    expect(sandboxToml.length).toBeGreaterThan(0);
+
+    const ownerRoot = await tempDir('cindy-xdt-gate4-owner-');
+    const absDir = await tempDir('cindy-xdt-gate4-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    const tree = await emptyIndexTree();
+    const userData = await tempDir('cindy-xdt-gate4-ud-');
+    await mkdir(path.join(userData, 'codex-home'), { recursive: true });
+    const copiedToml = path.join(userData, 'codex-home', 'config.toml');
+    await writeFile(copiedToml, sandboxToml, 'utf8');
+    assertNoProductionPaths(tree.repoRoot, tree.dataRoot, absDir, ownerRoot, userData);
+    expect(userData.replaceAll('\\', '/')).not.toMatch(/Cindy-dev2-xdtseg6/i);
+    expect(userData.replaceAll('\\', '/')).not.toMatch(/\/Cindy(\/|$)/);
+    expect(ownerRoot.replaceAll('\\', '/')).not.toMatch(/Roaming\/Cindy/i);
+
+    const nativeAgent = createAgent({
+      kind: 'codex',
+      startSession: async () => createHandle('thread-codex-gate4', 'codex'),
+    });
+    const setMemory = vi.spyOn(nativeAgent, 'setMemory');
+    rememberSessionWorkspaceIdentity('session-codex-sandbox-copy', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'codex',
+      workingDir: absDir,
+      model: 'gpt-5.4',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-codex-sandbox-copy', opts, {
+      getAgent: () => nativeAgent,
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => userData,
+    });
+    expect(isXdtMemoryBinding(opts.preparedMemorySession?.binding)).toBe(true);
+    expect(opts.preparedMemorySession?.binding.canonicalWorkspaceId).toBe(
+      created.canonicalWorkspaceId,
+    );
+    expect(getPreparedMemorySession(opts.preparedMemorySession!.preparedMemorySessionId)).toBe(
+      opts.preparedMemorySession,
+    );
+    expect(setMemory).toHaveBeenCalled();
+    expect(await readFile(copiedToml, 'utf8')).toBe(sandboxToml);
+    expect(createHash('sha256').update(await readFile(sandboxTomlPath, 'utf8'), 'utf8').digest('hex')).toBe(
+      sandboxSha,
+    );
+    await expect(stat(path.join(path.dirname(path.dirname(sandboxTomlPath)), 'owners'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('skips registered Codex when a contiguous stanza is copied instead of the sandbox toml', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-gate4-skip-owner-');
+    const absDir = await tempDir('cindy-xdt-gate4-skip-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    const tree = await emptyIndexTree();
+    const userData = await tempDir('cindy-xdt-gate4-skip-ud-');
+    await mkdir(path.join(userData, 'codex-home'), { recursive: true });
+    const stanza = [
+      '[mcp_servers.xdt-memory]',
+      'command = "node"',
+      'args = ["server.mjs"]',
+      'cwd = "/tmp/xdt-memory"',
+      '',
+      '[mcp_servers.xdt-memory.env]',
+      'XDT_MEMORY_INTROSPECTION_ONLY = "1"',
+      '',
+    ].join('\n');
+    await writeFile(path.join(userData, 'codex-home', 'config.toml'), stanza, 'utf8');
+    const setMemory = vi.fn(async () => ({ effective: 'next-session' as const }));
+    const nativeAgent = createAgent({
+      kind: 'codex',
+      startSession: async () => createHandle('thread-codex-gate4-skip', 'codex'),
+      setMemory,
+    });
+    rememberSessionWorkspaceIdentity('session-codex-contiguous-skip', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'codex',
+      workingDir: absDir,
+      model: 'gpt-5.4',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-codex-contiguous-skip', opts, {
+      getAgent: () => nativeAgent,
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => userData,
+    });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    expect(setMemory).not.toHaveBeenCalled();
+  });
+
+  it('leaves an unregistered Codex session without preparedMemorySession even with sandbox toml copy', async () => {
+    const sandboxTomlPath = path.join(
+      process.env.APPDATA ?? path.join(homedir(), 'AppData', 'Roaming'),
+      'Cindy-dev2-xdtseg6',
+      'codex-home',
+      'config.toml',
+    );
+    const sandboxToml = await readFile(sandboxTomlPath, 'utf8');
+    const ownerRoot = await tempDir('cindy-xdt-gate4-unreg-owner-');
+    const absDir = await tempDir('cindy-xdt-gate4-unreg-ws-');
+    const tree = await emptyIndexTree();
+    const userData = await tempDir('cindy-xdt-gate4-unreg-ud-');
+    await mkdir(path.join(userData, 'codex-home'), { recursive: true });
+    await writeFile(path.join(userData, 'codex-home', 'config.toml'), sandboxToml, 'utf8');
+    const setMemory = vi.fn(async () => ({ effective: 'next-session' as const }));
+    const nativeAgent = createAgent({
+      kind: 'codex',
+      startSession: async (opts) => {
+        expect(opts.preparedMemorySession).toBeUndefined();
+        return createHandle('thread-codex-unreg', 'codex');
+      },
+      setMemory,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'codex',
+      workingDir: absDir,
+      model: 'gpt-5.4',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-codex-unregistered-copy', opts, {
+      getAgent: () => nativeAgent,
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => userData,
+    });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    expect(getSessionWorkspaceIdentity('session-codex-unregistered-copy')).toBeUndefined();
+    expect(setMemory).not.toHaveBeenCalled();
   });
 
   it('aborts when qualified dataRoot is missing and does not mkdir', async () => {
