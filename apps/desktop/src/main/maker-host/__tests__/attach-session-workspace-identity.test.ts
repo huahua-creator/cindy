@@ -400,13 +400,17 @@ describe('attachSessionWorkspaceIdentity', () => {
     const onClose = src.indexOf('onClose: async (sessionId) => {');
     const forget = src.indexOf('forgetSessionWorkspaceIdentity(sessionId);', onClose);
     const suppression = src.indexOf('rehydrateCloseSuppression.runOnCloseSideEffects(sessionId', onClose);
+    const prepareReadonly = src.indexOf('await prepareReadonlyXdtSession(sessionId, opts');
+    const forgetPrepared = src.indexOf('forgetPreparedMemorySessionForSessionId(sessionId);', onClose);
     expect(attach).toBeGreaterThan(0);
-    expect(persisted).toBeGreaterThan(attach);
+    expect(prepareReadonly).toBeGreaterThan(attach);
+    expect(persisted).toBeGreaterThan(prepareReadonly);
     expect(forget).toBeGreaterThan(onClose);
-    expect(suppression).toBeGreaterThan(forget);
-    expect(src).not.toMatch(/opts\.preparedMemorySession\s*=/);
+    expect(forgetPrepared).toBeGreaterThan(forget);
+    expect(suppression).toBeGreaterThan(forgetPrepared);
     expect(src).not.toMatch(/opts\.memoryBinding\s*=/);
     expect(src).not.toMatch(/opts\.memoryProviderRequested\s*=/);
+    expect(src).not.toMatch(/forgetPreparedMemorySession\(sessionId\)/);
   });
 });
 

@@ -603,6 +603,37 @@ describe('Maker session creation singleflight', () => {
     expect(second.instanceId).not.toBe(first.instanceId);
   });
 
+  it('mints sessionInstanceId before prepareStartOptions and reuses it for startSession and Session.instanceId', async () => {
+    const seen: string[] = [];
+    const startSession = vi.fn(async (opts: CreateSessionOptions) => {
+      seen.push(opts.sessionInstanceId ?? '');
+      return createHandle({ id: 'thread-instance' });
+    });
+    const maker = new Maker({
+      agents: { 'claude-code': createAgent(startSession, 'claude-code') },
+      storage: createStorage(),
+      logger: createLogger(),
+      lifecycleHooks: {
+        prepareStartOptions: async (_sessionId, opts) => {
+          expect(opts.sessionInstanceId).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          );
+          seen.push(opts.sessionInstanceId ?? '');
+        },
+      },
+    });
+    const session = await maker.createSession({
+      id: 'session-instance-align',
+      agentKind: 'claude-code',
+      workingDir: '/repo',
+      model: 'claude-sonnet-4-5',
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(seen[1]);
+    expect(session.instanceId).toBe(seen[0]);
+    expect(startSession.mock.calls[0]?.[0].sessionInstanceId).toBe(session.instanceId);
+  });
+
   it('shares one startup when the same business session is restored concurrently', async () => {
     let resolveStart!: (handle: AgentSessionHandle) => void;
     const startPending = new Promise<AgentSessionHandle>((resolve) => {

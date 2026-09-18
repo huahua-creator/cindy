@@ -1,7 +1,7 @@
 /**
  * Host-only in-memory registry for xdt PreparedMemorySession.
- * 本刀只服务 fixture UUID + fixture repo，不读生产 xdt data。
- * 产品入口：temp UUID 树 → memory_index → prepareAndRemember → createSession({ preparedMemorySession })。
+ * 段 1 fixture 与段 5 生产只读 prepare 共用 remember / get / forget。
+ * forget 的键永远是 preparedId，禁止 forgetPreparedMemorySession(sessionId)。
  */
 
 import {
@@ -11,9 +11,17 @@ import {
 } from '@cindy/maker-core';
 
 const sessions = new Map<string, PreparedMemorySession>();
+const sessionIdToPreparedId = new Map<string, string>();
 
 export function rememberPreparedMemorySession(session: PreparedMemorySession): void {
   sessions.set(session.preparedMemorySessionId, session);
+}
+
+export function bindPreparedMemorySessionToSessionId(
+  sessionId: string,
+  preparedMemorySessionId: string,
+): void {
+  sessionIdToPreparedId.set(sessionId, preparedMemorySessionId);
 }
 
 export function getPreparedMemorySession(
@@ -26,7 +34,18 @@ export function forgetPreparedMemorySession(preparedMemorySessionId: string): vo
   sessions.delete(preparedMemorySessionId);
 }
 
-/** Host fixture 入口：调 memory_index、冻结、markXdtReadOnlyScope、登记。 */
+export function forgetPreparedMemorySessionForSessionId(sessionId: string): void {
+  const preparedId = sessionIdToPreparedId.get(sessionId);
+  sessionIdToPreparedId.delete(sessionId);
+  if (preparedId) forgetPreparedMemorySession(preparedId);
+}
+
+export function resetPreparedMemorySessionsForTest(): void {
+  sessions.clear();
+  sessionIdToPreparedId.clear();
+}
+
+/** Host fixture / 生产只读入口：调 memory_index、冻结、markXdtReadOnlyScope、登记。 */
 export async function prepareAndRememberMemorySession(
   input: PrepareMemorySessionInput,
 ): Promise<PreparedMemorySession> {

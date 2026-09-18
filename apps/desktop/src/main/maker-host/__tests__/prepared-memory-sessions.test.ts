@@ -20,8 +20,12 @@ import {
 } from '@cindy/maker-core';
 
 import {
+  bindPreparedMemorySessionToSessionId,
   forgetPreparedMemorySession,
+  forgetPreparedMemorySessionForSessionId,
+  getPreparedMemorySession,
   prepareAndRememberMemorySession,
+  resetPreparedMemorySessionsForTest,
 } from '../prepared-memory-sessions';
 import { readCreateSessionOpts } from '../../maker-ipc/sessionRequest';
 
@@ -35,7 +39,7 @@ const HEX_B = 'b'.repeat(64);
 const temps: string[] = [];
 
 afterEach(async () => {
-  forgetPreparedMemorySession(PREPARED_SESSION);
+  resetPreparedMemorySessionsForTest();
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -202,5 +206,26 @@ describe('Host fixture startup path', () => {
         snapshot: { content: '# handwritten\n' },
       } as never),
     ).rejects.toThrow(/memory_index|caller-supplied snapshot/);
+  });
+
+  it('forgets prepared by preparedId via the sessionId reverse index, not sessionId', async () => {
+    const prepared = await prepareAndRememberMemorySession({
+      agentKind: 'claude-code',
+      sessionInstanceId: SESSION_INSTANCE,
+      binding: fixtureBinding(),
+      isolatedStanzaPresent: true,
+      preparedMemorySessionId: PREPARED_SESSION,
+      nativeSetResult: { effective: 'immediate' },
+      nativeObservedStatus: { enabled: false, source: 'host-runtime' },
+      indexSource: await emptyIndexSource(),
+      xdtReadOnlyScope: '/tmp/xdt-fixture-repo',
+      makerMemory: { markXdtReadOnlyScope() {} },
+    });
+    bindPreparedMemorySessionToSessionId('business-session', prepared.preparedMemorySessionId);
+    expect(getPreparedMemorySession(prepared.preparedMemorySessionId)).toBe(prepared);
+    forgetPreparedMemorySession('business-session');
+    expect(getPreparedMemorySession(prepared.preparedMemorySessionId)).toBe(prepared);
+    forgetPreparedMemorySessionForSessionId('business-session');
+    expect(getPreparedMemorySession(prepared.preparedMemorySessionId)).toBeUndefined();
   });
 });

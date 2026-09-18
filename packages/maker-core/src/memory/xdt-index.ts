@@ -19,6 +19,11 @@ export interface XdtIndexSource {
   repoRoot: string;
   dataRoot: string;
   workspace: string;
+  /**
+   * 生产只读 prepare 用 `'cindy-host-readonly'`。缺省仍是段 1 fixture
+   * `'cindy-host-fixture'`，不得破坏既有 fixture 测试。
+   */
+  device?: 'cindy-host-fixture' | 'cindy-host-readonly';
 }
 
 export interface MemoryIndexRecord {
@@ -58,7 +63,7 @@ export function createXdtMemoryIndexClient(
     workspace: source.workspace,
     mutationMode: 'disabled',
     legacyMode: 'disabled',
-    device: 'cindy-host-fixture',
+    device: source.device ?? 'cindy-host-fixture',
   });
 }
 
