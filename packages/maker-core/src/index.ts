@@ -150,7 +150,9 @@ export {
   assertNativeProofSchema,
   resolveXdtMemoryRoot,
   loadXdtSchemaValidator,
+  loadUpdateCindyCodexConfig,
   type XdtSchemaValidator,
+  type UpdateCindyCodexConfigFn,
 } from './memory/xdt-schema.js';
 export { freezeUtcZ } from './memory/xdt-native-proof.js';
 

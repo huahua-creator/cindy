@@ -74,6 +74,31 @@ export function loadXdtSchemaValidator(root?: string): XdtSchemaValidator {
   return loadValidator(resolveXdtMemoryRoot(root));
 }
 
+export type UpdateCindyCodexConfigFn = (
+  text: string,
+  request: { state: 'remove' },
+) => string;
+
+/**
+ * 只加载 xdt-memory `scripts/cindy-codex-config.mjs` 的纯函数
+ * `updateCindyCodexConfig`。禁止 spawn CLI（atomicWrite 会 mkdir）。
+ */
+export function loadUpdateCindyCodexConfig(root?: string): UpdateCindyCodexConfigFn {
+  const scriptPath = path.join(resolveXdtMemoryRoot(root), 'scripts/cindy-codex-config.mjs');
+  try {
+    const mod = require(scriptPath) as { updateCindyCodexConfig?: UpdateCindyCodexConfigFn };
+    if (typeof mod.updateCindyCodexConfig !== 'function') {
+      throw new Error('updateCindyCodexConfig export missing');
+    }
+    return mod.updateCindyCodexConfig;
+  } catch (err) {
+    throw new XdtPrepareError(
+      'CONFIG_INVALID',
+      `xdt-memory cindy-codex-config unavailable at ${scriptPath}: ${String(err)}`,
+    );
+  }
+}
+
 function assertSchemaOk(
   kind: string,
   value: unknown,

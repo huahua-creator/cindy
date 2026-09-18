@@ -1,10 +1,10 @@
 /**
  * Effective writable Memory source inventory for Host-only xdt prepare.
  *
- * 阶段性 Cindy isolated Codex direct stanza 仍是第二个可写源。本刀不删 stanza。
- * 仅 Cindy Codex + provider=xdt 的 enabled prepare 因 stanza 返回
- * DUPLICATE_WRITABLE_MEMORY_SOURCE。Claude Code / Pi fixture 的 inventory 仍跑，
- * 但 Codex isolated stanza 不算进 Claude/Pi session 的 writable set。
+ * 生产隔离 home 不得再有可写 xdt stanza（段 6 用户授权取代「不得删除阶段性 stanza」）。
+ * 检测函数仍用于 fail-closed：Cindy Codex + provider=xdt 的 enabled prepare
+ * 若 stanza 仍在，返回 DUPLICATE_WRITABLE_MEMORY_SOURCE。Claude Code / Pi
+ * 即使 stanza 在也不算进 writable set。
  */
 
 import { readFileSync } from 'node:fs';

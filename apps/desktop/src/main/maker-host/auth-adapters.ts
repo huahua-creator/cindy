@@ -37,6 +37,7 @@ import { createLogger } from '../logger.js';
 import { prepareCodexGlobalSkillsLinks } from './codex-global-skills.js';
 import { prepareCodexGlobalRulesCopy } from './codex-global-rules.js';
 import { prepareCodexGlobalPluginsBridge } from './codex-global-plugins.js';
+import { ensureIsolatedCodexXdtStanzaRemoved } from './remove-isolated-codex-xdt-stanza.js';
 import { DESKTOP_CAPABILITY_ROUTING_POLICY } from './capability-routing.js';
 import { prepareSharedGlobalSkillLinks } from './shared-global-skills.js';
 import { PreparationCache } from './preparation-cache.js';
@@ -1475,6 +1476,10 @@ export class DesktopCodexAuthAdapter implements AuthAdapter {
   }
 
   private async runEnsureGlobalCodexPlugins(): Promise<void> {
+    // 段 6：先清隔离 xdt stanza，再跑 plugins 桥（同一隔离 config.toml，禁止抢写）。
+    await ensureIsolatedCodexXdtStanzaRemoved({
+      userDataDir: () => app.getPath('userData'),
+    });
     const pluginsOutcome = await prepareCodexGlobalPluginsBridge(this.codexHome, {
       capabilityRouting: DESKTOP_CAPABILITY_ROUTING_POLICY,
     }).then(
