@@ -103,32 +103,76 @@ export async function removeIsolatedCodexXdtStanza(
 
 let completed: Promise<RemoveIsolatedCodexXdtStanzaResult> | null = null;
 let inFlight: Promise<RemoveIsolatedCodexXdtStanzaResult> | null = null;
+let lastCleanConfigPath: string | null = null;
 
 /**
- * 进程内 once：成功后不再重写 toml。失败（坏 TOML）不 sticky，下次仍 fail-closed。
- * 并发调用复用同一 Promise。
+ * sticky 只跳过「文件仍无 stanza」的重写：成功后再 ensure 时先读盘，用纯函数
+ * `update(..., {state:'remove'})` 探测；next===existing 才短接。stanza 写回 /
+ * 路径变了 / 坏 TOML → 清 sticky 再跑 remove。失败不 sticky。并发共用 inFlight。
+ * 不要每个 createSession 无条件写 toml。
  */
+async function fileStillHasNoStanza(
+  overrides: Partial<RemoveIsolatedCodexXdtStanzaDeps>,
+  configPath: string,
+): Promise<boolean> {
+  const userDataDir = overrides.userDataDir?.();
+  if (!userDataDir) return false;
+  const loaded = await coreDeps();
+  const isolatedConfigPath = overrides.isolatedConfigPath ?? loaded.isolatedConfigPath;
+  if (isolatedConfigPath(userDataDir) !== configPath) return false;
+
+  let existing: string;
+  try {
+    existing = await fsp.readFile(configPath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    return false;
+  }
+
+  const loadUpdate = overrides.loadUpdate ?? loaded.loadUpdate;
+  try {
+    const next = loadUpdate(overrides.xdtMemoryRoot)(existing, { state: 'remove' });
+    return next === existing;
+  } catch {
+    // 坏 TOML / 非 contiguous：探测失败不得当「无 stanza」短接。
+    return false;
+  }
+}
+
+async function ensureOnce(
+  overrides: Partial<RemoveIsolatedCodexXdtStanzaDeps>,
+): Promise<RemoveIsolatedCodexXdtStanzaResult> {
+  if (completed && lastCleanConfigPath) {
+    if (await fileStillHasNoStanza(overrides, lastCleanConfigPath)) {
+      return completed;
+    }
+    completed = null;
+    lastCleanConfigPath = null;
+  }
+  try {
+    const result = await removeIsolatedCodexXdtStanza(overrides);
+    lastCleanConfigPath = result.configPath;
+    completed = Promise.resolve(result);
+    return result;
+  } catch (err) {
+    completed = null;
+    lastCleanConfigPath = null;
+    throw err;
+  }
+}
+
 export function ensureIsolatedCodexXdtStanzaRemoved(
   overrides: Partial<RemoveIsolatedCodexXdtStanzaDeps> = {},
 ): Promise<RemoveIsolatedCodexXdtStanzaResult> {
-  if (completed) return completed;
-  if (!inFlight) {
-    inFlight = removeIsolatedCodexXdtStanza(overrides).then(
-      (result) => {
-        completed = Promise.resolve(result);
-        inFlight = null;
-        return result;
-      },
-      (err) => {
-        inFlight = null;
-        throw err;
-      },
-    );
-  }
+  if (inFlight) return inFlight;
+  inFlight = ensureOnce(overrides).finally(() => {
+    inFlight = null;
+  });
   return inFlight;
 }
 
 export function resetIsolatedCodexXdtStanzaRemovalForTest(): void {
   completed = null;
   inFlight = null;
+  lastCleanConfigPath = null;
 }

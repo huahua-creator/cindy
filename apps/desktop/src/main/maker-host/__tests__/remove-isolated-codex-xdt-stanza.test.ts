@@ -297,18 +297,117 @@ describe('ensureIsolatedCodexXdtStanzaRemoved once', () => {
     const configPath = cindyIsolatedCodexConfigPath(userData);
     await mkdir(path.dirname(configPath), { recursive: true });
     await writeFile(configPath, `${otherTables()}${contiguousStanza()}`, 'utf8');
+    const update = vi.fn((text: string, request: { state: 'remove' }) =>
+      loadUpdateCindyCodexConfig()(text, request),
+    );
+    const loadUpdate = vi.fn(() => update);
+    const first = await ensureIsolatedCodexXdtStanzaRemoved({
+      userDataDir: () => userData,
+      loadUpdate,
+    });
+    expect(first.status).toBe('removed');
+    const afterFirst = await readFile(configPath, 'utf8');
+    const second = await ensureIsolatedCodexXdtStanzaRemoved({
+      userDataDir: () => userData,
+      loadUpdate,
+    });
+    expect(second).toEqual(first);
+    expect(await readFile(configPath, 'utf8')).toBe(afterFirst);
+    expect(loadUpdate).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a fake isolatedConfigPath that is not userData/codex-home/config.toml', async () => {
+    const userData = await tempDir('cindy-xdt-stanza-fake-path-');
+    const fakeDir = path.join(userData, 'elsewhere');
+    await mkdir(fakeDir, { recursive: true });
+    const fakePath = path.join(fakeDir, 'config.toml');
+    const original = contiguousStanza();
+    await writeFile(fakePath, original, 'utf8');
+    await expect(
+      ensureIsolatedCodexXdtStanzaRemoved({
+        userDataDir: () => userData,
+        isolatedConfigPath: () => fakePath,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    expect(await readFile(fakePath, 'utf8')).toBe(original);
+    await expect(readdir(path.join(userData, 'codex-home'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('fails closed when userDataDir is missing or empty', async () => {
+    await expect(ensureIsolatedCodexXdtStanzaRemoved({})).rejects.toMatchObject({
+      code: 'CONFIG_INVALID',
+    });
+    await expect(
+      ensureIsolatedCodexXdtStanzaRemoved({ userDataDir: () => '' }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+  });
+
+  it('does not sticky a CONFIG_INVALID failure; the next ensure still fails closed', async () => {
+    const userData = await tempDir('cindy-xdt-stanza-bad-once-');
+    const configPath = cindyIsolatedCodexConfigPath(userData);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    const original = 'not = [toml';
+    await writeFile(configPath, original, 'utf8');
+    const loadUpdate = vi.fn((root?: string) => loadUpdateCindyCodexConfig(root));
+    await expect(
+      ensureIsolatedCodexXdtStanzaRemoved({
+        userDataDir: () => userData,
+        loadUpdate,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    await expect(
+      ensureIsolatedCodexXdtStanzaRemoved({
+        userDataDir: () => userData,
+        loadUpdate,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    expect(loadUpdate).toHaveBeenCalledTimes(2);
+    expect(await readFile(configPath, 'utf8')).toBe(original);
+  });
+
+  it('shares one inFlight across concurrent ensure calls', async () => {
+    const userData = await tempDir('cindy-xdt-stanza-concurrent-');
+    const configPath = cindyIsolatedCodexConfigPath(userData);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(configPath, `${otherTables()}${contiguousStanza()}`, 'utf8');
+    const loadUpdate = vi.fn((root?: string) => loadUpdateCindyCodexConfig(root));
+    const first = ensureIsolatedCodexXdtStanzaRemoved({
+      userDataDir: () => userData,
+      loadUpdate,
+    });
+    const second = ensureIsolatedCodexXdtStanzaRemoved({
+      userDataDir: () => userData,
+      loadUpdate,
+    });
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toBe(b);
+    expect(a.status).toBe('removed');
+    expect(loadUpdate).toHaveBeenCalledTimes(1);
+    expect(await readFile(configPath, 'utf8')).not.toContain('[mcp_servers.xdt-memory]');
+  });
+
+  it('cleans a stanza written back after a successful sticky run without reset', async () => {
+    const userData = await tempDir('cindy-xdt-stanza-rewrite-');
+    const configPath = cindyIsolatedCodexConfigPath(userData);
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeFile(configPath, `${otherTables()}${contiguousStanza()}`, 'utf8');
     const loadUpdate = vi.fn((root?: string) => loadUpdateCindyCodexConfig(root));
     const first = await ensureIsolatedCodexXdtStanzaRemoved({
       userDataDir: () => userData,
       loadUpdate,
     });
     expect(first.status).toBe('removed');
+    await writeFile(configPath, `${otherTables()}${contiguousStanza()}`, 'utf8');
     const second = await ensureIsolatedCodexXdtStanzaRemoved({
       userDataDir: () => userData,
       loadUpdate,
     });
-    expect(second).toEqual(first);
-    expect(loadUpdate).toHaveBeenCalledTimes(1);
+    expect(second.status).toBe('removed');
+    expect(await readFile(configPath, 'utf8')).not.toContain('[mcp_servers.xdt-memory]');
+    expect(loadUpdate).toHaveBeenCalledTimes(3);
   });
 });
 
