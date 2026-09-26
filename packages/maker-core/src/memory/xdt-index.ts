@@ -24,6 +24,11 @@ export interface XdtIndexSource {
    * `'cindy-host-fixture'`，不得破坏既有 fixture 测试。
    */
   device?: 'cindy-host-fixture' | 'cindy-host-readonly';
+  /**
+   * mutationMode=disabled 时额外只读的历史 basename 根。
+   * 不得写入 MemoryStore.workspace / record.workspace / record.key。
+   */
+  extraReadWorkspaces?: readonly string[];
 }
 
 export interface MemoryIndexRecord {
@@ -64,6 +69,7 @@ export function createXdtMemoryIndexClient(
     mutationMode: 'disabled',
     legacyMode: 'disabled',
     device: source.device ?? 'cindy-host-fixture',
+    extraReadWorkspaces: source.extraReadWorkspaces,
   });
 }
 

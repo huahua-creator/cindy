@@ -253,6 +253,86 @@ describe('prepareMemorySession fixture lane', () => {
     expect(prepared.indexSnapshot.content).toContain('project_fixture.md');
   });
 
+  it('projects extraReadWorkspaces basename records while binding stays UUID', async () => {
+    const stub = managerStub();
+    const indexSource = await emptyIndexSource();
+    await seedV2ProjectHead(indexSource.dataRoot, 'legacy_basename');
+    const prepared = await prepareMemorySession({
+      agentKind: 'claude-code',
+      sessionInstanceId: SESSION_INSTANCE,
+      binding: fixtureBinding(),
+      isolatedStanzaPresent: true,
+      preparedMemorySessionId: PREPARED_SESSION,
+      indexSource: {
+        ...indexSource,
+        extraReadWorkspaces: ['legacy_basename'],
+      },
+      xdtReadOnlyScope: '/tmp/xdt-fixture-repo',
+      makerMemory: stub.makerMemory,
+      ...nativeOk(),
+    });
+    expect(prepared.binding.canonicalWorkspaceId).toBe(FIXTURE_WORKSPACE);
+    expect(prepared.indexSnapshot.content).toContain('project_fixture.md');
+    expect(prepared.records.map((row) => row.filename)).toEqual(['project_fixture.md']);
+    await expect(prepared.sessionStore.read('project_fixture.md')).resolves.toMatchObject({
+      body: 'fixture body',
+    });
+  });
+
+  it('projects extra-only records by snapshot filename when two extra roots share no filename', async () => {
+    const stub = managerStub();
+    const indexSource = await emptyIndexSource();
+    await seedV2ProjectHead(indexSource.dataRoot, 'legacy_a');
+    const secondDir = path.join(indexSource.dataRoot, 'records', 'legacy_b', 'other');
+    await mkdir(secondDir, { recursive: true });
+    await writeFile(
+      path.join(secondDir, 'other.json'),
+      `${JSON.stringify({
+        schema_version: 2,
+        id: 'other',
+        key: 'legacy_b/other',
+        title: 'Other',
+        description: 'second extra root',
+        content: 'other body',
+        kind: 'project',
+        scope: 'workspace',
+        workspace: 'legacy_b',
+        tags: [],
+        source_harness: 'cindy',
+        source_ref: null,
+        archived: false,
+        archive_reason: null,
+        updated_at: '2026-09-16T00:00:00.000Z',
+        device: 'fixture',
+        parent_revision: null,
+        operation_id: randomUUID(),
+        request_digest: HEX_B,
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    const prepared = await prepareMemorySession({
+      agentKind: 'claude-code',
+      sessionInstanceId: SESSION_INSTANCE,
+      binding: fixtureBinding(),
+      isolatedStanzaPresent: true,
+      preparedMemorySessionId: PREPARED_SESSION,
+      indexSource: {
+        ...indexSource,
+        extraReadWorkspaces: ['legacy_a', 'legacy_b'],
+      },
+      xdtReadOnlyScope: '/tmp/xdt-fixture-repo',
+      makerMemory: stub.makerMemory,
+      ...nativeOk(),
+    });
+    expect(prepared.records.map((row) => row.filename).sort()).toEqual([
+      'project_fixture.md',
+      'project_other.md',
+    ]);
+    await expect(prepared.sessionStore.read('project_other.md')).resolves.toMatchObject({
+      body: 'other body',
+    });
+  });
+
   it('rejects caller-supplied snapshot.content instead of calling memory_index', async () => {
     const stub = managerStub();
     await expect(

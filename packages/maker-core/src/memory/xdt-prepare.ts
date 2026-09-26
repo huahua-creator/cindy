@@ -171,6 +171,12 @@ async function loadFacadeRecords(
   return projectFacadeRecordsFromIndex({
     snapshot,
     getRecord: async (_filename, parsed) => {
+      const byFilename = await client.get?.(parsed.filename);
+      if (byFilename) return byFilename;
+      if (parsed.key) {
+        const bySnapshotKey = await client.get?.(parsed.key);
+        if (bySnapshotKey) return bySnapshotKey;
+      }
       const canonicalKey = `${workspace}/${parsed.name}`;
       const byCanonical = await client.get?.(canonicalKey);
       if (byCanonical) return byCanonical;

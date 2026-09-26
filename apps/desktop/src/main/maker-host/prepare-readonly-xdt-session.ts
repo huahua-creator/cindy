@@ -77,6 +77,52 @@ function assertExistingDirectory(abs: string, label: string): void {
   }
 }
 
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function safeSegmentEquals(value: string): boolean {
+  const normalized = value
+    .normalize('NFKC')
+    .trim()
+    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 100);
+  return normalized === value;
+}
+
+/**
+ * Host-only extra read label. Basename is never written as canonical workspace.
+ * Illegal labels are dropped (UUID-only empty shell), not rewritten.
+ */
+export function extraReadWorkspacesFromWorkingDir(
+  workingDir: string | undefined,
+  canonicalWorkspaceId: string,
+  dataRoot?: string,
+): string[] {
+  if (!workingDir) return [];
+  const rawSegment = workingDir.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() ?? '';
+  if (!rawSegment || rawSegment === '.' || rawSegment === '..' || rawSegment === '_global') {
+    return [];
+  }
+  if (/[\\/\0]/.test(rawSegment)) return [];
+  const base = path.basename(path.resolve(workingDir));
+  if (!base || base !== rawSegment) return [];
+  if (base === '.' || base === '..' || base === '_global') return [];
+  if (UUID_V4.test(base) || base === canonicalWorkspaceId) return [];
+  if (path.win32.isAbsolute(base) || path.isAbsolute(base)) return [];
+  if (!safeSegmentEquals(base)) return [];
+  if (dataRoot) {
+    const recordsRoot = path.resolve(dataRoot, 'records');
+    const resolved = path.resolve(recordsRoot, base);
+    if (path.basename(resolved) !== base) return [];
+    const relative = path.relative(recordsRoot, resolved);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || resolved === recordsRoot) {
+      return [];
+    }
+  }
+  return [base];
+}
+
 function defaultIndexSource(workspace: string): XdtIndexSource {
   const repoRoot = resolveXdtMemoryRoot();
   const dataRoot = process.env.XDT_MEMORY_HOME || path.join(repoRoot, 'data');
@@ -237,6 +283,12 @@ export async function prepareReadonlyXdtSession(
   const indexSource = deps.resolveIndexSource(identity.canonicalWorkspaceId);
   assertExistingDirectory(indexSource.repoRoot, 'xdt repoRoot');
   assertExistingDirectory(indexSource.dataRoot, 'xdt dataRoot');
+  const extraReadWorkspaces = indexSource.extraReadWorkspaces
+    ?? extraReadWorkspacesFromWorkingDir(
+      opts.workingDir,
+      identity.canonicalWorkspaceId,
+      indexSource.dataRoot,
+    );
 
   const binding = assembleBinding({
     canonicalWorkspaceId: identity.canonicalWorkspaceId,
@@ -261,6 +313,7 @@ export async function prepareReadonlyXdtSession(
       indexSource: {
         ...indexSource,
         device: indexSource.device ?? 'cindy-host-readonly',
+        extraReadWorkspaces,
       },
       xdtReadOnlyScope: identity.canonicalWorkspaceId,
       makerMemory: manager,
