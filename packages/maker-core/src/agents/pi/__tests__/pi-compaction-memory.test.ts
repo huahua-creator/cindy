@@ -228,4 +228,45 @@ describe('PiAgent compaction → memory digest', () => {
     expect(writeMock).not.toHaveBeenCalled();
     await handle.close();
   });
+
+  it('does not treat a write as success or write twice if identity drifts during await', async () => {
+    const enabled = { value: true };
+    const debug = vi.fn();
+    const warn = vi.fn();
+    const logger: Logger = { ...noopLogger, debug, warn };
+    let releaseWrite!: () => void;
+    let markStarted!: () => void;
+    const writeStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    writeMock = vi.fn(async () => {
+      markStarted();
+      await writeGate;
+      return { ok: true, filename: 'digest_x.md' };
+    });
+    const deps = buildDeps(true);
+    deps.logger = logger;
+    (deps.makerMemory as { isEnabled: () => boolean; write: typeof writeMock }).isEnabled = () => enabled.value;
+    (deps.makerMemory as { write: typeof writeMock }).write = writeMock;
+    const handle = await new PiAgent(deps).startSession({
+      sessionId: 'cm-session',
+      workingDir: cwd,
+      model: 'm',
+      makerMemoryEnabled: true,
+    });
+    fireCompaction('summary during write');
+    await writeStarted;
+    enabled.value = false;
+    releaseWrite();
+    await flush();
+    expect(writeMock).toHaveBeenCalledTimes(1);
+    expect(debug.mock.calls.map((call) => call[0])).not.toContain('pi compaction digest saved to memory');
+    expect(warn.mock.calls.map((call) => call[0])).toContain(
+      'pi compaction digest write drifted after persist (non-fatal)',
+    );
+    await handle.close();
+  });
 });

@@ -3990,6 +3990,13 @@ export class PiAgent extends BaseAgent {
               body,
               mode: 'create',
             });
+            if (sessionRevoked() || identityDrifted()) {
+              this.deps.logger.warn('pi compaction digest write drifted after persist (non-fatal)', {
+                slug,
+                reason,
+              });
+              return;
+            }
             this.deps.logger.debug('pi compaction digest saved to memory', {
               slug,
               reason,
