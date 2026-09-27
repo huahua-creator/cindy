@@ -155,7 +155,7 @@ describe('executeHbusXdtFacadeWrite', () => {
     expect(parse(first).ok).toBe(true);
     const firstLedger = await readInvocationLedger(owner, {
       threadId: SESSION_ID,
-      turnId: 'mcp-session-a',
+      turnId: SESSION_INSTANCE,
       callId: 'rpc-1',
     });
     const replay = await executeHbusXdtFacadeWrite({
@@ -167,11 +167,36 @@ describe('executeHbusXdtFacadeWrite', () => {
     expect(parse(replay).ok).toBe(true);
     const replayLedger = await readInvocationLedger(owner, {
       threadId: SESSION_ID,
-      turnId: 'mcp-session-a',
+      turnId: SESSION_INSTANCE,
       callId: 'rpc-1',
     });
     expect(replayLedger?.invocationId).toBe(firstLedger?.invocationId);
     expect(replayLedger?.facadeOperationId).toBe(firstLedger?.facadeOperationId);
+
+    const reconnect = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'rpc-1',
+      mcpSessionId: 'mcp-session-b',
+      sessionContext: ctx,
+    }, deps);
+    expect(parse(reconnect).ok).toBe(true);
+    const reconnectLedger = await readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: SESSION_INSTANCE,
+      callId: 'rpc-1',
+    });
+    expect(reconnectLedger?.invocationId).toBe(firstLedger?.invocationId);
+    expect(reconnectLedger?.facadeOperationId).toBe(firstLedger?.facadeOperationId);
+    await expect(readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: 'mcp-session-a',
+      callId: 'rpc-1',
+    })).resolves.toBeUndefined();
+    await expect(readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: 'mcp-session-b',
+      callId: 'rpc-1',
+    })).resolves.toBeUndefined();
 
     const second = await executeHbusXdtFacadeWrite({
       args: WRITE_ARGS,
@@ -182,7 +207,7 @@ describe('executeHbusXdtFacadeWrite', () => {
     expect(parse(second).ok).toBe(true);
     const secondLedger = await readInvocationLedger(owner, {
       threadId: SESSION_ID,
-      turnId: 'mcp-session-a',
+      turnId: SESSION_INSTANCE,
       callId: 'rpc-2',
     });
     expect(secondLedger?.invocationId).not.toBe(firstLedger?.invocationId);
@@ -203,6 +228,35 @@ describe('executeHbusXdtFacadeWrite', () => {
         workingDir: '/tmp/xdt-fixture-repo',
         sessionId: SESSION_ID,
         sessionInstanceId: SESSION_INSTANCE,
+        preparedMemorySessionId: PREPARED_SESSION,
+        memoryBinding: session.binding,
+      },
+    }, {
+      getOwner: () => ({ dataOwnerId: OWNER, ownerRoot }),
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedMemorySession: () => session,
+      resolveWriteRoots: () => ({ repoRoot: ownerRoot, dataRoot: ownerRoot }),
+    });
+    expect(parse(result)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    await expect(stat(path.join(ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    expect(frozenWrite).not.toHaveBeenCalled();
+  });
+
+  it('rejects a missing sessionInstanceId before minting a ledger row', async () => {
+    const ownerRoot = await tempDir('cindy-hbus-missing-instance-');
+    expect(ownerRoot.replaceAll('\\', '/')).not.toMatch(/AppData\/Roaming\/Cindy/i);
+    const frozenWrite = vi.fn();
+    const session = prepared(PRODUCTION_WRITE_WORKSPACE, frozenWrite);
+    const result = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'rpc-missing-instance',
+      mcpSessionId: 'mcp-session-should-not-become-turn',
+      sessionContext: {
+        agentKind: 'claude-code' as const,
+        workingDir: '/tmp/xdt-fixture-repo',
+        sessionId: SESSION_ID,
         preparedMemorySessionId: PREPARED_SESSION,
         memoryBinding: session.binding,
       },

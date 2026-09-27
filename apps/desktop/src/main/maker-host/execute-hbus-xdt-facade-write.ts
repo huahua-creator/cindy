@@ -122,7 +122,8 @@ export async function executeHbusXdtFacadeWrite(
       prepared,
       identity: {
         threadId: sessionId,
-        turnId: input.mcpSessionId ?? sessionInstanceId,
+        // MCP session id is connection-scoped and must not enter the ledger key.
+        turnId: sessionInstanceId,
         callId: input.callId,
       },
       innerName: 'memory_write',
