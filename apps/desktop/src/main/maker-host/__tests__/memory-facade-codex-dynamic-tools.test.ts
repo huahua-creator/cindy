@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   loadXdtSchemaValidator,
+  resolveXdtMemoryRoot,
   type PreparedMemorySession,
 } from '@cindy/maker-core';
 
@@ -145,12 +146,49 @@ async function ownerScope() {
   return { dataOwnerId: OWNER, ownerRoot };
 }
 
-function createProvider(owner: { dataOwnerId: string; ownerRoot: string }, prepared: PreparedMemorySession | undefined) {
+async function isolatedWriteTarget(workspace = WRITE_WORKSPACE) {
+  const repoRoot = await tempDir('cindy-facade-1c-stub-repo-');
+  const dataRoot = path.join(repoRoot, 'data');
+  await mkdir(dataRoot, { recursive: true });
+  return { repoRoot, dataRoot, workspace };
+}
+
+function stubWriteStore() {
+  return {
+    async get() { return null; },
+    async upsert(input: Record<string, unknown>) {
+      return {
+        shared: true,
+        phase: 'shared',
+        operation_id: input.operation_id,
+        key: `${String(input.id)}`,
+        revision: 'sha256:' + '1'.repeat(64),
+        push_verified: true,
+      };
+    },
+  };
+}
+
+function createProvider(
+  owner: { dataOwnerId: string; ownerRoot: string },
+  prepared: PreparedMemorySession | undefined,
+  writeTarget?: { repoRoot: string; dataRoot: string; workspace: string },
+) {
+  const bound = prepared ? { ...prepared, binding: { ...prepared.binding } } : undefined;
+  if (bound && writeTarget) {
+    bound.binding.canonicalWorkspaceId = writeTarget.workspace;
+  }
   return createMemoryFacadeCodexDynamicToolProvider({
     getOwner: () => owner,
     getCapabilitySecret: () => FIXTURE_SECRET,
-    getPreparedBySessionId: (sessionId) => (sessionId === SESSION_ID ? prepared : undefined),
+    getPreparedBySessionId: (sessionId) => (sessionId === SESSION_ID ? bound : undefined),
     advertiseTools: true,
+    ...(writeTarget
+      ? {
+          getWriteTarget: () => writeTarget,
+          createWriteStore: () => stubWriteStore(),
+        }
+      : {}),
   });
 }
 
@@ -199,6 +237,10 @@ describe('memory facade Codex dynamic tools', () => {
     );
     expect(payload(result)).toEqual(XDT_WRITE_FORBIDDEN);
     expect(constructs).toEqual([]);
+    await expect(stat(path.join(owner.ownerRoot, 'facade-journal'))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
   });
 
   it('does not advertise tools without a prepared xdt session', () => {
@@ -246,13 +288,14 @@ describe('memory facade Codex dynamic tools', () => {
     });
   });
 
-  it('mints with fixture HMAC, claims, and still returns live deny-write', async () => {
+  it('mints with fixture HMAC, claims, and writes only the injected isolated tree', async () => {
     const owner = await ownerScope();
-    const provider = createProvider(owner, fixturePrepared());
+    const writeTarget = await isolatedWriteTarget();
+    const provider = createProvider(owner, fixturePrepared(), writeTarget);
     const ids = { threadId: 'thread-a', turnId: 'turn-a', callId: 'call-a' };
     const result = await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
-    expect(payload(result)).toEqual(XDT_WRITE_FORBIDDEN);
-    expect(result?.success).toBe(false);
+    expect(payload(result).shared).toBe(true);
+    expect(result?.success).toBe(true);
     const first = result?.contentItems[0];
     const text = first && 'text' in first ? first.text ?? '' : '';
     expect(text).not.toContain(FIXTURE_SECRET);
@@ -288,7 +331,7 @@ describe('memory facade Codex dynamic tools', () => {
 
   it('reuses invocationId and facadeOperationId on the same call identity', async () => {
     const owner = await ownerScope();
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     const ids = { threadId: 'thread-b', turnId: 'turn-b', callId: 'call-b' };
     await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
     const first = await readInvocationLedger(owner, ids);
@@ -300,7 +343,7 @@ describe('memory facade Codex dynamic tools', () => {
 
   it('treats the same args with a different callId as a second operation', async () => {
     const owner = await ownerScope();
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     await provider.callTool(writeCall(WRITE_ARGS, { threadId: 't', turnId: 'u', callId: 'c-1' }), CONTEXT);
     await provider.callTool(writeCall(WRITE_ARGS, { threadId: 't', turnId: 'u', callId: 'c-2' }), CONTEXT);
     const a = await readInvocationLedger(owner, { threadId: 't', turnId: 'u', callId: 'c-1' });
@@ -312,9 +355,10 @@ describe('memory facade Codex dynamic tools', () => {
   it('reuses the disk ledger after a Host restart of the provider instance', async () => {
     const owner = await ownerScope();
     const ids = { threadId: 'thread-restart', turnId: 'turn-restart', callId: 'call-restart' };
-    await createProvider(owner, fixturePrepared()).callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
+    const writeTarget = await isolatedWriteTarget();
+    await createProvider(owner, fixturePrepared(), writeTarget).callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
     const first = await readInvocationLedger(owner, ids);
-    await createProvider(owner, fixturePrepared()).callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
+    await createProvider(owner, fixturePrepared(), writeTarget).callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
     const second = await readInvocationLedger(owner, ids);
     expect(second?.invocationId).toBe(first?.invocationId);
     expect(second?.facadeOperationId).toBe(first?.facadeOperationId);
@@ -323,7 +367,7 @@ describe('memory facade Codex dynamic tools', () => {
   it('returns MUTATION_IDENTITY_UNAVAILABLE when the ledger is lost after a claim', async () => {
     const owner = await ownerScope();
     const ids = { threadId: 'thread-lost', turnId: 'turn-lost', callId: 'call-lost' };
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
     const digest = callIdentityDigest(ids);
     await rm(ledgerPath(owner, digest), { force: true });
@@ -337,7 +381,7 @@ describe('memory facade Codex dynamic tools', () => {
   it('returns MUTATION_IDENTITY_UNAVAILABLE on ledger digest mix', async () => {
     const owner = await ownerScope();
     const ids = { threadId: 'thread-mix', turnId: 'turn-mix', callId: 'call-mix' };
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
     const file = ledgerPath(owner, callIdentityDigest(ids));
     const raw = JSON.parse(await readFile(file, 'utf8')) as Record<string, unknown>;
@@ -349,7 +393,7 @@ describe('memory facade Codex dynamic tools', () => {
 
   it('does not count the retry ledger toward 1a journal capacity', async () => {
     const owner = await ownerScope();
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     await provider.callTool(writeCall(WRITE_ARGS, { threadId: 't', turnId: 'u', callId: 'c' }), CONTEXT);
     const journalDir = ownerJournalDir(owner);
     const ledgerRoot = path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR);
@@ -360,13 +404,13 @@ describe('memory facade Codex dynamic tools', () => {
 
   it('does not nest journal locks on the first successful mint', async () => {
     const owner = await ownerScope();
-    const provider = createProvider(owner, fixturePrepared());
+    const provider = createProvider(owner, fixturePrepared(), await isolatedWriteTarget());
     const result = await provider.callTool(
       writeCall(WRITE_ARGS, { threadId: 't-lock', turnId: 'u-lock', callId: 'c-lock' }),
       CONTEXT,
     );
     expect(payload(result).code).not.toBe('JOURNAL_BUSY');
-    expect(payload(result)).toEqual(XDT_WRITE_FORBIDDEN);
+    expect(payload(result).shared).toBe(true);
   });
 
   it('rejects append, delete, and consolidate before claim', async () => {
@@ -474,13 +518,26 @@ describe('memory facade Codex dynamic tools', () => {
       remove: () => ({ success: true }),
       list: () => [],
     })).toThrow(/FACADE_SECRET_UNAVAILABLE/);
+    const writeTarget = await isolatedWriteTarget();
+    const prepared = fixturePrepared();
+    prepared.binding.canonicalWorkspaceId = writeTarget.workspace;
     const provider = createMemoryFacadeCodexDynamicToolProvider({
       getOwner: () => owner,
       getCapabilitySecret: () => {
         throw new FacadeSecretError('safeStorage encryption is unavailable');
       },
-      getPreparedBySessionId: () => fixturePrepared(),
+      getPreparedBySessionId: () => prepared,
       advertiseTools: true,
+      getWriteTarget: () => writeTarget,
+      createWriteStore: () => {
+        throw new Error('must not construct');
+      },
+    });
+    await expect(stat(path.join(owner.ownerRoot, 'facade-journal'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
     });
     const result = await provider.callTool(
       writeCall(WRITE_ARGS, { threadId: 't-secret', turnId: 'u-secret', callId: 'c-secret' }),
@@ -490,9 +547,41 @@ describe('memory facade Codex dynamic tools', () => {
     await expect(stat(path.join(owner.ownerRoot, 'facade-capability.secret'))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    await expect(stat(path.join(owner.ownerRoot, 'facade-journal'))).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+  });
+
+  it('constructs MemoryStore with injected dataRoot, not production dataRoot', async () => {
+    const owner = await ownerScope();
+    const writeTarget = await isolatedWriteTarget();
+    const prepared = fixturePrepared();
+    prepared.binding.canonicalWorkspaceId = writeTarget.workspace;
+    const productionData = path.join(resolveXdtMemoryRoot(), 'data');
+    const seen: Array<Record<string, unknown>> = [];
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => prepared,
+      advertiseTools: true,
+      getWriteTarget: () => writeTarget,
+      createWriteStore: (options) => {
+        seen.push(options);
+        return stubWriteStore();
+      },
+    });
+    const result = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't-ctor', turnId: 'u-ctor', callId: 'c-ctor' }),
+      CONTEXT,
+    );
+    expect(payload(result).shared).toBe(true);
+    expect(seen.length).toBeGreaterThan(0);
+    for (const options of seen) {
+      expect(String(options.dataRoot).toLowerCase()).not.toBe(productionData.toLowerCase());
+      expect(String(options.dataRoot).toLowerCase()).toBe(writeTarget.dataRoot.toLowerCase());
+      expect(String(options.repoRoot).toLowerCase()).toBe(writeTarget.repoRoot.toLowerCase());
+    }
   });
 
   it('creates on an isolated git tree with shared:true and reuses operationId on retry', { timeout: 60_000 }, async () => {
