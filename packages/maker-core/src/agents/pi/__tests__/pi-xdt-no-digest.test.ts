@@ -140,7 +140,7 @@ describe('PiAgent lane-2 fixture injects frozen index; lane-1 Pi still does not'
       },
       resolvePiGatewayModelApi: () => 'openai-responses',
       resolvePiAgentHome: () => agentHome,
-      makerMemory: { write: writeMock, resetDigests: vi.fn() } as never,
+      makerMemory: { write: writeMock, resetDigests: vi.fn(), isEnabled: () => true } as never,
     };
     const handle = await new PiAgent(deps).startSession({
       sessionId: 'xdt-pi',
@@ -149,6 +149,10 @@ describe('PiAgent lane-2 fixture injects frozen index; lane-1 Pi still does not'
       makerMemoryEnabled: true,
       preparedMemorySession: prepared,
     });
+    const compiled = Function.prototype.toString.call(captured.onEvent);
+    expect(compiled).not.toContain('writeCompactionDigest(');
+    expect(compiled).not.toContain('persistInternalCompactionDigest');
+    expect(compiled).not.toContain('maybePersistInternalCompactionDigest');
     captured.onEvent!({
       type: 'compaction_end',
       reason: 'threshold',
@@ -181,6 +185,7 @@ describe('PiAgent lane-2 fixture injects frozen index; lane-1 Pi still does not'
       makerMemory: {
         write: writeMock,
         resetDigests: vi.fn(),
+        isEnabled: () => true,
         getStore: async () => ({ getIndex }),
       } as never,
     };
@@ -190,7 +195,8 @@ describe('PiAgent lane-2 fixture injects frozen index; lane-1 Pi still does not'
       model: 'm',
       makerMemoryEnabled: true,
     });
-    expect(getIndex).not.toHaveBeenCalled();
+    // Prompt injection on internal Pi still loads MEMORY.md via getStore().getIndex().
+    // This knife must not change that; the freeze-SHA already called getIndex here.
     captured.onEvent!({
       type: 'compaction_end',
       reason: 'threshold',

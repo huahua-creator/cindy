@@ -94,7 +94,15 @@ describe('PiAgent compaction → memory digest', () => {
       },
       resolvePiGatewayModelApi: () => 'openai-responses',
       resolvePiAgentHome: () => agentHome,
-      ...(withManager ? { makerMemory: { write: writeMock, resetDigests: resetDigestsMock } as never } : {}),
+      ...(withManager
+        ? {
+            makerMemory: {
+              write: writeMock,
+              resetDigests: resetDigestsMock,
+              isEnabled: () => memoryEnabled,
+            } as never,
+          }
+        : {}),
     };
   }
 
@@ -186,5 +194,38 @@ describe('PiAgent compaction → memory digest', () => {
     const agent = new PiAgent(buildDeps(true));
     await expect(agent.resetMemory()).resolves.toEqual({ removedEntries: 2 });
     expect(resetDigestsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('binds writeCompactionDigest into the compiled onEvent for internal sessions', async () => {
+    const handle = await start(true);
+    const compiled = Function.prototype.toString.call(captured.onEvent);
+    expect(compiled).toContain('maybePersistInternalCompactionDigest');
+    await handle.close();
+  });
+
+  it('does not write after the session is closed', async () => {
+    const handle = await start(true);
+    await handle.close();
+    fireCompaction('late summary after close');
+    await flush();
+    expect(writeMock).not.toHaveBeenCalled();
+  });
+
+  it('does not write when makerMemoryEnabled flips off after start', async () => {
+    const enabled = { value: true };
+    const deps = buildDeps(true);
+    deps.runtimeConfig = { ...deps.runtimeConfig, get makerMemoryEnabled() { return enabled.value; } };
+    (deps.makerMemory as { isEnabled: () => boolean }).isEnabled = () => enabled.value;
+    const handle = await new PiAgent(deps).startSession({
+      sessionId: 'cm-session',
+      workingDir: cwd,
+      model: 'm',
+      makerMemoryEnabled: true,
+    });
+    enabled.value = false;
+    fireCompaction('summary after disable');
+    await flush();
+    expect(writeMock).not.toHaveBeenCalled();
+    await handle.close();
   });
 });

@@ -3534,33 +3534,14 @@ export class PiAgent extends BaseAgent {
     }
     const digestSlugBase = slugifyForMemory(opts.sessionId ?? `pi-${process.pid}`, 24);
     let digestSeq = 0;
-    const writeCompactionDigest = async (summary: string, reason: string): Promise<void> => {
-      const manager = this.deps.makerMemory;
-      if (!compactionMemoryEnabled || !manager) return;
-      const body = truncateToByteBudget(summary, PI_DIGEST_MAX_BODY_BYTES);
-      const seq = ++digestSeq;
-      // slug 唯一:sessionId 片段 + 递增序号;resume/跨会话用 Date.now 防撞名(create 模式撞名会抛)。
-      const slug = slugifyForMemory(`digest-${digestSlugBase}-${Date.now()}-${seq}`, 64);
-      try {
-        await manager.write(memoryScopeKey, {
-          type: 'digest',
-          name: slug,
-          // reason 收敛(去换行 + 截断):防某版本 pi 给出长 reason 撑爆 maxTitleLen(100)被吞。
-          title: `PI compaction digest (${oneLineDescription(reason, 40)})`,
-          description: oneLineDescription(summary, 180),
-          body,
-          mode: 'create',
-        });
-        this.deps.logger.debug('pi compaction digest saved to memory', {
-          slug,
-          reason,
-        });
-      } catch (err) {
-        this.deps.logger.warn('pi compaction digest write failed (non-fatal)', {
-          message: err instanceof Error ? err.message : String(err),
-        });
-      }
-    };
+    const digestIdentity = compactionMemoryEnabled
+      ? Object.freeze({
+          sessionId: opts.sessionId ?? '',
+          memoryScopeKey,
+          makerMemoryEnabled: (opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false) === true,
+          compactionMemoryEnabled: true as const,
+        })
+      : null;
 
     // 追加而非替换:pi 默认 prompt(工具用法/工程约定)原样保留,只追加 host 产品段
     // 与用户段。前缀稳定(默认 prompt 静态),易变内容禁止进入(缓存规则 3.1)。
@@ -3984,6 +3965,52 @@ export class PiAgent extends BaseAgent {
       });
     };
     let closed = false;
+    const persistInternalCompactionDigest = digestIdentity
+      ? async (summary: string, reason: string): Promise<void> => {
+          const manager = this.deps.makerMemory;
+          if (!manager) return;
+          const sessionRevoked = () => closed || piProcessExited || proc.isClosed;
+          const identityDrifted = () => (
+            digestIdentity.sessionId !== (opts.sessionId ?? '')
+            || digestIdentity.memoryScopeKey !== memoryScopeKey
+            || Boolean(opts.preparedMemorySession)
+            || manager.isEnabled(digestIdentity.memoryScopeKey) !== true
+          );
+          if (sessionRevoked() || identityDrifted() || digestIdentity.makerMemoryEnabled !== true) return;
+          const body = truncateToByteBudget(summary, PI_DIGEST_MAX_BODY_BYTES);
+          const seq = ++digestSeq;
+          const slug = slugifyForMemory(`digest-${digestSlugBase}-${Date.now()}-${seq}`, 64);
+          try {
+            if (sessionRevoked() || identityDrifted()) return;
+            await manager.write(digestIdentity.memoryScopeKey, {
+              type: 'digest',
+              name: slug,
+              title: `PI compaction digest (${oneLineDescription(reason, 40)})`,
+              description: oneLineDescription(summary, 180),
+              body,
+              mode: 'create',
+            });
+            this.deps.logger.debug('pi compaction digest saved to memory', {
+              slug,
+              reason,
+            });
+          } catch (err) {
+            this.deps.logger.warn('pi compaction digest write failed (non-fatal)', {
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      : undefined;
+    const maybePersistInternalCompactionDigest = persistInternalCompactionDigest
+      ? (event: PiRpcEvent): void => {
+          if (event.type !== 'compaction_end') return;
+          const summary = (event.result as { summary?: unknown } | null)?.summary;
+          if (typeof summary === 'string' && summary.trim().length > 0) {
+            const reason = typeof event.reason === 'string' ? event.reason : 'auto';
+            void persistInternalCompactionDigest(summary.trim(), reason);
+          }
+        }
+      : undefined;
     /**
      * Has the Pi process itself exited?
      *
@@ -5246,10 +5273,7 @@ export class PiAgent extends BaseAgent {
         effectivePiBinaryPath,
       );
       sessionTransport = transport;
-      proc = new PiRpcProcess({
-        transport,
-        logger: this.deps.logger,
-        onEvent: (event: PiRpcEvent) => {
+      const handlePiRpcEvent = (event: PiRpcEvent): void => {
           if (event.type === 'agent_start' || event.type === 'agent_settled') {
             piAgentLifecycleSequence += 1;
           }
@@ -5369,15 +5393,6 @@ export class PiAgent extends BaseAgent {
             }));
             return;
           }
-          // 压缩即记忆:compaction_end 带摘要正文时沉淀 digest(auto/manual 都触发,pi
-          // 文档:两种压缩都发此事件)。fire-and-forget,不阻塞事件流。
-          if (event.type === 'compaction_end' && compactionMemoryEnabled) {
-            const summary = (event.result as { summary?: unknown } | null)?.summary;
-            if (typeof summary === 'string' && summary.trim().length > 0) {
-              const reason = typeof event.reason === 'string' ? event.reason : 'auto';
-              void writeCompactionDigest(summary.trim(), reason);
-            }
-          }
           // Pi 的真实 turn 终态是 agent_settled；auto-retry 耗尽则先发 terminal error。
           // 两条路径都必须立即清本轮 host policy，避免它泄漏到后续 Desktop turn。
           if (event.type === 'agent_settled' || (event.type === 'auto_retry_end' && event.success !== true)) {
@@ -5406,7 +5421,16 @@ export class PiAgent extends BaseAgent {
               }
             }
           }
-        },
+        };
+      proc = new PiRpcProcess({
+        transport,
+        logger: this.deps.logger,
+        onEvent: maybePersistInternalCompactionDigest
+          ? (event: PiRpcEvent) => {
+              handlePiRpcEvent(event);
+              maybePersistInternalCompactionDigest(event);
+            }
+          : handlePiRpcEvent,
         onExit: ({ code, signal }) => {
           const hostAbortRequested = isCurrentTurnHostAbortRequested(ctx);
           piProcessExited = true;
