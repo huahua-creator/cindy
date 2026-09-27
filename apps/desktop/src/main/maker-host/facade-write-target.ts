@@ -7,9 +7,11 @@ import path from 'node:path';
 
 import { resolveXdtMemoryRoot, UUID_V4_RE } from '@cindy/maker-core';
 
+export const PRODUCTION_WRITE_WORKSPACE = 'dc703d5e-1ce0-4543-be4d-014cfa3a1955';
+export const SANDBOX_WRITE_WORKSPACE = '5fb84df7-8de0-4f74-a7ff-6c7b0850f317';
 export const FORBIDDEN_WRITE_WORKSPACES = Object.freeze([
-  'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
-  '5fb84df7-8de0-4f74-a7ff-6c7b0850f317',
+  PRODUCTION_WRITE_WORKSPACE,
+  SANDBOX_WRITE_WORKSPACE,
 ]);
 
 export type FacadeWriteTargetErrorCode =
@@ -62,7 +64,10 @@ function samePath(left: string, right: string): boolean {
   return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
 }
 
-export function assertWriteTarget(target: Partial<FacadeWriteTarget> | undefined): FacadeWriteTarget {
+export function assertWriteTarget(
+  target: Partial<FacadeWriteTarget> | undefined,
+  options?: { allowProductionWorkspace?: boolean; allowProductionTree?: boolean },
+): FacadeWriteTarget {
   if (!target) {
     throw new FacadeWriteTargetError('WRITE_TARGET_REQUIRED', 'write target is required');
   }
@@ -78,8 +83,11 @@ export function assertWriteTarget(target: Partial<FacadeWriteTarget> | undefined
   if (!UUID_V4_RE.test(workspace)) {
     throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'workspace must be UUID v4');
   }
-  if (FORBIDDEN_WRITE_WORKSPACES.includes(workspace)) {
-    throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'workspace is a production or sandbox UUID');
+  if (workspace === SANDBOX_WRITE_WORKSPACE) {
+    throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'workspace is a sandbox UUID');
+  }
+  if (workspace === PRODUCTION_WRITE_WORKSPACE && options?.allowProductionWorkspace !== true) {
+    throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'workspace is a production UUID');
   }
 
   const repoReal = realpathOrThrow(repoRoot, 'repoRoot');
@@ -90,7 +98,10 @@ export function assertWriteTarget(target: Partial<FacadeWriteTarget> | undefined
     tryRealpath(process.env.XDT_MEMORY_REPO),
     tryRealpath('D:/AI/Codex/xdt-memory'),
   ].filter((value): value is string => Boolean(value));
-  if (productionRepos.some((candidate) => samePath(repoReal, candidate))) {
+  if (
+    options?.allowProductionTree !== true
+    && productionRepos.some((candidate) => samePath(repoReal, candidate))
+  ) {
     throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'repoRoot is the production xdt-memory checkout');
   }
   const productionDataTrees = [
@@ -98,7 +109,10 @@ export function assertWriteTarget(target: Partial<FacadeWriteTarget> | undefined
     tryRealpath(path.join(resolvedRepo, 'data')),
     tryRealpath('D:/AI/Codex/xdt-memory/data'),
   ].filter((value): value is string => Boolean(value));
-  if (productionDataTrees.some((candidate) => samePath(dataReal, candidate))) {
+  if (
+    options?.allowProductionTree !== true
+    && productionDataTrees.some((candidate) => samePath(dataReal, candidate))
+  ) {
     throw new FacadeWriteTargetError('WRITE_TARGET_FORBIDDEN', 'dataRoot is the production xdt-memory data tree');
   }
   const relative = path.relative(repoReal, dataReal);

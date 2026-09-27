@@ -100,6 +100,7 @@ export interface DesktopMcpProvidersDeps {
   getAppVersion?: () => string;
   getMakerMemoryManager: () => MakerMemoryManager;
   getPreparedMemorySession?: (preparedMemorySessionId: string) => PreparedMemorySession | undefined;
+  executeXdtFacadeWrite?: import('@cindy/mcps').MemoryMcpDeps['executeXdtFacadeWrite'];
   lspPool: LspServerPool;
   /** 按会话控制启用状态的 plugin registry。 */
   pluginRegistry: PluginRegistry;
@@ -349,6 +350,9 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
       getManager: deps.getMakerMemoryManager,
       ...(deps.getPreparedMemorySession
         ? { getPreparedMemorySession: deps.getPreparedMemorySession }
+        : {}),
+      ...(deps.executeXdtFacadeWrite
+        ? { executeXdtFacadeWrite: deps.executeXdtFacadeWrite }
         : {}),
       searchSessions: searchSessionsFn,
       logger: createLogger('mcp/cindy_memory'),

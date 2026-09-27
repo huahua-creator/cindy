@@ -20,6 +20,13 @@ describe('desktop MCP providers carry frozen xdt binding', () => {
     expect(host).toContain('getPreparedMemorySession,');
   });
 
+  it('injects executeXdtFacadeWrite for Claude H-Bus and keeps Codex getWriteTarget undefined', () => {
+    expect(providers).toContain('executeXdtFacadeWrite?: import(\'@cindy/mcps\').MemoryMcpDeps[\'executeXdtFacadeWrite\']');
+    expect(providers).toContain('executeXdtFacadeWrite: deps.executeXdtFacadeWrite');
+    expect(host).toContain('createHbusXdtFacadeWrite');
+    expect(host).toContain('getWriteTarget: () => undefined');
+  });
+
   it('copies frozen binding through Codex ALS and Pi liziCtx', () => {
     expect(codexEnv).toContain('...(active.memoryBinding ? { memoryBinding: active.memoryBinding } : {})');
     expect(codexEnv).toContain('preparedMemorySessionId: active.preparedMemorySessionId');

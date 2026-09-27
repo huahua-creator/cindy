@@ -35,6 +35,7 @@ import {
   ClaudeCodeAgent,
   CodexAgent,
   configureDefaultImageResizer,
+  resolveXdtMemoryRoot,
   type AgentKind,
   type McpProvider,
 } from '@cindy/maker-core';
@@ -257,6 +258,7 @@ import {
   composeCodexHostDynamicToolProviders,
   createMemoryFacadeCodexDynamicToolProvider,
 } from './memory-facade-codex-dynamic-tools.js';
+import { createHbusXdtFacadeWrite } from './execute-hbus-xdt-facade-write.js';
 import { getElectronSecretIo } from '../secrets/providerSecretStore.js';
 import { resolveOwnerScopedRegistryRoot } from './workspace-identity-assembler.js';
 import { captureKnownFileBefore, noteOpaqueTurnChange } from '../turn-change-set/store.js';
@@ -953,6 +955,18 @@ export function getMaker(): Maker {
       getAppVersion: () => app.getVersion(),
       getMakerMemoryManager: () => makerMemoryManager,
       getPreparedMemorySession,
+      executeXdtFacadeWrite: createHbusXdtFacadeWrite({
+        getOwner: () => resolveOwnerScopedRegistryRoot(),
+        getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
+        getPreparedMemorySession,
+        resolveWriteRoots: () => {
+          const repoRoot = resolveXdtMemoryRoot();
+          return {
+            repoRoot,
+            dataRoot: process.env.XDT_MEMORY_HOME || path.join(repoRoot, 'data'),
+          };
+        },
+      }),
       lspPool: getLspPool(),
       pluginRegistry,
       resolveIOSSimulatorAccess,

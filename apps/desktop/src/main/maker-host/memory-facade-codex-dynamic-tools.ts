@@ -127,6 +127,8 @@ export interface MemoryFacadeDynamicToolDeps {
   createWriteStore?: CreateFacadeWriteStore;
   now?: () => Date;
   randomUuid?: () => string;
+  allowProductionWorkspace?: boolean;
+  allowProductionTree?: boolean;
 }
 
 export class MemoryFacadeError extends Error {
@@ -246,8 +248,9 @@ function denyWriteResponse(): DynamicToolCallResponse {
 function assertTargetMatchesPrepared(
   writeTarget: FacadeWriteTarget | undefined,
   prepared: PreparedMemorySession,
+  options?: { allowProductionWorkspace?: boolean; allowProductionTree?: boolean },
 ): FacadeWriteTarget {
-  const target = assertWriteTarget(writeTarget);
+  const target = assertWriteTarget(writeTarget, options);
   if (target.workspace !== prepared.binding.canonicalWorkspaceId) {
     throw new FacadeWriteTargetError(
       'WRITE_TARGET_FORBIDDEN',
@@ -419,6 +422,63 @@ async function reuseOrMint(
   }
 }
 
+export async function executeFacadeMemoryWrite(input: {
+  deps: MemoryFacadeDynamicToolDeps;
+  owner: RegistryOwnerScope;
+  prepared: PreparedMemorySession;
+  identity: CallIdentity;
+  innerName: FacadeInnerToolName;
+  innerArgs: FacadeWriteArgs;
+  writeTarget: FacadeWriteTarget;
+}): Promise<Record<string, unknown>> {
+  const target = assertTargetMatchesPrepared(input.writeTarget, input.prepared, {
+    allowProductionWorkspace: input.deps.allowProductionWorkspace,
+    allowProductionTree: input.deps.allowProductionTree,
+  });
+  await input.deps.getCapabilitySecret();
+  const normalizedArgsDigest = objectDigest(input.innerArgs);
+  const existingLedger = await readInvocationLedger(input.owner, input.identity);
+  let expectedRevision: string | null = existingLedger?.expectedRevision ?? null;
+  const allowFlags = {
+    allowProductionWorkspace: input.deps.allowProductionWorkspace,
+    allowProductionTree: input.deps.allowProductionTree,
+  };
+  if (!existingLedger && input.innerArgs.mode === 'update') {
+    expectedRevision = await freezeExpectedRevision({
+      target,
+      name: input.innerArgs.name,
+      createStore: input.deps.createWriteStore,
+      ...allowFlags,
+    });
+    if (typeof expectedRevision !== 'string' || !expectedRevision) {
+      throw new FacadeWriteError('INVALID_ARGS', 'update requires a frozen expected_revision');
+    }
+  }
+  const ledger = await reuseOrMint(
+    input.deps,
+    input.owner,
+    input.identity,
+    input.prepared,
+    input.innerName,
+    normalizedArgsDigest,
+    expectedRevision,
+  );
+  if (!ledger.operationId) {
+    throw new FacadeInvocationLedgerError(
+      'MUTATION_IDENTITY_UNAVAILABLE',
+      'ledger operationId missing after claim',
+    );
+  }
+  return upsertFacadeMemoryWrite({
+    target,
+    args: input.innerArgs,
+    operationId: ledger.operationId,
+    expectedRevision: ledger.expectedRevision,
+    createStore: input.deps.createWriteStore,
+    ...allowFlags,
+  });
+}
+
 export function createMemoryFacadeCodexDynamicToolProvider(
   deps: MemoryFacadeDynamicToolDeps,
 ): CodexHostDynamicToolProvider {
@@ -493,47 +553,18 @@ export function createMemoryFacadeCodexDynamicToolProvider(
         if (!writeTarget) {
           return denyWriteResponse();
         }
-        const target = assertTargetMatchesPrepared(writeTarget, prepared);
-        await deps.getCapabilitySecret();
-        const normalizedArgsDigest = objectDigest(innerArgs);
-        const identity: CallIdentity = {
-          threadId: params.threadId,
-          turnId: params.turnId,
-          callId: params.callId,
-        };
-        const existingLedger = await readInvocationLedger(owner, identity);
-        let expectedRevision: string | null = existingLedger?.expectedRevision ?? null;
-        if (!existingLedger && innerArgs.mode === 'update') {
-          expectedRevision = await freezeExpectedRevision({
-            target,
-            name: innerArgs.name,
-            createStore: deps.createWriteStore,
-          });
-          if (typeof expectedRevision !== 'string' || !expectedRevision) {
-            throw new FacadeWriteError('INVALID_ARGS', 'update requires a frozen expected_revision');
-          }
-        }
-        const ledger = await reuseOrMint(
+        const result = await executeFacadeMemoryWrite({
           deps,
           owner,
-          identity,
           prepared,
+          identity: {
+            threadId: params.threadId,
+            turnId: params.turnId,
+            callId: params.callId,
+          },
           innerName,
-          normalizedArgsDigest,
-          expectedRevision,
-        );
-        if (!ledger.operationId) {
-          throw new FacadeInvocationLedgerError(
-            'MUTATION_IDENTITY_UNAVAILABLE',
-            'ledger operationId missing after claim',
-          );
-        }
-        const result = await upsertFacadeMemoryWrite({
-          target,
-          args: innerArgs,
-          operationId: ledger.operationId,
-          expectedRevision: ledger.expectedRevision,
-          createStore: deps.createWriteStore,
+          innerArgs,
+          writeTarget,
         });
         return textResponse(result, true);
       } catch (err) {

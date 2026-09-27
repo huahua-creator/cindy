@@ -484,6 +484,9 @@ export function createLiziMcpProviders(
           ...(opts.memory!.getPreparedMemorySession
             ? { getPreparedMemorySession: opts.memory!.getPreparedMemorySession }
             : {}),
+          ...(opts.memory!.executeXdtFacadeWrite
+            ? { executeXdtFacadeWrite: opts.memory!.executeXdtFacadeWrite }
+            : {}),
           ...(opts.memory!.searchSessions ? { searchSessions: opts.memory!.searchSessions } : {}),
           ...(opts.memory!.logger ? { logger: opts.memory!.logger } : {}),
         }),

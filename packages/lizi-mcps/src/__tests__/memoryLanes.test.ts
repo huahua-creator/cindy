@@ -40,7 +40,9 @@ function parse(result: { content: Array<{ type: string; text?: string }> }) {
 function tools(server: unknown) {
   return (
     server as {
-      _registeredTools: Record<string, { handler: (args: unknown) => Promise<unknown> }>;
+      _registeredTools: Record<string, {
+        handler: (args: unknown, extra?: { requestId?: unknown; sessionId?: string }) => Promise<unknown>;
+      }>;
     }
   )._registeredTools;
 }
@@ -223,6 +225,128 @@ describe('cindy_memory three lanes', () => {
 
     const reviewed = await tools(cfg.instance).call_tool.handler({ name: 'memory_review', args: {} });
     expect(parse(reviewed as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+
+    const frozenWrite = vi.spyOn(prepared.sessionStore, 'write');
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, facade: true }) }],
+    }));
+    const withFacade = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({ isEnabled: () => true, getStore }) as never,
+        getPreparedMemorySession: (id) => (id === PREPARED_ID ? prepared : undefined),
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!withFacade) throw new Error('cindy_memory missing');
+    const facadeCfg = withFacade.toClaudeSdkConfig(ctx) as { instance: unknown };
+    const droppedExtra = await tools(facadeCfg.instance).call_tool.handler({
+      name: 'memory_write',
+      args: {
+        type: 'project',
+        name: 'should-fail',
+        title: 'no',
+        description: 'must not land on internal store',
+        body: 'nope',
+      },
+    });
+    expect(parse(droppedExtra as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
+    expect(frozenWrite).not.toHaveBeenCalled();
+
+    const emptyId = await tools(facadeCfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'should-fail',
+          title: 'no',
+          description: 'must not land on internal store',
+          body: 'nope',
+        },
+      },
+      { requestId: '' },
+    );
+    expect(parse(emptyId as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
+
+    const accepted = await tools(facadeCfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'should-write',
+          title: 'yes',
+          description: 'claude requestId present',
+          body: 'ok',
+        },
+      },
+      { requestId: 'rpc-1', sessionId: 'mcp-session-1' },
+    );
+    expect(parse(accepted as never)).toMatchObject({ ok: true, facade: true });
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(1);
+    const firstCall = executeXdtFacadeWrite.mock.calls.at(0)?.at(0);
+    expect(firstCall).toMatchObject({
+      callId: 'rpc-1',
+      mcpSessionId: 'mcp-session-1',
+    });
+    expect(frozenWrite).not.toHaveBeenCalled();
+
+    const reserved = await tools(facadeCfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'should-fail',
+          title: 'no',
+          description: 'model-reported identity is forbidden',
+          body: 'nope',
+          invocationId: 'model-forged',
+        },
+      },
+      { requestId: 'rpc-forged' },
+    );
+    expect(parse(reserved as never)).toMatchObject({ ok: false, errorCode: 'INVALID_ARGS' });
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps Pi xdt memory_write red even with a requestId', async () => {
+    const prepared = await preparedSession();
+    const frozenWrite = vi.spyOn(prepared.sessionStore, 'write');
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, facade: true }) }],
+    }));
+    const provider = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({ isEnabled: () => true, getStore: async () => ({}) }) as never,
+        getPreparedMemorySession: () => prepared,
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!provider) throw new Error('cindy_memory missing');
+    const ctx: LiziMcpSessionContext = {
+      agentKind: 'pi',
+      workingDir: '/tmp/xdt-fixture-repo',
+      vendorOptions: {},
+      memoryBinding: prepared.binding,
+      preparedMemorySessionId: PREPARED_ID,
+    };
+    const cfg = provider.toClaudeSdkConfig(ctx) as { instance: unknown };
+    const written = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'pi-should-fail',
+          title: 'no',
+          description: 'pi must stay red this knife',
+          body: 'nope',
+        },
+      },
+      { requestId: 'rpc-pi' },
+    );
+    expect(parse(written as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
+    expect(frozenWrite).not.toHaveBeenCalled();
   });
 
   it('returns MAKER_MEMORY_NOT_READY when xdt accessor is undefined', async () => {

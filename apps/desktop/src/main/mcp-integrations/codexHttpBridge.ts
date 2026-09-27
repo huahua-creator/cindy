@@ -23,7 +23,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { runWithLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
 
-import type { Logger } from '@cindy/maker-core';
+import { isXdtMemoryBinding, type Logger } from '@cindy/maker-core';
 import {
   createCodexMcpThreadContextStore,
   isSameCodexMcpSessionContext,
@@ -719,6 +719,16 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
       writeBlockedToolCallResponse(res, parsedBody, pluginId, blockedToolCall.reason);
       return;
     }
+    // Codex 本刀预期只读：JSON-RPC id 无法证明跨重试稳定，禁止为 xdt
+    // memory_write create/update 铸造 Host 随机 callId。internal lane 放行。
+    if (
+      serverName === REMOTE_MEMORY_SERVER_NAME
+      && isXdtPreparedMemoryContext(activeContext)
+      && hasCindyMemoryWriteCreateOrUpdate(parsedBody)
+    ) {
+      writeXdtCodexWriteRejectedResponse(res, parsedBody);
+      return;
+    }
     if (activeContext) {
       await runWithLiziMcpSessionContext(activeContext, () =>
         existing.transport.handleRequest(req, res, parsedBody),
@@ -909,6 +919,60 @@ function withoutSessionInstanceId(
   const { sessionInstanceId: _sessionInstanceId, ...legacyContext } = context;
   void _sessionInstanceId;
   return legacyContext;
+}
+
+function isXdtPreparedMemoryContext(ctx: LiziMcpSessionContext | undefined): boolean {
+  return Boolean(ctx?.memoryBinding && isXdtMemoryBinding(ctx.memoryBinding));
+}
+
+function cindyMemoryWriteMode(message: unknown): 'create' | 'update' | 'append' | undefined {
+  if (!isToolCallMessage(message)) return undefined;
+  const params = (message as { params?: unknown }).params;
+  if (!params || typeof params !== 'object') return undefined;
+  if ((params as { name?: unknown }).name !== 'call_tool') return undefined;
+  const envelope = (params as { arguments?: unknown }).arguments;
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return undefined;
+  if ((envelope as { name?: unknown }).name !== 'memory_write') return undefined;
+  const inner = (envelope as { args?: unknown }).args;
+  if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return undefined;
+  const mode = (inner as { mode?: unknown }).mode;
+  if (mode === undefined || mode === 'create') return 'create';
+  if (mode === 'update' || mode === 'append') return mode;
+  return undefined;
+}
+
+function hasCindyMemoryWriteCreateOrUpdate(body: unknown): boolean {
+  return (Array.isArray(body) ? body : [body]).some((message) => {
+    const mode = cindyMemoryWriteMode(message);
+    return mode === 'create' || mode === 'update';
+  });
+}
+
+function writeXdtCodexWriteRejectedResponse(
+  res: http.ServerResponse,
+  body: unknown,
+): void {
+  const text = JSON.stringify({
+    ok: false,
+    code: 'MAKER_MEMORY_NOT_READY',
+    message: 'xdt prepared session is read-only; write/delete/consolidate/review are forbidden',
+  });
+  const rejected = (id: unknown) => ({
+    jsonrpc: '2.0',
+    id: id ?? null,
+    result: {
+      content: [{ type: 'text', text }],
+      isError: true,
+    },
+  });
+  const payload = Array.isArray(body)
+    ? body
+      .filter((message) => message !== null && typeof message === 'object' && 'id' in message)
+      .map((message) => rejected((message as { id?: unknown }).id))
+    : rejected((body as { id?: unknown }).id);
+  res.statusCode = 200;
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(payload));
 }
 
 function writeBlockedToolCallResponse(

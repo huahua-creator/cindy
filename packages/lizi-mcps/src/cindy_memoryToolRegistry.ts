@@ -26,8 +26,15 @@ export interface MemoryToolResult {
   [k: string]: unknown;
 }
 
+export interface MemoryToolCallExtra {
+  requestId?: string;
+  /** MCP transport session id; used as H-Bus turn key so JSON-RPC ids cannot collide across Query rebuilds. */
+  mcpSessionId?: string;
+}
+
 export type MemoryToolHandler<T = Record<string, unknown>> = (
   args: T,
+  extra?: MemoryToolCallExtra,
 ) => Promise<MemoryToolResult>;
 
 export interface MemoryToolDef {
@@ -91,7 +98,7 @@ export class MemoryToolRegistry {
     return Array.from(set);
   }
 
-  async call(name: string, rawArgs: unknown): Promise<MemoryToolResult> {
+  async call(name: string, rawArgs: unknown, extra?: MemoryToolCallExtra): Promise<MemoryToolResult> {
     const def = this.tools.get(name);
     if (!def) {
       return {
@@ -145,6 +152,6 @@ export class MemoryToolRegistry {
       };
     }
 
-    return def.handler(parsed.data as Record<string, unknown>);
+    return def.handler(parsed.data as Record<string, unknown>, extra);
   }
 }

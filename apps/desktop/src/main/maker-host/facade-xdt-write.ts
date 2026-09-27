@@ -57,8 +57,13 @@ export function freezeExpectedRevision(input: {
   target: FacadeWriteTarget;
   name: string;
   createStore?: CreateFacadeWriteStore;
+  allowProductionWorkspace?: boolean;
+  allowProductionTree?: boolean;
 }): Promise<string | null> {
-  const target = assertWriteTarget(input.target);
+  const target = assertWriteTarget(input.target, {
+    allowProductionWorkspace: input.allowProductionWorkspace,
+    allowProductionTree: input.allowProductionTree,
+  });
   const createStore = input.createStore ?? defaultCreateStore();
   const store = createStore({
     repoRoot: target.repoRoot,
@@ -81,8 +86,13 @@ export async function upsertFacadeMemoryWrite(input: {
   operationId: string;
   expectedRevision: string | null;
   createStore?: CreateFacadeWriteStore;
+  allowProductionWorkspace?: boolean;
+  allowProductionTree?: boolean;
 }): Promise<Record<string, unknown>> {
-  const target = assertWriteTarget(input.target);
+  const target = assertWriteTarget(input.target, {
+    allowProductionWorkspace: input.allowProductionWorkspace,
+    allowProductionTree: input.allowProductionTree,
+  });
   if (!UUID_V4_RE.test(input.operationId)) {
     throw new FacadeWriteError('INVALID_ARGS', 'operationId must be UUID v4 from the claim ledger');
   }

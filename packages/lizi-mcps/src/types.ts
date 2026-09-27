@@ -309,6 +309,23 @@ export interface MemoryMcpDeps {
     preparedMemorySessionId: string,
   ) => import('@cindy/maker-core').PreparedMemorySession | undefined;
   /**
+   * Host-injected xdt facade upsert for cindy_memory create/update.
+   * 缺省 = 继续 write.ts:55 红。Host 必须按 agentKind 闸（本刀仅 Claude）。
+   */
+  executeXdtFacadeWrite?: (input: {
+    args: {
+      type: 'user' | 'feedback' | 'project' | 'reference';
+      name: string;
+      title: string;
+      description: string;
+      body: string;
+      mode: 'create' | 'update';
+    };
+    callId: string;
+    mcpSessionId?: string;
+    sessionContext: LiziMcpSessionContext;
+  }) => Promise<import('./cindy_memoryToolRegistry.js').MemoryToolResult>;
+  /**
    * 搜历史对话 (Hermes 风格). 复用 desktop messages 表挂的 FTS5 索引。
    * 缺省 = host 没启用 → session_search tool 不注册 (跟 art video registry 同模式)。
    */
