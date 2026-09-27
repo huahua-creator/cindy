@@ -37,6 +37,7 @@ import {
   resetSessionWorkspaceIdentityForTest,
 } from '../session-workspace-identity.js';
 import { createLocalAlias } from '../workspace-identity-registry.js';
+import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 import {
   ensureIsolatedCodexXdtStanzaRemoved,
   removeIsolatedCodexXdtStanza,
@@ -421,6 +422,12 @@ describe('prepareReadonly after stanza cleanup', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     const userData = await tempDir('cindy-xdt-stanza-ud2-');
     const configPath = cindyIsolatedCodexConfigPath(userData);
     await mkdir(path.dirname(configPath), { recursive: true });
@@ -469,6 +476,12 @@ describe('prepareReadonly after stanza cleanup', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const userData = await tempDir('cindy-xdt-stanza-ud3-');
     const configPath = cindyIsolatedCodexConfigPath(userData);
@@ -566,6 +579,12 @@ describe('prepareReadonly after stanza cleanup', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const userData = await tempDir('cindy-xdt-stanza-ud5-');
     const configPath = cindyIsolatedCodexConfigPath(userData);

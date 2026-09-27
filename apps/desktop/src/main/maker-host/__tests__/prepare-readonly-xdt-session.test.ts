@@ -42,6 +42,7 @@ import {
   resetSessionWorkspaceIdentityForTest,
 } from '../session-workspace-identity.js';
 import { createLocalAlias } from '../workspace-identity-registry.js';
+import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 
 const HEX_B = 'b'.repeat(64);
 const SESSION_INSTANCE = '33333333-3333-4333-8333-333333333333';
@@ -318,6 +319,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     const tree = await emptyIndexTree();
     assertNoProductionPaths(tree.repoRoot, tree.dataRoot, absDir, ownerRoot);
     const getStore = vi.fn(async () => {
@@ -371,6 +378,8 @@ describe('prepareReadonlyXdtSession', () => {
       CINDY_HOST_READONLY_SERVER_REGISTRATION_ID,
     );
     expect(captured?.preparedMemorySession?.binding.serverRegistrationDigest).not.toBe('a'.repeat(64));
+    expect(captured?.preparedMemorySession?.binding.configGeneration).not.toBe('settings-side-unpublished-v1');
+    expect(captured?.preparedMemorySession?.binding.configGeneration).toMatch(/^cfg-override-/);
     expect(captured?.preparedMemorySession?.nativeMemoryProof.sessionInstanceId).toBe(
       session.instanceId,
     );
@@ -420,6 +429,12 @@ describe('prepareReadonlyXdtSession', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const tree = await emptyIndexTree();
     await seedV2ProjectHead(tree.dataRoot, created.canonicalWorkspaceId);
@@ -518,6 +533,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     const tree = await emptyIndexTree();
     const nativeAgent = createAgent({
       startSession: async () => createHandle('thread-fail'),
@@ -560,6 +581,12 @@ describe('prepareReadonlyXdtSession', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const userData = await tempDir('cindy-xdt-ro-userdata-');
     await mkdir(path.join(userData, 'codex-home'), { recursive: true });
@@ -617,6 +644,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     const tree = await emptyIndexTree();
     const userData = await tempDir('cindy-xdt-gate4-ud-');
     await mkdir(path.join(userData, 'codex-home'), { recursive: true });
@@ -672,6 +705,12 @@ describe('prepareReadonlyXdtSession', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const tree = await emptyIndexTree();
     const userData = await tempDir('cindy-xdt-gate4-skip-ud-');
@@ -771,6 +810,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     const repoRoot = await tempDir('cindy-xdt-ro-missing-');
     const missingData = path.join(repoRoot, 'data');
     rememberSessionWorkspaceIdentity('session-missing-data', {
@@ -839,6 +884,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     rememberSessionWorkspaceIdentity('session-no-userdata', {
       canonicalWorkspaceId: created.canonicalWorkspaceId,
       locatorDigest: created.locatorDigest,
@@ -901,6 +952,12 @@ describe('prepareReadonlyXdtSession', () => {
       absDir,
       confirmed: true,
     });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
     rememberSessionWorkspaceIdentity('session-memory-off', {
       canonicalWorkspaceId: created.canonicalWorkspaceId,
       locatorDigest: created.locatorDigest,
@@ -925,11 +982,17 @@ describe('prepareReadonlyXdtSession', () => {
   it('forgets prepared by preparedId on close, not sessionId', async () => {
     const ownerRoot = await tempDir('cindy-xdt-ro-owner-');
     const absDir = await tempDir('cindy-xdt-ro-ws-');
-    await createLocalAlias({
+    const created = await createLocalAlias({
       dataOwnerId: OWNER_ID,
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const tree = await emptyIndexTree();
     let preparedId = '';
@@ -1020,5 +1083,269 @@ describe('prepareReadonlyXdtSession', () => {
     expect(src).toMatch(/device: source\.device \?\? 'cindy-host-fixture'/);
     expect(src).toMatch(/'cindy-host-readonly'/);
     expect(createXdtMemoryIndexClient).toBeTypeOf('function');
+  });
+
+  it('skips a registered workspace when settings are missing (internal default)', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-missing-settings-');
+    const absDir = await tempDir('cindy-xdt-ro-missing-settings-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    const tree = await emptyIndexTree();
+    const setMemory = vi.fn(async () => ({ effective: 'next-session' as const }));
+    rememberSessionWorkspaceIdentity('session-missing-settings', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-missing-settings', opts, {
+      getAgent: () => createAgent({ startSession: async () => createHandle('x'), setMemory }),
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => ownerRoot,
+    });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    expect(setMemory).not.toHaveBeenCalled();
+  });
+
+  it('does not apply an override for a different canonical workspace', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-other-override-');
+    const absDir = await tempDir('cindy-xdt-ro-other-override-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+      provider: 'xdt',
+    });
+    expect(ownerRoot).not.toMatch(/AppData[\\/]Roaming[\\/]Cindy/i);
+    const tree = await emptyIndexTree();
+    rememberSessionWorkspaceIdentity('session-other-override', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-other-override', opts, {
+      getAgent: () => createAgent({ startSession: async () => createHandle('x') }),
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => ownerRoot,
+    });
+    expect(opts.preparedMemorySession).toBeUndefined();
+  });
+
+  it('fails closed on invalid settings and does not inject', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-invalid-settings-');
+    const absDir = await tempDir('cindy-xdt-ro-invalid-settings-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await writeFile(path.join(ownerRoot, 'memory-provider-settings-v1.json'), '{not-json', 'utf8');
+    rememberSessionWorkspaceIdentity('session-invalid-settings', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await expect(
+      prepareReadonlyXdtSession('session-invalid-settings', opts, {
+        getAgent: () => createAgent({ startSession: async () => createHandle('x') }),
+        getMakerMemory: () => managerStub().manager as never,
+        resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+        userDataDir: () => ownerRoot,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    expect(await readFile(path.join(ownerRoot, 'memory-provider-settings-v1.json'), 'utf8')).toBe('{not-json');
+  });
+
+  it('does not inject when recover cannot close a settings_only transaction', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-uncommitted-');
+    const absDir = await tempDir('cindy-xdt-ro-uncommitted-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
+    const txnPath = path.join(ownerRoot, 'workspace-registry-transaction-v1.json');
+    const txn = JSON.parse(await readFile(txnPath, 'utf8')) as Record<string, unknown>;
+    txn.operationKind = 'settings_only';
+    txn.state = 'settings_published';
+    txn.intendedRegistryGeneration = txn.expectedRegistryGeneration;
+    txn.registryDigestAfter = txn.registryDigestBefore;
+    txn.providerSettingsDigestAfter = 'b'.repeat(64);
+    await writeFile(txnPath, `${JSON.stringify(txn)}\n`, 'utf8');
+    rememberSessionWorkspaceIdentity('session-uncommitted', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await expect(
+      prepareReadonlyXdtSession('session-uncommitted', opts, {
+        getAgent: () => createAgent({ startSession: async () => createHandle('x') }),
+        getMakerMemory: () => managerStub().manager as never,
+        resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+        userDataDir: () => ownerRoot,
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    const leftover = JSON.parse(await readFile(txnPath, 'utf8')) as { state: string };
+    expect(leftover.state).toBe('settings_published');
+  });
+
+  it('fails before inject when committed configGeneration drifts', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-drift-');
+    const absDir = await tempDir('cindy-xdt-ro-drift-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
+    const tree = await emptyIndexTree();
+    let loads = 0;
+    const { loadMemoryProviderSettings } = await import('../workspace-identity-registry.js');
+    rememberSessionWorkspaceIdentity('session-drift', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await expect(
+      prepareReadonlyXdtSession('session-drift', opts, {
+        getAgent: () => createAgent({ startSession: async () => createHandle('x') }),
+        getMakerMemory: () => managerStub().manager as never,
+        resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+        resolveIndexSource: (workspace) => ({
+          repoRoot: tree.repoRoot,
+          dataRoot: tree.dataRoot,
+          workspace,
+          device: 'cindy-host-readonly',
+        }),
+        userDataDir: () => ownerRoot,
+        loadCommittedSettings: async (scope) => {
+          loads += 1;
+          const current = await loadMemoryProviderSettings(scope);
+          if (loads === 1) return current;
+          return {
+            ...current,
+            settings: current.settings
+              ? { ...current.settings, configGeneration: 'cfg-drifted' }
+              : current.settings,
+          };
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'CONFIG_INVALID' });
+    expect(opts.preparedMemorySession).toBeUndefined();
+    expect(loads).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not revoke an already-prepared extra session when a later prepare runs', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-keep-extra-');
+    const absDir = await tempDir('cindy-xdt-ro-keep-extra-ws-');
+    const created = await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
+    });
+    const extraId = '44444444-4444-4444-8444-444444444444';
+    rememberPreparedMemorySession({ preparedMemorySessionId: extraId } as never);
+    const tree = await emptyIndexTree();
+    rememberSessionWorkspaceIdentity('session-keep-extra', {
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      locatorDigest: created.locatorDigest,
+    });
+    const opts: CreateSessionOptions = {
+      agentKind: 'claude-code',
+      workingDir: absDir,
+      model: 'claude-sonnet-4-5',
+      sessionInstanceId: SESSION_INSTANCE,
+      makerMemoryEnabled: true,
+    };
+    await prepareReadonlyXdtSession('session-keep-extra', opts, {
+      getAgent: () => createAgent({ startSession: async () => createHandle('x') }),
+      getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
+      resolveIndexSource: (workspace) => ({
+        repoRoot: tree.repoRoot,
+        dataRoot: tree.dataRoot,
+        workspace,
+        device: 'cindy-host-readonly',
+      }),
+      userDataDir: () => ownerRoot,
+    });
+    expect(opts.preparedMemorySession).toBeDefined();
+    expect(getPreparedMemorySession(extraId)?.preparedMemorySessionId).toBe(extraId);
   });
 });

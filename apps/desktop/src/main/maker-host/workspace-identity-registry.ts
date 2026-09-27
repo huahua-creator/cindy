@@ -361,7 +361,7 @@ export function readRegistry(scope: RegistryOwnerScope): RegistryReadResult {
   }
 }
 
-function readTransaction(scope: RegistryOwnerScope): WorkspaceRegistryTransactionV1 | undefined {
+export function readTransaction(scope: RegistryOwnerScope): WorkspaceRegistryTransactionV1 | undefined {
   const filePath = transactionPath(scope);
   const raw = readFileTriState(filePath);
   if (raw.status === 'missing') return undefined;

@@ -30,6 +30,7 @@ import {
   resetSessionWorkspaceIdentityForTest,
 } from '../session-workspace-identity.js';
 import { createLocalAlias } from '../workspace-identity-registry.js';
+import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 
 const HEX_B = 'b'.repeat(64);
 const OWNER_ID = 'owner-fixture-1';
@@ -211,6 +212,12 @@ describe('prepareReadonlyXdtSession extra root', () => {
       ownerRoot,
       absDir,
       confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: created.canonicalWorkspaceId,
+      provider: 'xdt',
     });
     const tree = await emptyIndexTree();
     await seedV2ProjectHead(tree.dataRoot, 'legacy_basename');

@@ -33,8 +33,16 @@ import {
   prepareAndRememberMemorySession,
 } from './prepared-memory-sessions.js';
 import { getSessionWorkspaceIdentity } from './session-workspace-identity.js';
-import { readRegistry, type RegistryOwnerScope } from './workspace-identity-registry.js';
+import {
+  loadMemoryProviderSettings,
+  readRegistry,
+  readTransaction,
+  type MemoryProviderSettingsV1,
+  type ProviderSettingsReadResult,
+  type RegistryOwnerScope,
+} from './workspace-identity-registry.js';
 import { resolveOwnerScopedRegistryRoot } from './workspace-identity-assembler.js';
+import { resolveEffectiveProvider } from './resolve-effective-memory-provider.js';
 
 /**
  * Host 只读 index registration 的稳定 UUID v4。
@@ -55,6 +63,7 @@ export interface PrepareReadonlyXdtSessionDeps {
   userDataDir: () => string;
   resolveIndexSource: (workspace: string) => XdtIndexSource;
   xdtMemoryRoot?: string;
+  loadCommittedSettings?: (scope: RegistryOwnerScope) => Promise<ProviderSettingsReadResult>;
 }
 
 function sha256Hex(text: string): string {
@@ -148,6 +157,7 @@ function defaultDeps(): PrepareReadonlyXdtSessionDeps {
       );
     },
     resolveIndexSource: defaultIndexSource,
+    loadCommittedSettings: loadMemoryProviderSettings,
   };
 }
 
@@ -159,24 +169,34 @@ function ownerScopeFingerprint(dataOwnerId: string): string {
   return digest;
 }
 
+export function hostReadonlyRegistrationDigest(): string {
+  return sha256Hex(
+    `cindy-host-readonly:${CINDY_HOST_READONLY_SERVER_REGISTRATION_ID}:${SERVER_REGISTRATION_GENERATION}`,
+  );
+}
+
 function assembleBinding(input: {
   canonicalWorkspaceId: string;
   registryGeneration: string;
+  configGeneration: string;
   dataOwnerId: string;
   ownerEpoch: string;
   xdtMemoryRoot?: string;
 }): XdtMemoryBindingV1 {
   const sentinel = loadXdtSchemaValidator(input.xdtMemoryRoot).SETTINGS_UNCHANGED_SENTINEL;
+  if (input.configGeneration === sentinel.generation) {
+    throw new XdtPrepareError(
+      'CONFIG_INVALID',
+      'xdt binding configGeneration must not use SETTINGS_UNCHANGED_SENTINEL',
+    );
+  }
   const ownerFp = ownerScopeFingerprint(input.dataOwnerId);
-  const registrationDigest = sha256Hex(
-    `cindy-host-readonly:${CINDY_HOST_READONLY_SERVER_REGISTRATION_ID}:${SERVER_REGISTRATION_GENERATION}`,
-  );
+  const registrationDigest = hostReadonlyRegistrationDigest();
   const bindingDigest = sha256Hex(
     [
       input.canonicalWorkspaceId,
       input.registryGeneration,
-      sentinel.generation,
-      sentinel.digest,
+      input.configGeneration,
       ownerFp,
       input.ownerEpoch,
       CINDY_HOST_READONLY_SERVER_REGISTRATION_ID,
@@ -188,7 +208,7 @@ function assembleBinding(input: {
     schemaVersion: 1,
     ownerScopeFingerprint: ownerFp,
     ownerEpoch: input.ownerEpoch,
-    configGeneration: sentinel.generation,
+    configGeneration: input.configGeneration,
     registryGeneration: input.registryGeneration,
     bindingDigest,
     enabled: true,
@@ -274,6 +294,29 @@ export async function prepareReadonlyXdtSession(
     return;
   }
 
+  const loadSettings = deps.loadCommittedSettings ?? loadMemoryProviderSettings;
+  const settingsRead = await loadSettings(owner);
+  if (settingsRead.status === 'unreadable' || settingsRead.status === 'invalid') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings is invalid');
+  }
+  const txn = readTransaction(owner);
+  if (txn && txn.state !== 'committed') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'workspace registry transaction is not committed');
+  }
+
+  const settings: MemoryProviderSettingsV1 | undefined = settingsRead.settings;
+  const effective = resolveEffectiveProvider({
+    reviewMode: opts.reviewMode,
+    remoteHostId: opts.remoteHostId,
+    canonicalWorkspaceId: identity.canonicalWorkspaceId,
+    settings,
+  });
+  if (effective !== 'xdt') return;
+  if (!settings) {
+    throw new XdtPrepareError('CONFIG_INVALID', 'xdt override requires a committed settings snapshot');
+  }
+  const frozenConfigGeneration = settings.configGeneration;
+
   const read = deps.readRegistry(owner);
   if (read.status === 'unreadable') {
     throw new XdtPrepareError('CONFIG_INVALID', 'workspace identity registry is unreadable');
@@ -293,6 +336,7 @@ export async function prepareReadonlyXdtSession(
   const binding = assembleBinding({
     canonicalWorkspaceId: identity.canonicalWorkspaceId,
     registryGeneration: read.registry.registryGeneration,
+    configGeneration: frozenConfigGeneration,
     dataOwnerId: owner.dataOwnerId,
     ownerEpoch: `cindy-host-readonly-epoch-${getActiveAppSession().generation}`,
     xdtMemoryRoot: deps.xdtMemoryRoot,
@@ -319,6 +363,23 @@ export async function prepareReadonlyXdtSession(
       makerMemory: manager,
       xdtMemoryRoot: deps.xdtMemoryRoot,
     });
+    const reloaded = await loadSettings(owner);
+    if (reloaded.status === 'unreadable' || reloaded.status === 'invalid') {
+      throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings drifted before inject');
+    }
+    const reloadedTxn = readTransaction(owner);
+    if (reloadedTxn && reloadedTxn.state !== 'committed') {
+      throw new XdtPrepareError('CONFIG_INVALID', 'workspace registry transaction drifted before inject');
+    }
+    const stillXdt = resolveEffectiveProvider({
+      reviewMode: opts.reviewMode,
+      remoteHostId: opts.remoteHostId,
+      canonicalWorkspaceId: identity.canonicalWorkspaceId,
+      settings: reloaded.settings,
+    });
+    if (stillXdt !== 'xdt' || reloaded.settings?.configGeneration !== frozenConfigGeneration) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'committed settings generation drifted before inject');
+    }
     opts.preparedMemorySession = prepared;
     bindPreparedMemorySessionToSessionId(sessionId, prepared.preparedMemorySessionId);
   } catch (err) {
