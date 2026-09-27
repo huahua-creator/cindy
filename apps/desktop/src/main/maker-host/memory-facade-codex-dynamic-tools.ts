@@ -1,7 +1,8 @@
 /**
- * 前置刀 1b：Cindy Codex mutation 入口走 Host dynamic tool。
+ * 前置刀 1c：Cindy Codex mutation 入口走 Host dynamic tool。
  * 能力只在进程内 mint；模型 args/_meta 里的 invocationId/capability 一律 INVALID_ARGS。
- * inner 仍返回现网禁写，不改 write.ts:55，不接线 memory_write 成功。
+ * 隔离树可 memory_write create/update；生产 getWriteTarget 缺省失败。
+ * 不改 write.ts:55，不给 frozen store 开写。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -20,6 +21,7 @@ import {
   verifyFacadeInitialCapability,
   type FacadeInnerToolName,
 } from './facade-capability.js';
+import { FacadeSecretError } from './facade-capability-secret.js';
 import {
   claimFacadeInvocation,
   FacadeJournalError,
@@ -35,6 +37,18 @@ import {
   type CallIdentity,
   type FacadeInvocationLedgerV1,
 } from './facade-invocation-ledger.js';
+import {
+  freezeExpectedRevision,
+  upsertFacadeMemoryWrite,
+  FacadeWriteError,
+  type CreateFacadeWriteStore,
+  type FacadeWriteArgs,
+} from './facade-xdt-write.js';
+import {
+  assertWriteTarget,
+  FacadeWriteTargetError,
+  type FacadeWriteTarget,
+} from './facade-write-target.js';
 import type { RegistryOwnerScope } from './workspace-identity-registry.js';
 
 type DynamicToolSpec = ReturnType<CodexHostDynamicToolProvider['listTools']>[number];
@@ -47,8 +61,6 @@ const CALL_TOOL_NAME = `${NAMESPACE}${FLAT_TOOL_SEPARATOR}call_tool`;
 
 const INNER_TOOLS = new Set<FacadeInnerToolName>([
   'memory_write',
-  'memory_delete',
-  'memory_consolidate',
 ]);
 
 const RESERVED_KEYS = new Set([
@@ -65,7 +77,7 @@ const RESERVED_KEYS = new Set([
 
 const WRITE_KEYS = ['type', 'name', 'title', 'description', 'body', 'mode'] as const;
 const WRITE_TYPES = new Set(['user', 'feedback', 'project', 'reference']);
-const WRITE_MODES = new Set(['create', 'update', 'append']);
+const WRITE_MODES = new Set(['create', 'update']);
 
 export const XDT_WRITE_FORBIDDEN = {
   ok: false,
@@ -78,7 +90,7 @@ const TOOLS: readonly DynamicToolSpec[] = [
     type: 'function',
     name: LIST_TOOLS_NAME,
     description:
-      'Discover Host-owned xdt facade mutation tools for this Cindy session. Call list_tools first. Writes remain fail-closed until a later knife.',
+      'Discover Host-owned xdt facade mutation tools for this Cindy session. Call list_tools first. Only memory_write create/update is advertised; production trees stay fail-closed.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -92,7 +104,7 @@ const TOOLS: readonly DynamicToolSpec[] = [
     type: 'function',
     name: CALL_TOOL_NAME,
     description:
-      'Host-owned xdt facade mutation entry. Pass inner name and arguments. This knife mints a capability and durable retry identity; inner writes still return MAKER_MEMORY_NOT_READY.',
+      'Host-owned xdt facade mutation entry. Pass inner name and arguments. Isolated trees may accept memory_write create/update; production trees stay fail-closed.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -110,8 +122,9 @@ export interface MemoryFacadeDynamicToolDeps {
   getOwner: () => RegistryOwnerScope;
   getCapabilitySecret: () => string | Buffer | Promise<string | Buffer>;
   getPreparedBySessionId: (sessionId: string) => PreparedMemorySession | undefined;
-  /** 生产默认 false：1b 不把第二写入口挂进 Codex listTools 快照。测试可开。 */
   advertiseTools?: boolean;
+  getWriteTarget?: () => FacadeWriteTarget | undefined;
+  createWriteStore?: CreateFacadeWriteStore;
   now?: () => Date;
   randomUuid?: () => string;
 }
@@ -197,7 +210,7 @@ function requireString(value: unknown, field: string): string {
 function normalizeInnerArgs(
   innerName: FacadeInnerToolName,
   raw: Record<string, unknown>,
-): Record<string, unknown> {
+): FacadeWriteArgs {
   if (containsReserved(raw)) {
     throw new MemoryFacadeError('INVALID_ARGS', 'model-reported invocation identity is forbidden');
   }
@@ -207,48 +220,41 @@ function normalizeInnerArgs(
       throw new MemoryFacadeError('INVALID_ARGS', `unknown field: ${extra[0]}`);
     }
     const type = requireString(raw.type, 'type');
-    if (!WRITE_TYPES.has(type)) {
+    if (!WRITE_TYPES.has(type as FacadeWriteArgs['type'])) {
       throw new MemoryFacadeError('INVALID_ARGS', 'type must be a curated memory type');
     }
     const mode = raw.mode === undefined ? 'create' : requireString(raw.mode, 'mode');
     if (!WRITE_MODES.has(mode)) {
-      throw new MemoryFacadeError('INVALID_ARGS', 'mode must be create, update, or append');
+      throw new MemoryFacadeError('INVALID_ARGS', 'mode must be create or update');
     }
     return {
-      type,
+      type: type as FacadeWriteArgs['type'],
       name: requireString(raw.name, 'name'),
       title: requireString(raw.title, 'title'),
       description: requireString(raw.description, 'description'),
       body: requireString(raw.body, 'body'),
-      mode,
+      mode: mode as FacadeWriteArgs['mode'],
     };
   }
-  if (innerName === 'memory_delete') {
-    const extra = Object.keys(raw).filter((key) => key !== 'filename');
-    if (extra.length > 0) {
-      throw new MemoryFacadeError('INVALID_ARGS', `unknown field: ${extra[0]}`);
-    }
-    return { filename: requireString(raw.filename, 'filename') };
-  }
-  const extra = Object.keys(raw).filter((key) => key !== 'sources' && key !== 'target');
-  if (extra.length > 0) {
-    throw new MemoryFacadeError('INVALID_ARGS', `unknown field: ${extra[0]}`);
-  }
-  if (!Array.isArray(raw.sources) || raw.sources.length === 0) {
-    throw new MemoryFacadeError('INVALID_ARGS', 'sources is required');
-  }
-  const target = asRecord(raw.target);
-  if (!target) {
-    throw new MemoryFacadeError('INVALID_ARGS', 'target is required');
-  }
-  return {
-    sources: raw.sources,
-    target: normalizeInnerArgs('memory_write', { ...target, mode: 'create' }),
-  };
+  throw new MemoryFacadeError('INVALID_ARGS', 'inner tool is not a facade mutation');
 }
 
 function denyWriteResponse(): DynamicToolCallResponse {
   return textResponse(XDT_WRITE_FORBIDDEN, false);
+}
+
+function assertTargetMatchesPrepared(
+  writeTarget: FacadeWriteTarget | undefined,
+  prepared: PreparedMemorySession,
+): FacadeWriteTarget {
+  const target = assertWriteTarget(writeTarget);
+  if (target.workspace !== prepared.binding.canonicalWorkspaceId) {
+    throw new FacadeWriteTargetError(
+      'WRITE_TARGET_FORBIDDEN',
+      'write workspace must match the prepared binding',
+    );
+  }
+  return target;
 }
 
 function mapCaught(err: unknown): DynamicToolCallResponse {
@@ -264,6 +270,17 @@ function mapCaught(err: unknown): DynamicToolCallResponse {
   if (err instanceof XdtPrepareError) {
     return errorResponse(err.code, err.message.replace(/^[A-Z_]+: /, ''));
   }
+  if (err instanceof FacadeSecretError) {
+    return errorResponse(err.code, err.message.replace(/^[A-Z_]+: /, ''));
+  }
+  if (err instanceof FacadeWriteTargetError || err instanceof FacadeWriteError) {
+    return errorResponse(err.code, err.message.replace(/^[A-Z_]+: /, ''));
+  }
+  const code = (err as { code?: string }).code;
+  if (typeof code === 'string' && code.length > 0 && code === code.toUpperCase()) {
+    const message = err instanceof Error ? err.message : String(err);
+    return errorResponse(code, message.replace(/^[A-Z_]+: /, ''));
+  }
   const message = err instanceof Error ? err.message : String(err);
   if (message.includes('JOURNAL_BUSY')) {
     return errorResponse('JOURNAL_BUSY', 'facade journal is busy');
@@ -278,8 +295,8 @@ async function reuseOrMint(
   prepared: PreparedMemorySession,
   innerName: FacadeInnerToolName,
   normalizedArgsDigest: string,
-): Promise<void> {
-  const secret = await deps.getCapabilitySecret();
+  expectedRevision: string | null,
+): Promise<FacadeInvocationLedgerV1> {
   const now = freezeUtcZ((deps.now?.() ?? new Date()).toISOString());
   const sessionInstanceId = prepared.nativeMemoryProof.sessionInstanceId;
   const preparedMemorySessionId = prepared.preparedMemorySessionId;
@@ -306,6 +323,7 @@ async function reuseOrMint(
       || existing.innerToolName !== innerName
       || existing.sessionInstanceId !== sessionInstanceId
       || existing.preparedMemorySessionId !== preparedMemorySessionId
+      || existing.expectedRevision !== expectedRevision
     ) {
       throw new FacadeInvocationLedgerError(
         'MUTATION_IDENTITY_UNAVAILABLE',
@@ -313,16 +331,16 @@ async function reuseOrMint(
       );
     }
     if (existing.facadeOperationId && existing.operationId) {
-      return;
+      return existing;
     }
     const claimed = await readByInvocation({ owner }, existing.invocationId);
     if (claimed) {
-      await fillInvocationLedgerOperationIds(owner, identity, {
+      return fillInvocationLedgerOperationIds(owner, identity, {
         facadeOperationId: claimed.claim.facadeOperationId,
         operationId: claimed.claim.operationId,
       });
-      return;
     }
+    const secret = await deps.getCapabilitySecret();
     const capability = mintFacadeInitialCapability(
       {
         innerToolName: innerName,
@@ -339,13 +357,13 @@ async function reuseOrMint(
     const result = await claimFacadeInvocation({ owner }, {
       capability: { kind: 'FacadeInitialInvocationCapabilityV1', invocationId: capability.invocationId },
     });
-    await fillInvocationLedgerOperationIds(owner, identity, {
+    return fillInvocationLedgerOperationIds(owner, identity, {
       facadeOperationId: result.facadeOperationId,
       operationId: result.operationId,
     });
-    return;
   }
 
+  const secret = await deps.getCapabilitySecret();
   const invocationId = (deps.randomUuid ?? randomUUID)();
   const identityRecord: FacadeInvocationLedgerV1 = {
     schemaVersion: 1,
@@ -361,6 +379,7 @@ async function reuseOrMint(
     issuedAt: now,
     facadeOperationId: null,
     operationId: null,
+    expectedRevision,
   };
   await writeIdentityLedger(owner, identityRecord);
 
@@ -382,7 +401,7 @@ async function reuseOrMint(
     const result = await claimFacadeInvocation({ owner }, {
       capability: { kind: 'FacadeInitialInvocationCapabilityV1', invocationId: capability.invocationId },
     });
-    await fillInvocationLedgerOperationIds(owner, identity, {
+    return fillInvocationLedgerOperationIds(owner, identity, {
       facadeOperationId: result.facadeOperationId,
       operationId: result.operationId,
     });
@@ -390,11 +409,10 @@ async function reuseOrMint(
     if (err instanceof FacadeJournalError && err.code === 'JOURNAL_INVALID') {
       const claimed = await readByInvocation({ owner }, invocationId);
       if (claimed) {
-        await fillInvocationLedgerOperationIds(owner, identity, {
+        return fillInvocationLedgerOperationIds(owner, identity, {
           facadeOperationId: claimed.claim.facadeOperationId,
           operationId: claimed.claim.operationId,
         });
-        return;
       }
     }
     throw err;
@@ -424,11 +442,13 @@ export function createMemoryFacadeCodexDynamicToolProvider(
           ok: true,
           category: 'write',
           tools: [
-            { name: 'memory_write', description: 'Host facade write; currently fail-closed.' },
-            { name: 'memory_delete', description: 'Host facade delete; currently fail-closed.' },
-            { name: 'memory_consolidate', description: 'Host facade consolidate; currently fail-closed.' },
+            { name: 'memory_write', description: 'Host facade write create/update on an injected isolated tree.' },
           ],
         });
+      }
+
+      if (!params.callId) {
+        return errorResponse('INVALID_ARGS', 'callId is required');
       }
 
       const forbidden = rejectModelReportedIdentity(params);
@@ -475,8 +495,53 @@ export function createMemoryFacadeCodexDynamicToolProvider(
           turnId: params.turnId,
           callId: params.callId,
         };
-        await reuseOrMint(deps, owner, identity, prepared, innerName, normalizedArgsDigest);
-        return denyWriteResponse();
+        const writeTarget = deps.getWriteTarget?.();
+        const existingLedger = await readInvocationLedger(owner, identity);
+        let expectedRevision: string | null = null;
+        if (existingLedger) {
+          expectedRevision = existingLedger.expectedRevision;
+          if (writeTarget) {
+            assertTargetMatchesPrepared(writeTarget, prepared);
+          }
+        } else if (innerArgs.mode === 'update') {
+          const target = assertTargetMatchesPrepared(writeTarget, prepared);
+          expectedRevision = await freezeExpectedRevision({
+            target,
+            name: innerArgs.name,
+            createStore: deps.createWriteStore,
+          });
+          if (typeof expectedRevision !== 'string' || !expectedRevision) {
+            throw new FacadeWriteError('INVALID_ARGS', 'update requires a frozen expected_revision');
+          }
+        } else if (writeTarget) {
+          assertTargetMatchesPrepared(writeTarget, prepared);
+        }
+        const ledger = await reuseOrMint(
+          deps,
+          owner,
+          identity,
+          prepared,
+          innerName,
+          normalizedArgsDigest,
+          expectedRevision,
+        );
+        if (!writeTarget) {
+          return denyWriteResponse();
+        }
+        if (!ledger.operationId) {
+          throw new FacadeInvocationLedgerError(
+            'MUTATION_IDENTITY_UNAVAILABLE',
+            'ledger operationId missing after claim',
+          );
+        }
+        const result = await upsertFacadeMemoryWrite({
+          target: assertWriteTarget(writeTarget),
+          args: innerArgs,
+          operationId: ledger.operationId,
+          expectedRevision: ledger.expectedRevision,
+          createStore: deps.createWriteStore,
+        });
+        return textResponse(result, true);
       } catch (err) {
         return mapCaught(err);
       }

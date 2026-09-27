@@ -66,6 +66,7 @@ import {
   GHOST_SECRET_TAIL_MIN_VALUE_CHARS,
   isRendererAccessibleSafeStorageKey,
   PI_PROXY_DERIVATION_KEY_STORAGE_KEY,
+  FACADE_CAPABILITY_HMAC_STORAGE_KEY,
   PROVIDER_SECRET_IDS,
   REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY,
 } from '../../../shared/providerSecrets';
@@ -124,6 +125,7 @@ describe('providerSecrets registry', () => {
   it('keeps daemon-wide remote secrets behind the main-only boundary', () => {
     expect(isRendererAccessibleSafeStorageKey(REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY)).toBe(false);
     expect(isRendererAccessibleSafeStorageKey(PI_PROXY_DERIVATION_KEY_STORAGE_KEY)).toBe(false);
+    expect(isRendererAccessibleSafeStorageKey(FACADE_CAPABILITY_HMAC_STORAGE_KEY)).toBe(false);
   });
 
   it('keeps custom-provider header blobs behind the main-only boundary', () => {

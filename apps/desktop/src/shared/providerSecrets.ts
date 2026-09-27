@@ -85,12 +85,16 @@ export const REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY = 'remote_mcp_bridge_token';
  */
 export const PI_PROXY_DERIVATION_KEY_STORAGE_KEY = 'pi_proxy_derivation_key';
 
+/** Host-only HMAC key for FacadeInitialInvocationCapabilityV1. Never renderer-accessible. */
+export const FACADE_CAPABILITY_HMAC_STORAGE_KEY = 'facade_capability_hmac';
+
 const MAIN_ONLY_PROVIDER_SECRET_STORAGE_KEYS = new Set<string>([
   STORAGE_KEYS['voice-asr'].toLowerCase(),
   STORAGE_KEYS['gemini'].toLowerCase(),
   STORAGE_KEYS['openai-images'].toLowerCase(),
   REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY.toLowerCase(),
   PI_PROXY_DERIVATION_KEY_STORAGE_KEY.toLowerCase(),
+  FACADE_CAPABILITY_HMAC_STORAGE_KEY.toLowerCase(),
 ]);
 
 /** Custom-provider runtime header blobs are main-only credential material. */

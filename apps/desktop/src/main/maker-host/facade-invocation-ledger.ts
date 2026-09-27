@@ -51,6 +51,7 @@ export interface FacadeInvocationLedgerV1 {
   issuedAt: string;
   facadeOperationId: string | null;
   operationId: string | null;
+  expectedRevision: string | null;
 }
 
 export interface CallIdentity {
@@ -190,6 +191,9 @@ function parseLedger(utf8: string, expectedDigest: string): FacadeInvocationLedg
       'MUTATION_IDENTITY_UNAVAILABLE',
       'ledger filename digest does not match fields',
     );
+  }
+  if (parsed.expectedRevision === undefined) {
+    parsed.expectedRevision = null;
   }
   return parsed;
 }

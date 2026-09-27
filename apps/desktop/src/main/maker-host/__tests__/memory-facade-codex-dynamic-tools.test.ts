@@ -3,7 +3,9 @@
  * 测试必须注入 temp ownerRoot；禁止写生产 Roaming / dc703d5e UUID。
  */
 
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -42,6 +44,8 @@ const WRITE_ARGS = {
   body: 'deny-write still required',
 };
 
+const execFileAsync = promisify(execFile);
+const WRITE_WORKSPACE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const temps: string[] = [];
 
 afterEach(async () => {
@@ -157,19 +161,44 @@ function payload(result: { contentItems: Array<{ type: string; text?: string }> 
 }
 
 describe('memory facade Codex dynamic tools', () => {
-  it('does not advertise tools in production wiring', async () => {
+  it('advertises in production wiring but cannot write production disk without a write target', async () => {
     const owner = await ownerScope();
+    const constructs: unknown[] = [];
     const provider = createMemoryFacadeCodexDynamicToolProvider({
       getOwner: () => owner,
       getCapabilitySecret: () => FIXTURE_SECRET,
       getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      getWriteTarget: () => undefined,
+      createWriteStore: (options) => {
+        constructs.push(options);
+        throw new Error('must not construct MemoryStore');
+      },
     });
-    expect(provider.listTools(CONTEXT)).toEqual([]);
+    expect(provider.listTools(CONTEXT).map((tool) => tool.name)).toEqual([
+      'cindy_memory_facade__list_tools',
+      'cindy_memory_facade__call_tool',
+    ]);
+    const listed = await provider.callTool(
+      {
+        threadId: 't-prod',
+        turnId: 'u-prod',
+        callId: 'c-list',
+        namespace: null,
+        tool: 'cindy_memory_facade__list_tools',
+        arguments: {},
+      },
+      CONTEXT,
+    );
+    expect(payload(listed).tools).toEqual([
+      expect.objectContaining({ name: 'memory_write' }),
+    ]);
     const result = await provider.callTool(
       writeCall(WRITE_ARGS, { threadId: 't-prod', turnId: 'u-prod', callId: 'c-prod' }),
       CONTEXT,
     );
     expect(payload(result)).toEqual(XDT_WRITE_FORBIDDEN);
+    expect(constructs).toEqual([]);
   });
 
   it('does not advertise tools without a prepared xdt session', () => {
@@ -338,6 +367,202 @@ describe('memory facade Codex dynamic tools', () => {
     );
     expect(payload(result).code).not.toBe('JOURNAL_BUSY');
     expect(payload(result)).toEqual(XDT_WRITE_FORBIDDEN);
+  });
+
+  it('rejects append, delete, and consolidate before claim', async () => {
+    const owner = await ownerScope();
+    const constructs: unknown[] = [];
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      createWriteStore: (options) => {
+        constructs.push(options);
+        throw new Error('must not construct');
+      },
+    });
+    const append = await provider.callTool(
+      writeCall({ ...WRITE_ARGS, mode: 'append' }, { threadId: 't', turnId: 'u', callId: 'c-append' }),
+      CONTEXT,
+    );
+    expect(payload(append).code).toBe('INVALID_ARGS');
+    const consolidate = await provider.callTool(
+      {
+        threadId: 't',
+        turnId: 'u',
+        callId: 'c-con',
+        namespace: null,
+        tool: 'cindy_memory_facade__call_tool',
+        arguments: { name: 'memory_consolidate', args: { sources: ['a.md'] } },
+      },
+      CONTEXT,
+    );
+    expect(payload(consolidate).code).toBe('INVALID_ARGS');
+    const deleted = await provider.callTool(
+      {
+        threadId: 't',
+        turnId: 'u',
+        callId: 'c-del',
+        namespace: null,
+        tool: 'cindy_memory_facade__call_tool',
+        arguments: { name: 'memory_delete', args: { filename: 'project_facade_1b_probe.md' } },
+      },
+      CONTEXT,
+    );
+    expect(payload(deleted).code).toBe('INVALID_ARGS');
+    await expect(stat(path.join(owner.ownerRoot, 'facade-journal'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(constructs).toEqual([]);
+  });
+
+  it('rejects missing write-target fields and forbidden workspaces before MemoryStore', async () => {
+    const owner = await ownerScope();
+    const constructs: unknown[] = [];
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      getWriteTarget: () => ({ repoRoot: '', dataRoot: '', workspace: '' }),
+      createWriteStore: (options) => {
+        constructs.push(options);
+        throw new Error('must not construct');
+      },
+    });
+    const missing = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't', turnId: 'u', callId: 'c-missing' }),
+      CONTEXT,
+    );
+    expect(payload(missing).code).toBe('WRITE_TARGET_REQUIRED');
+    expect(constructs).toEqual([]);
+    await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+
+    const bannedRepo = await tempDir('cindy-facade-1c-repo-');
+    const bannedData = await tempDir('cindy-facade-1c-data-');
+    const forbidden = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      getWriteTarget: () => ({
+        repoRoot: bannedRepo,
+        dataRoot: bannedData,
+        workspace: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+      }),
+      createWriteStore: (options) => {
+        constructs.push(options);
+        throw new Error('must not construct');
+      },
+    });
+    const banned = await forbidden.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't', turnId: 'u', callId: 'c-banned' }),
+      CONTEXT,
+    );
+    expect(payload(banned).code).toBe('WRITE_TARGET_FORBIDDEN');
+    expect(constructs).toEqual([]);
+  });
+
+  it('does not mint when Host secret storage is unavailable and writes no plaintext secret file', async () => {
+    const owner = await ownerScope();
+    const { FacadeSecretError, loadHostFacadeCapabilitySecret } = await import('../facade-capability-secret.js');
+    expect(() => loadHostFacadeCapabilitySecret({
+      isAvailable: () => false,
+      read: () => null,
+      write: () => true,
+      remove: () => ({ success: true }),
+      list: () => [],
+    })).toThrow(/FACADE_SECRET_UNAVAILABLE/);
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => {
+        throw new FacadeSecretError('safeStorage encryption is unavailable');
+      },
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+    });
+    const result = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't-secret', turnId: 'u-secret', callId: 'c-secret' }),
+      CONTEXT,
+    );
+    expect(payload(result).code).toBe('FACADE_SECRET_UNAVAILABLE');
+    await expect(stat(path.join(owner.ownerRoot, 'facade-capability.secret'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('creates on an isolated git tree with shared:true and reuses operationId on retry', { timeout: 60_000 }, async () => {
+    const owner = await ownerScope();
+    const prepared = fixturePrepared();
+    prepared.binding.canonicalWorkspaceId = WRITE_WORKSPACE;
+    const root = await tempDir('cindy-facade-1c-iso-');
+    const remote = path.join(root, 'remote.git');
+    const service = path.join(root, 'service');
+    await execFileAsync('git', ['init', '--bare', '--initial-branch=main', remote], { windowsHide: true });
+    await execFileAsync('git', ['clone', remote, service], { windowsHide: true });
+    await execFileAsync('git', ['-C', service, 'config', 'user.name', 'cindy facade 1c'], { windowsHide: true });
+    await execFileAsync('git', ['-C', service, 'config', 'user.email', 'cindy-facade-1c@example.invalid'], { windowsHide: true });
+    await writeFile(path.join(service, '.gitignore'), '.runtime/\n', 'utf8');
+    await mkdir(path.join(service, 'data'), { recursive: true });
+    await writeFile(path.join(service, 'data', '.gitkeep'), '', 'utf8');
+    await execFileAsync('git', ['-C', service, 'add', '.gitignore', 'data/.gitkeep'], { windowsHide: true });
+    await execFileAsync('git', ['-C', service, 'commit', '-m', 'fixture: isolated facade write'], { windowsHide: true });
+    await execFileAsync('git', ['-C', service, 'push', '-u', 'origin', 'main'], { windowsHide: true });
+    const target = {
+      repoRoot: service,
+      dataRoot: path.join(service, 'data'),
+      workspace: WRITE_WORKSPACE,
+    };
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => prepared,
+      advertiseTools: true,
+      getWriteTarget: () => target,
+    });
+    const ids = { threadId: 'iso', turnId: 'turn', callId: 'call-iso' };
+    const first = await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
+    expect(payload(first).shared).toBe(true);
+    expect(payload(first).operation_id).toMatch(/^[0-9a-f-]{36}$/);
+    const ledger = await readInvocationLedger(owner, ids);
+    expect(payload(first).operation_id).toBe(ledger?.operationId);
+    const second = await provider.callTool(writeCall(WRITE_ARGS, ids), CONTEXT);
+    expect(payload(second).shared).toBe(true);
+    expect(payload(second).operation_id).toBe(ledger?.operationId);
+    const recordDir = path.join(service, 'data', 'records', WRITE_WORKSPACE, WRITE_ARGS.name);
+    const names = await readdir(recordDir);
+    expect(names).toEqual([`${ledger?.operationId}.json`]);
+    const record = JSON.parse(await readFile(path.join(recordDir, names[0]), 'utf8')) as Record<string, unknown>;
+    expect(record.id).toBe(WRITE_ARGS.name);
+    expect(record.kind).toBe(WRITE_ARGS.type);
+    expect(record.operation_id).toBe(ledger?.operationId);
+    expect(JSON.stringify(ledger)).not.toContain(FIXTURE_SECRET);
+    expect(JSON.stringify(record)).not.toContain(FIXTURE_SECRET);
+    const journalFiles: string[] = [];
+    const journalRoot = ownerJournalDir(owner);
+    const walk = async (dir: string): Promise<void> => {
+      const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full);
+        else journalFiles.push(await readFile(full, 'utf8'));
+      }
+    };
+    await walk(journalRoot);
+    expect(journalFiles.join('\n')).not.toContain(FIXTURE_SECRET);
+    expect(ledger?.expectedRevision).toBeNull();
+    const makerMemory = path.join(owner.ownerRoot, 'maker-memory');
+    await expect(stat(makerMemory)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      stat(path.join('D:/AI/Codex/xdt-memory/data/records/dc703d5e-1ce0-4543-be4d-014cfa3a1955', WRITE_ARGS.name)),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      stat(path.join('D:/AI/Codex/xdt-memory/data/records/5fb84df7-8de0-4f74-a7ff-6c7b0850f317', WRITE_ARGS.name)),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('composes with iOS without replacing it, and keeps foreign tools undefined', async () => {

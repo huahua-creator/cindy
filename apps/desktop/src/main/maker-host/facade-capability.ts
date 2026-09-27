@@ -4,10 +4,7 @@
  * 生产对象不得用 CAP-FIXTURE-MAC 当放行门。
  */
 
-import { createHmac, randomBytes, randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
-import path from 'node:path';
+import { createHmac, randomUUID } from 'node:crypto';
 
 import { freezeUtcZ, HEX64_RE, UUID_V4_RE } from '@cindy/maker-core';
 
@@ -107,37 +104,4 @@ export function verifyFacadeInitialCapability(
     return false;
   }
   return capability.capabilityMac === facadeCapabilityMac(capability, secret);
-}
-
-export function facadeCapabilitySecretPath(ownerRoot: string): string {
-  return path.join(ownerRoot, FACADE_CAPABILITY_SECRET_FILE);
-}
-
-/**
- * 测试注入密钥；生产 Desktop 走 ownerRoot 旁路 generate-once 文件（明文债，不进 journal）。
- * 不得把密钥写进 ledger / journal JSON，不得打日志。
- */
-export async function loadOrCreateFacadeCapabilitySecret(ownerRoot: string): Promise<Buffer> {
-  const filePath = facadeCapabilitySecretPath(ownerRoot);
-  await fsp.mkdir(ownerRoot, { recursive: true });
-  try {
-    const handle = await fsp.open(filePath, 'wx', 0o600);
-    try {
-      await handle.writeFile(randomBytes(32));
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-  }
-  const bytes = await fsp.readFile(filePath);
-  if (bytes.length !== 32) {
-    throw new Error('facade capability secret must be 32 bytes');
-  }
-  const stat = fs.lstatSync(filePath);
-  if (stat.isSymbolicLink()) {
-    throw new Error('facade capability secret must not be a symlink');
-  }
-  return bytes;
 }

@@ -252,11 +252,12 @@ import { invalidatePiEnvironment } from '../mcp-integrations/piEnvironment.js';
 import { getIOSSimulatorMcpDeps } from '../mcp-integrations/ios-simulator.js';
 import { readContactsSettings } from './contacts-settings-store.js';
 import { createIOSSimulatorCodexDynamicToolProvider } from './ios-simulator-codex-dynamic-tools.js';
-import { loadOrCreateFacadeCapabilitySecret } from './facade-capability.js';
+import { loadHostFacadeCapabilitySecret } from './facade-capability-secret.js';
 import {
   composeCodexHostDynamicToolProviders,
   createMemoryFacadeCodexDynamicToolProvider,
 } from './memory-facade-codex-dynamic-tools.js';
+import { getElectronSecretIo } from '../secrets/providerSecretStore.js';
 import { resolveOwnerScopedRegistryRoot } from './workspace-identity-assembler.js';
 import { captureKnownFileBefore, noteOpaqueTurnChange } from '../turn-change-set/store.js';
 
@@ -1558,12 +1559,10 @@ export function getMaker(): Maker {
         }),
         createMemoryFacadeCodexDynamicToolProvider({
           getOwner: () => resolveOwnerScopedRegistryRoot(),
-          getCapabilitySecret: () => {
-            const owner = resolveOwnerScopedRegistryRoot();
-            return loadOrCreateFacadeCapabilitySecret(owner.ownerRoot);
-          },
+          getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
           getPreparedBySessionId: getPreparedMemorySessionForSessionId,
-          advertiseTools: false,
+          advertiseTools: true,
+          getWriteTarget: () => undefined,
         }),
       ]),
       // 通讯录 prompt 段有效状态(codex 版): 在 claude 的判定链之上再与「实际应用
