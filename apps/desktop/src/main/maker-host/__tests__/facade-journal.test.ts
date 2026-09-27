@@ -3,15 +3,18 @@
  * 测试必须显式注入 temp ownerRoot，禁止默认扫生产 Roaming。
  */
 
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { loadXdtSchemaValidator, resolveXdtMemoryRoot } from '@cindy/maker-core';
+
 import {
-  FacadeJournalError,
   claimFacadeInvocation,
   claimPath,
   entryPath,
@@ -20,10 +23,13 @@ import {
   ownerScopeDigest,
   readByInvocation,
   recoverIntent,
+  schemaJournalValidator,
   shardForFacadeOperationId,
   structuralJournalValidator,
   __testOnly,
 } from '../facade-journal.js';
+
+const require = createRequire(import.meta.url);
 
 const OWNER = 'owner-fixture-journal-1';
 const temps: string[] = [];
@@ -76,26 +82,78 @@ describe('facade journal files', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('rejects a symlink journal root and does not follow it', async () => {
+  it('does not reject a production-shaped Roaming ownerRoot substring in a temp tree', async () => {
+    const fakeRoaming = await tempDir('cindy-facade-journal-roaming-');
+    const ownerRoot = path.join(fakeRoaming, 'AppData', 'Roaming', 'Cindy', 'owners', `c88d8b${'a'.repeat(14)}`);
+    await mkdir(ownerRoot, { recursive: true });
+    expect(ownerRoot.replaceAll('\\', '/')).toMatch(/AppData\/Roaming\/Cindy\/owners\/c88d8b/i);
+    expect(path.resolve(ownerRoot).replaceAll('\\', '/')).not.toMatch(
+      /\/Users\/XINDONG\/AppData\/Roaming\/Cindy(\/|$)/i,
+    );
+    const result = await claimFacadeInvocation(deps({ dataOwnerId: OWNER, ownerRoot }), {
+      capability: capability(),
+    });
+    expect(result.claimPath.replaceAll('\\', '/')).toContain('/AppData/Roaming/Cindy/owners/c88d8b');
+    expect(result.claimPath.replaceAll('\\', '/')).not.toMatch(
+      /\/Users\/XINDONG\/AppData\/Roaming\/Cindy(\/|$)/i,
+    );
+  });
+
+  it('matches xdt-memory objectDigest instead of hashing JSON.stringify', async () => {
+    const { objectDigest, sha256Hex } = require(
+      path.join(resolveXdtMemoryRoot(), 'src/schema-validator/canonical-json.mjs'),
+    ) as {
+      objectDigest: (value: unknown, excluded?: string[] | null) => string;
+      sha256Hex: (utf8: string) => string;
+    };
+    const claim = {
+      schemaVersion: 1,
+      invocationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      invocationIdDigest: 'b'.repeat(64),
+      facadeOperationId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      operationId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    };
+    const canonical = objectDigest(claim, []);
+    expect(__testOnly.objectDigest(claim)).toBe(canonical);
+    expect(__testOnly.objectDigest(claim)).not.toBe(sha256Hex(JSON.stringify(claim)));
+  });
+
+  it('uses loadXdtSchemaValidator on origin/main journal-intent vectors', async () => {
+    const schema = loadXdtSchemaValidator();
+    const kind = (schema.KIND as { journalIntent?: string }).journalIntent ?? 'facade-journal-intent-v1';
+    const root = resolveXdtMemoryRoot();
+    const pass = JSON.parse(
+      await readFile(path.join(root, 'schemas/vectors/journal-intent-prepared-pass.json'), 'utf8'),
+    ) as { utf8: string };
+    const extra = JSON.parse(
+      await readFile(path.join(root, 'schemas/vectors/journal-intent-prepared-extra-key.json'), 'utf8'),
+    ) as { utf8: string };
+    const wrong = JSON.parse(
+      await readFile(path.join(root, 'schemas/vectors/journal-intent-wrong-state-field.json'), 'utf8'),
+    ) as { utf8: string };
+    expect(schema.validateUtf8Object({ kind, utf8Bytes: pass.utf8 }).ok).toBe(true);
+    expect(schema.validateUtf8Object({ kind, utf8Bytes: extra.utf8 }).ok).toBe(false);
+    expect(schema.validateUtf8Object({ kind, utf8Bytes: wrong.utf8 }).ok).toBe(false);
+
     const owner = await ownerScope();
-    const real = await tempDir('cindy-facade-journal-real-');
+    const validator = schemaJournalValidator();
+    expect(validator.validateIntent(extra.utf8).ok).toBe(false);
+    expect(validator.validateIntent(wrong.utf8).ok).toBe(false);
+    await mkdir(path.dirname(__testOnly.intentPath(owner)), { recursive: true });
+    await writeFile(__testOnly.intentPath(owner), `${extra.utf8}\n`, 'utf8');
+    await expect(recoverIntent({ owner, validator })).rejects.toMatchObject({ code: 'JOURNAL_INVALID' });
+  });
+
+  it('rejects a Windows junction journal root and leaves the target empty', async () => {
+    const owner = await ownerScope();
+    const real = await tempDir('cindy-facade-journal-junction-target-');
     const journal = journalRoot(owner);
     await mkdir(path.dirname(journal), { recursive: true });
-    try {
-      await symlink(real, journal, 'dir');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EPERM') {
-        expect((err as NodeJS.ErrnoException).code).toBe('EPERM');
-        return;
-      }
-      throw err;
-    }
+    execFileSync('cmd.exe', ['/c', 'mklink', '/J', journal, real], { windowsHide: true });
     await expect(
       claimFacadeInvocation(deps(owner), { capability: capability() }),
     ).rejects.toMatchObject({ code: 'JOURNAL_INVALID' });
-    expect(await readFile(journal, { encoding: 'utf8' }).catch(() => 'link')).toBe('link');
-    const names = await (await import('node:fs/promises')).readdir(real);
-    expect(names).toEqual([]);
+    expect(await readdir(real)).toEqual([]);
   });
 
   it('keeps a half-published intent on recover and does not delete it', async () => {

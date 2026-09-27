@@ -20,6 +20,7 @@ import path from 'node:path';
 import {
   HEX64_RE,
   UUID_V4_RE,
+  loadXdtSchemaValidator,
   resolveXdtMemoryRoot,
 } from '@cindy/maker-core';
 
@@ -103,7 +104,7 @@ export interface FacadeJournalLimits {
 
 export interface FacadeJournalDeps {
   owner: RegistryOwnerScope;
-  validator: FixtureJournalValidator;
+  validator?: FixtureJournalValidator;
   limits?: FacadeJournalLimits;
   randomUuid?: () => string;
 }
@@ -127,16 +128,28 @@ const INTENT_STATES: readonly FacadeJournalIntentState[] = [
   'committed',
 ];
 
-function loadCanonicalDigest(): (utf8: string) => string {
+function loadCanonicalJson(): {
+  sha256Hex: (utf8: string) => string;
+  objectDigest: (value: unknown, excludedKeys?: string[] | null) => string;
+} {
   const root = resolveXdtMemoryRoot();
-  const mod = require(path.join(root, 'src/schema-validator/canonical-json.mjs')) as {
+  return require(path.join(root, 'src/schema-validator/canonical-json.mjs')) as {
     sha256Hex: (utf8: string) => string;
+    objectDigest: (value: unknown, excludedKeys?: string[] | null) => string;
   };
-  return mod.sha256Hex;
+}
+
+function loadJournalKindNames(): { journalIntent: string } {
+  const root = resolveXdtMemoryRoot();
+  const patterns = require(path.join(root, 'src/schema-validator/patterns.mjs')) as {
+    KIND?: { journalIntent?: string };
+  };
+  const journalIntent = patterns.KIND?.journalIntent ?? 'facade-journal-intent-v1';
+  return { journalIntent };
 }
 
 function sha256Utf8(utf8: string): string {
-  const digest = loadCanonicalDigest()(utf8);
+  const digest = loadCanonicalJson().sha256Hex(utf8);
   if (!HEX64_RE.test(digest)) {
     throw new FacadeJournalError('JOURNAL_INVALID', 'digest must be sha256 hex');
   }
@@ -182,12 +195,6 @@ function assertOwnerScope(scope: RegistryOwnerScope): void {
       'journal must not write cindy-no-session',
     );
   }
-  if (/appdata[/\\]roaming[/\\]cindy([/\\]|$)/i.test(normalized.replaceAll('\\', '/'))) {
-    throw new FacadeJournalError(
-      'WORKSPACE_IDENTITY_REQUIRED',
-      'journal ownerRoot must be injected; production Roaming is forbidden',
-    );
-  }
 }
 
 export function journalRoot(scope: RegistryOwnerScope): string {
@@ -224,12 +231,28 @@ function serialize(value: unknown): string {
 }
 
 function objectDigest(value: unknown): string {
-  const utf8 = serialize(value);
-  return sha256Utf8(utf8.endsWith('\n') ? utf8.slice(0, -1) : utf8);
+  const digest = loadCanonicalJson().objectDigest(value, []);
+  if (!HEX64_RE.test(digest)) {
+    throw new FacadeJournalError('JOURNAL_INVALID', 'digest must be sha256 hex');
+  }
+  return digest;
 }
 
-function isReparse(stat: fs.Stats): boolean {
-  return stat.isSymbolicLink();
+function isReparseStat(stat: fs.Stats): boolean {
+  if (stat.isSymbolicLink()) return true;
+  const reparseTag = Number((stat as fs.Stats & { reparseTag?: number }).reparseTag);
+  return Number.isFinite(reparseTag) && reparseTag !== 0;
+}
+
+function isReparsePath(target: string, stat: fs.Stats): boolean {
+  if (isReparseStat(stat)) return true;
+  if (process.platform !== 'win32') return false;
+  try {
+    fs.readlinkSync(target);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function lstatNoFollow(target: string): Promise<fs.Stats | null> {
@@ -244,7 +267,7 @@ async function lstatNoFollow(target: string): Promise<fs.Stats | null> {
 async function assertNotReparse(target: string, label: string): Promise<void> {
   const stat = await lstatNoFollow(target);
   if (!stat) return;
-  if (isReparse(stat)) {
+  if (isReparsePath(target, stat)) {
     throw new FacadeJournalError('JOURNAL_INVALID', `${label} must not be a symlink, junction, or reparse point`);
   }
 }
@@ -252,7 +275,7 @@ async function assertNotReparse(target: string, label: string): Promise<void> {
 async function assertSafeDirectory(target: string, label: string): Promise<void> {
   const stat = await lstatNoFollow(target);
   if (!stat) return;
-  if (stat.isSymbolicLink()) {
+  if (isReparsePath(target, stat)) {
     throw new FacadeJournalError('JOURNAL_INVALID', `${label} must not be a symlink, junction, or reparse point`);
   }
   if (!stat.isDirectory()) {
@@ -266,7 +289,7 @@ async function mkdirReal(target: string): Promise<void> {
   await assertSafeDirectory(target, target);
   const existing = await lstatNoFollow(target);
   if (existing) {
-    if (existing.isSymbolicLink()) {
+    if (isReparsePath(target, existing)) {
       throw new FacadeJournalError('JOURNAL_INVALID', `${target} must not be a symlink, junction, or reparse point`);
     }
     return;
@@ -379,7 +402,8 @@ async function directoryBytes(root: string): Promise<number> {
     }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isSymbolicLink()) {
+      const childStat = await fsp.lstat(full);
+      if (entry.isSymbolicLink() || isReparsePath(full, childStat)) {
         throw new FacadeJournalError('JOURNAL_INVALID', `${full} must not be a symlink, junction, or reparse point`);
       }
       if (entry.isDirectory()) {
@@ -464,14 +488,18 @@ async function readIntentFile(
 function digestMatches(fileUtf8: string | undefined, expected: string | null): boolean {
   if (expected === null) return fileUtf8 === undefined;
   if (fileUtf8 === undefined) return false;
-  const body = fileUtf8.endsWith('\n') ? fileUtf8.slice(0, -1) : fileUtf8;
-  return sha256Utf8(body) === expected;
+  try {
+    return objectDigest(JSON.parse(fileUtf8)) === expected;
+  } catch {
+    return false;
+  }
 }
 
 async function recoverLockedIntent(
   deps: FacadeJournalDeps,
 ): Promise<FacadeJournalIntentV1 | undefined> {
-  const intent = await readIntentFile(deps.owner, deps.validator);
+  const validator = resolveValidator(deps);
+  const intent = await readIntentFile(deps.owner, validator);
   if (!intent) return undefined;
   if (intent.state === 'committed') {
     await fsp.rm(intentPath(deps.owner), { force: true });
@@ -525,6 +553,58 @@ async function writeIntent(scope: RegistryOwnerScope, validator: FixtureJournalV
     );
   }
   await writeUtf8Atomic(intentPath(scope), utf8);
+}
+
+function structuralClaimEntryValidator(): Pick<FixtureJournalValidator, 'validateClaim' | 'validateEntry'> {
+  const check = (utf8: string, required: string[]): { ok: boolean; code?: string; message?: string } => {
+    if (utf8.includes('\r')) return { ok: false, code: 'CRLF_FORBIDDEN', message: 'CR forbidden' };
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(utf8) as Record<string, unknown>;
+    } catch {
+      return { ok: false, code: 'JSON_INVALID', message: 'not json' };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, code: 'SHAPE_INVALID', message: 'not an object' };
+    }
+    if (parsed.schemaVersion !== 1) {
+      return { ok: false, code: 'SCHEMA_VERSION', message: 'schemaVersion must be 1' };
+    }
+    for (const key of required) {
+      if (!(key in parsed)) return { ok: false, code: 'MISSING_FIELD', message: key };
+    }
+    return { ok: true };
+  };
+  return {
+    validateClaim: (utf8) => check(utf8, [
+      'invocationId',
+      'invocationIdDigest',
+      'facadeOperationId',
+      'operationId',
+    ]),
+    validateEntry: (utf8) => check(utf8, [
+      'facadeOperationId',
+      'invocationId',
+      'operationId',
+      'state',
+    ]),
+  };
+}
+
+export function schemaJournalValidator(): FixtureJournalValidator {
+  const schema = loadXdtSchemaValidator();
+  const kind = (schema.KIND as { journalIntent?: string }).journalIntent
+    ?? loadJournalKindNames().journalIntent;
+  const claimEntry = structuralClaimEntryValidator();
+  return {
+    validateIntent: (utf8) => schema.validateUtf8Object({ kind, utf8Bytes: utf8 }),
+    validateClaim: claimEntry.validateClaim,
+    validateEntry: claimEntry.validateEntry,
+  };
+}
+
+function resolveValidator(deps: FacadeJournalDeps): FixtureJournalValidator {
+  return deps.validator ?? schemaJournalValidator();
 }
 
 export function structuralJournalValidator(): FixtureJournalValidator {
@@ -592,7 +672,8 @@ export async function readByInvocation(
       await isolateInvalid(deps.owner, claimFile);
       throw new FacadeJournalError('JOURNAL_INVALID', 'facade journal claim is unreadable');
     }
-    const claim = parseClaim(raw.utf8, deps.validator);
+    const validator = resolveValidator(deps);
+    const claim = parseClaim(raw.utf8, validator);
     const entryFile = entryPath(deps.owner, claim.facadeOperationId);
     const entryRaw = await readUtf8(entryFile);
     if (entryRaw.status === 'unreadable' || entryRaw.utf8 === undefined) {
@@ -602,7 +683,7 @@ export async function readByInvocation(
     if (entryRaw.status === 'missing') {
       throw new FacadeJournalError('JOURNAL_INVALID', 'claim exists without entry');
     }
-    const entry = parseEntry(entryRaw.utf8, deps.validator);
+    const entry = parseEntry(entryRaw.utf8, validator);
     return { claim, entry };
   });
 }
@@ -659,12 +740,13 @@ export async function claimFacadeInvocation(
       operationId,
       state: 'claimed',
     };
+    const validator = resolveValidator(deps);
     const claimUtf8 = serialize(claim);
     const entryUtf8 = serialize(entry);
-    if (!deps.validator.validateClaim(claimUtf8).ok) {
+    if (!validator.validateClaim(claimUtf8).ok) {
       throw new FacadeJournalError('JOURNAL_INVALID', 'claim fixture validator rejected object');
     }
-    if (!deps.validator.validateEntry(entryUtf8).ok) {
+    if (!validator.validateEntry(entryUtf8).ok) {
       throw new FacadeJournalError('JOURNAL_INVALID', 'entry fixture validator rejected object');
     }
 
@@ -684,15 +766,15 @@ export async function claimFacadeInvocation(
       intendedEntryDigest,
       state: 'prepared',
     };
-    await writeIntent(deps.owner, deps.validator, prepared);
+    await writeIntent(deps.owner, validator, prepared);
 
     await writeUtf8Atomic(claimPath(deps.owner, invDigest), claimUtf8);
-    await writeIntent(deps.owner, deps.validator, { ...prepared, state: 'claim_published' });
+    await writeIntent(deps.owner, validator, { ...prepared, state: 'claim_published' });
 
     await writeUtf8Atomic(entryPath(deps.owner, facadeOperationId), entryUtf8);
-    await writeIntent(deps.owner, deps.validator, { ...prepared, state: 'entry_published' });
+    await writeIntent(deps.owner, validator, { ...prepared, state: 'entry_published' });
 
-    await writeIntent(deps.owner, deps.validator, { ...prepared, state: 'committed' });
+    await writeIntent(deps.owner, validator, { ...prepared, state: 'committed' });
     await fsp.rm(intentPath(deps.owner), { force: true });
 
     return {
