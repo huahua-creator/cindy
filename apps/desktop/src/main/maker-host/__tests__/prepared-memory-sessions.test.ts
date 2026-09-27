@@ -24,6 +24,7 @@ import {
   forgetPreparedMemorySession,
   forgetPreparedMemorySessionForSessionId,
   getPreparedMemorySession,
+  getPreparedMemorySessionForSessionId,
   prepareAndRememberMemorySession,
   resetPreparedMemorySessionsForTest,
 } from '../prepared-memory-sessions';
@@ -223,6 +224,8 @@ describe('Host fixture startup path', () => {
     });
     bindPreparedMemorySessionToSessionId('business-session', prepared.preparedMemorySessionId);
     expect(getPreparedMemorySession(prepared.preparedMemorySessionId)).toBe(prepared);
+    expect(getPreparedMemorySessionForSessionId('business-session')).toBe(prepared);
+    expect(getPreparedMemorySessionForSessionId('missing-session')).toBeUndefined();
     forgetPreparedMemorySession('business-session');
     expect(getPreparedMemorySession(prepared.preparedMemorySessionId)).toBe(prepared);
     forgetPreparedMemorySessionForSessionId('business-session');

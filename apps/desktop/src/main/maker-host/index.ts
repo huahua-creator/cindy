@@ -41,6 +41,7 @@ import {
 import {
   forgetPreparedMemorySessionForSessionId,
   getPreparedMemorySession,
+  getPreparedMemorySessionForSessionId,
 } from './prepared-memory-sessions.js';
 import { attachSessionWorkspaceIdentity } from './attach-session-workspace-identity.js';
 import { prepareReadonlyXdtSession } from './prepare-readonly-xdt-session.js';
@@ -251,6 +252,12 @@ import { invalidatePiEnvironment } from '../mcp-integrations/piEnvironment.js';
 import { getIOSSimulatorMcpDeps } from '../mcp-integrations/ios-simulator.js';
 import { readContactsSettings } from './contacts-settings-store.js';
 import { createIOSSimulatorCodexDynamicToolProvider } from './ios-simulator-codex-dynamic-tools.js';
+import { loadOrCreateFacadeCapabilitySecret } from './facade-capability.js';
+import {
+  composeCodexHostDynamicToolProviders,
+  createMemoryFacadeCodexDynamicToolProvider,
+} from './memory-facade-codex-dynamic-tools.js';
+import { resolveOwnerScopedRegistryRoot } from './workspace-identity-assembler.js';
 import { captureKnownFileBefore, noteOpaqueTurnChange } from '../turn-change-set/store.js';
 
 /**
@@ -1545,9 +1552,20 @@ export function getMaker(): Maker {
         });
       },
       makerMemory: makerMemoryManager,
-      codexHostDynamicToolProvider: createIOSSimulatorCodexDynamicToolProvider({
-        deps: getIOSSimulatorMcpDeps({ resolveAccess: resolveIOSSimulatorAccess }),
-      }),
+      codexHostDynamicToolProvider: composeCodexHostDynamicToolProviders([
+        createIOSSimulatorCodexDynamicToolProvider({
+          deps: getIOSSimulatorMcpDeps({ resolveAccess: resolveIOSSimulatorAccess }),
+        }),
+        createMemoryFacadeCodexDynamicToolProvider({
+          getOwner: () => resolveOwnerScopedRegistryRoot(),
+          getCapabilitySecret: () => {
+            const owner = resolveOwnerScopedRegistryRoot();
+            return loadOrCreateFacadeCapabilitySecret(owner.ownerRoot);
+          },
+          getPreparedBySessionId: getPreparedMemorySessionForSessionId,
+          advertiseTools: false,
+        }),
+      ]),
       // 通讯录 prompt 段有效状态(codex 版): 在 claude 的判定链之上再与「实际应用
       // 到 running app-server 的 spawn 快照」对齐 —— 开关切换后失效失败(busy,
       // contacts-ipc 折成 codexMcpRefreshed:false)时 stale 桥里没有新工具面,

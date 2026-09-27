@@ -30,6 +30,13 @@ export function getPreparedMemorySession(
   return sessions.get(preparedMemorySessionId);
 }
 
+export function getPreparedMemorySessionForSessionId(
+  sessionId: string,
+): PreparedMemorySession | undefined {
+  const preparedId = sessionIdToPreparedId.get(sessionId);
+  return preparedId ? sessions.get(preparedId) : undefined;
+}
+
 export function forgetPreparedMemorySession(preparedMemorySessionId: string): void {
   sessions.delete(preparedMemorySessionId);
 }

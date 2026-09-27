@@ -438,6 +438,13 @@ function mintId(randomUuid: () => string, label: string): string {
   return id;
 }
 
+export async function withFacadeJournalLock<T>(
+  scope: RegistryOwnerScope,
+  task: () => Promise<T>,
+): Promise<T> {
+  return withOwnerJournalLock(scope, task);
+}
+
 async function withOwnerJournalLock<T>(scope: RegistryOwnerScope, task: () => Promise<T>): Promise<T> {
   assertOwnerScope(scope);
   await mkdirReal(ownerJournalDir(scope));
