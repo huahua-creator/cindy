@@ -32,6 +32,8 @@ export interface XdtSchemaValidator {
     registryMin: string;
     registry: string;
     registryTransaction: string;
+    /** xdt-memory origin/main 已有；本仓类型此前未投影。缺席时用字面 kind。 */
+    providerSettings?: string;
   };
   SETTINGS_UNCHANGED_SENTINEL: {
     generation: string;
@@ -47,7 +49,7 @@ function loadValidator(root: string): XdtSchemaValidator {
       SETTINGS_UNCHANGED_SENTINEL?: XdtSchemaValidator['SETTINGS_UNCHANGED_SENTINEL'];
     };
     const patterns = require(patternsPath) as {
-      KIND: XdtSchemaValidator['KIND'];
+      KIND: XdtSchemaValidator['KIND'] & { providerSettings?: string };
       SETTINGS_UNCHANGED_SENTINEL: XdtSchemaValidator['SETTINGS_UNCHANGED_SENTINEL'];
     };
     const sentinel = validator.SETTINGS_UNCHANGED_SENTINEL ?? patterns.SETTINGS_UNCHANGED_SENTINEL;

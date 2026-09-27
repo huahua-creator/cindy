@@ -28,8 +28,12 @@ const require = createRequire(import.meta.url);
 
 const REGISTRY_FILE = 'workspace-identity-registry-v1.json';
 const TRANSACTION_FILE = 'workspace-registry-transaction-v1.json';
+const SETTINGS_FILE = 'memory-provider-settings-v1.json';
+const BOOLEAN_MEMORY_SETTINGS_FILE = 'memory-settings.json';
 const LOCATOR_HASH_PREFIX = 'loc1:';
 const EMPTY_REGISTRY_GENERATION = 'reg-empty';
+const MISSING_SETTINGS_DIGEST = createHash('sha256').update('', 'utf8').digest('hex');
+const PROVIDER_SETTINGS_KIND = 'memory-provider-settings-v1';
 
 export type RegistryReadStatus = 'missing' | 'readable' | 'unreadable';
 
@@ -54,10 +58,23 @@ export interface AliasRecord {
   boundAt: string;
 }
 
-export interface WorkspaceRegistryTransactionV1 {
+export type MemoryProviderKind = 'internal' | 'xdt';
+
+export interface MemoryProviderSettingsV1 {
+  schemaVersion: 1;
+  defaultProvider: MemoryProviderKind;
+  workspaceOverrides: Record<string, MemoryProviderKind>;
+  xdt?: {
+    serverRegistrationId: string;
+    serverRegistrationGeneration: string;
+    serverRegistrationDigest: string;
+  };
+  configGeneration: string;
+}
+
+interface WorkspaceRegistryTransactionIdentityV1 {
   schemaVersion: 1;
   transactionId: string;
-  operationKind: 'registry_only';
   expectedRegistryGeneration: string;
   expectedProviderConfigGeneration: string;
   intendedRegistryGeneration: string;
@@ -66,7 +83,26 @@ export interface WorkspaceRegistryTransactionV1 {
   providerSettingsDigestBefore: string;
   registryDigestAfter: string;
   providerSettingsDigestAfter: string;
-  state: 'prepared' | 'registry_published' | 'committed';
+}
+
+export type WorkspaceRegistryTransactionV1 =
+  | (WorkspaceRegistryTransactionIdentityV1 & {
+      operationKind: 'settings_only';
+      state: 'prepared' | 'settings_published' | 'committed';
+    })
+  | (WorkspaceRegistryTransactionIdentityV1 & {
+      operationKind: 'registry_only';
+      state: 'prepared' | 'registry_published' | 'committed';
+    });
+
+export type ProviderSettingsReadStatus = RegistryReadStatus | 'invalid';
+
+export interface ProviderSettingsReadResult {
+  status: ProviderSettingsReadStatus;
+  settings?: MemoryProviderSettingsV1;
+  filePath: string;
+  utf8?: string;
+  effectiveProvider: MemoryProviderKind | undefined;
 }
 
 export interface RegistryOwnerScope {
@@ -136,6 +172,20 @@ function transactionPath(scope: RegistryOwnerScope): string {
   return path.join(scope.ownerRoot, TRANSACTION_FILE);
 }
 
+function settingsPath(scope: RegistryOwnerScope): string {
+  assertOwnerScope(scope);
+  return path.join(scope.ownerRoot, SETTINGS_FILE);
+}
+
+function booleanMemorySettingsPath(scope: RegistryOwnerScope): string {
+  assertOwnerScope(scope);
+  return path.join(scope.ownerRoot, BOOLEAN_MEMORY_SETTINGS_FILE);
+}
+
+function providerSettingsKind(): string {
+  return loadXdtSchemaValidator().KIND.providerSettings ?? PROVIDER_SETTINGS_KIND;
+}
+
 function emptyRegistry(): WorkspaceIdentityRegistryV1 {
   return {
     schemaVersion: 1,
@@ -149,9 +199,49 @@ function serializeRegistry(registry: WorkspaceIdentityRegistryV1): string {
   return `${JSON.stringify(registry)}\n`.replace(/\r/g, '');
 }
 
-function digestRegistryUtf8(utf8: string): string {
+function serializeSettings(settings: MemoryProviderSettingsV1): string {
+  return `${JSON.stringify(settings)}\n`.replace(/\r/g, '');
+}
+
+function serializeTransaction(txn: WorkspaceRegistryTransactionV1): string {
+  return `${JSON.stringify(txn)}\n`.replace(/\r/g, '');
+}
+
+function digestCanonicalUtf8(utf8: string): string {
   const body = utf8.endsWith('\n') ? utf8.slice(0, -1) : utf8;
   return loadCanonicalDigest()(body);
+}
+
+function digestRegistryUtf8(utf8: string): string {
+  return digestCanonicalUtf8(utf8);
+}
+
+function digestSettingsUtf8(utf8: string): string {
+  return digestCanonicalUtf8(utf8);
+}
+
+function emptyRegistryDigest(): string {
+  return digestRegistryUtf8(serializeRegistry(emptyRegistry()));
+}
+
+function missingSettingsDigest(): string {
+  return MISSING_SETTINGS_DIGEST;
+}
+
+function assertDigestNamespaces(): void {
+  const sentinel = settingsSentinel();
+  if (MISSING_SETTINGS_DIGEST === sentinel.digest) {
+    throw new XdtPrepareError(
+      'CONFIG_INVALID',
+      'missing settings digest must not equal SETTINGS_UNCHANGED_SENTINEL',
+    );
+  }
+  if (MISSING_SETTINGS_DIGEST === emptyRegistryDigest()) {
+    throw new XdtPrepareError(
+      'CONFIG_INVALID',
+      'missing settings digest must not equal empty registry digest',
+    );
+  }
 }
 
 function validateKind(kind: string, utf8: string, code: 'CONFIG_INVALID' = 'CONFIG_INVALID'): void {
@@ -188,7 +278,36 @@ export function assertMinKindRejectsWorkspaces(utf8: string): void {
 function parseTransactionUtf8(utf8: string): WorkspaceRegistryTransactionV1 {
   const validator = loadXdtSchemaValidator();
   validateKind(validator.KIND.registryTransaction, utf8);
-  return JSON.parse(utf8) as WorkspaceRegistryTransactionV1;
+  const txn = JSON.parse(utf8) as WorkspaceRegistryTransactionV1 | {
+    operationKind?: string;
+    state?: string;
+  };
+  if (txn.operationKind === 'registry_and_settings') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'registry_and_settings is not implemented');
+  }
+  if (txn.operationKind !== 'registry_only' && txn.operationKind !== 'settings_only') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+  }
+  if (txn.operationKind === 'registry_only') {
+    if (txn.state !== 'prepared' && txn.state !== 'registry_published' && txn.state !== 'committed') {
+      throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+    }
+  } else if (txn.state !== 'prepared' && txn.state !== 'settings_published' && txn.state !== 'committed') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+  }
+  return txn as WorkspaceRegistryTransactionV1;
+}
+
+function parseSettingsUtf8(utf8: string): MemoryProviderSettingsV1 {
+  validateKind(providerSettingsKind(), utf8);
+  const settings = JSON.parse(utf8) as MemoryProviderSettingsV1;
+  if (settings.defaultProvider === 'xdt' && !settings.xdt) {
+    throw new XdtPrepareError(
+      'CONFIG_INVALID',
+      'defaultProvider=xdt requires a server registration object',
+    );
+  }
+  return settings;
 }
 
 export function localLocatorDigest(absDir: string): { digest: string; normalized: string } {
@@ -257,6 +376,84 @@ function readTransaction(scope: RegistryOwnerScope): WorkspaceRegistryTransactio
   }
 }
 
+function readSettingsRaw(scope: RegistryOwnerScope): {
+  status: RegistryReadStatus;
+  utf8?: string;
+  filePath: string;
+} {
+  const filePath = settingsPath(scope);
+  const raw = readFileTriState(filePath);
+  if (raw.status === 'missing') return { status: 'missing', filePath };
+  if (raw.status === 'unreadable' || raw.utf8 === undefined) {
+    return { status: 'unreadable', filePath };
+  }
+  return { status: 'readable', utf8: raw.utf8, filePath };
+}
+
+function currentSettingsDigest(scope: RegistryOwnerScope): {
+  status: RegistryReadStatus;
+  digest: string;
+  utf8?: string;
+} {
+  const raw = readSettingsRaw(scope);
+  if (raw.status === 'missing') {
+    return { status: 'missing', digest: missingSettingsDigest() };
+  }
+  if (raw.status === 'unreadable' || raw.utf8 === undefined) {
+    throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings is unreadable');
+  }
+  parseSettingsUtf8(raw.utf8);
+  const digest = digestSettingsUtf8(raw.utf8);
+  if (digest === missingSettingsDigest()) {
+    throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings is invalid');
+  }
+  return { status: 'readable', digest, utf8: raw.utf8 };
+}
+
+function currentRegistrySnapshot(scope: RegistryOwnerScope): {
+  registry: WorkspaceIdentityRegistryV1;
+  utf8: string;
+  digest: string;
+} {
+  const read = readRegistry(scope);
+  if (read.status === 'unreadable') {
+    throw new XdtPrepareError('CONFIG_INVALID', 'workspace identity registry is unreadable');
+  }
+  const current =
+    read.status === 'missing'
+      ? { registry: emptyRegistry(), utf8: serializeRegistry(emptyRegistry()) }
+      : { registry: read.registry!, utf8: read.utf8! };
+  return { ...current, digest: digestRegistryUtf8(current.utf8) };
+}
+
+function assertUnchangedRegistrySide(
+  txn: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'settings_only' }>,
+  registryDigest: string,
+): void {
+  if (
+    txn.intendedRegistryGeneration !== txn.expectedRegistryGeneration
+    || txn.registryDigestAfter !== txn.registryDigestBefore
+  ) {
+    throw new XdtPrepareError('CONFIG_INVALID', 'settings_only must keep registry generation unchanged');
+  }
+  if (registryDigest !== txn.registryDigestBefore || registryDigest !== txn.registryDigestAfter) {
+    throw new XdtPrepareError('CONFIG_INVALID', 'settings_only unchanged registry digest drifted');
+  }
+}
+
+async function persistTransaction(scope: RegistryOwnerScope, txn: WorkspaceRegistryTransactionV1): Promise<void> {
+  const utf8 = serializeTransaction(txn);
+  validateKind(loadXdtSchemaValidator().KIND.registryTransaction, utf8);
+  await writeUtf8Atomic(transactionPath(scope), utf8);
+}
+
+type SettingsRecoverHook = (afterFillState: 'settings_published') => void | Promise<void>;
+let settingsRecoverHook: SettingsRecoverHook | undefined;
+
+function setSettingsRecoverHookForTest(hook: SettingsRecoverHook | undefined): void {
+  settingsRecoverHook = hook;
+}
+
 async function writeUtf8Atomic(filePath: string, utf8: string): Promise<void> {
   const tmp = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
@@ -277,12 +474,11 @@ function findActiveAlias(
   return undefined;
 }
 
-function recoverTransaction(
+async function recoverRegistryOnlyTransaction(
   scope: RegistryOwnerScope,
   current: { registry: WorkspaceIdentityRegistryV1; utf8: string },
-  txn: WorkspaceRegistryTransactionV1 | undefined,
-): { registry: WorkspaceIdentityRegistryV1; utf8: string } {
-  if (!txn) return current;
+  txn: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'registry_only' }>,
+): Promise<{ registry: WorkspaceIdentityRegistryV1; utf8: string }> {
   const sentinel = settingsSentinel();
   const currentDigest = digestRegistryUtf8(current.utf8);
   const settingsOk =
@@ -290,7 +486,7 @@ function recoverTransaction(
     && txn.intendedProviderConfigGeneration === sentinel.generation
     && txn.providerSettingsDigestBefore === sentinel.digest
     && txn.providerSettingsDigestAfter === sentinel.digest;
-  if (txn.operationKind !== 'registry_only' || !settingsOk) {
+  if (!settingsOk) {
     throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
   }
   if (txn.state === 'prepared' && currentDigest === txn.registryDigestBefore) {
@@ -298,14 +494,106 @@ function recoverTransaction(
     return current;
   }
   if (txn.state === 'registry_published' && currentDigest === txn.registryDigestAfter) {
-    const committed: WorkspaceRegistryTransactionV1 = { ...txn, state: 'committed' };
-    const utf8 = `${JSON.stringify(committed)}\n`.replace(/\r/g, '');
-    const validator = loadXdtSchemaValidator();
-    validateKind(validator.KIND.registryTransaction, utf8);
-    fs.writeFileSync(transactionPath(scope), utf8, 'utf8');
+    await persistTransaction(scope, { ...txn, state: 'committed' });
     return current;
   }
   if (txn.state === 'committed') return current;
+  throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+}
+
+async function recoverSettingsOnlyTransaction(
+  scope: RegistryOwnerScope,
+  txn: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'settings_only' }>,
+): Promise<void> {
+  assertDigestNamespaces();
+  const reread = () => {
+    const registry = currentRegistrySnapshot(scope);
+    const settings = currentSettingsDigest(scope);
+    assertUnchangedRegistrySide(txn, registry.digest);
+    return { registry, settings };
+  };
+
+  const fillCommitted = async (
+    currentTxn: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'settings_only' }>,
+  ) => {
+    const snapshot = reread();
+    if (
+      snapshot.settings.status !== 'readable'
+      || snapshot.settings.digest !== currentTxn.providerSettingsDigestAfter
+      || !snapshot.settings.utf8
+    ) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+    }
+    parseSettingsUtf8(snapshot.settings.utf8);
+    await persistTransaction(scope, { ...currentTxn, state: 'committed' });
+  };
+
+  if (txn.state === 'prepared') {
+    const snapshot = reread();
+    if (snapshot.settings.digest === txn.providerSettingsDigestBefore) {
+      if (txn.providerSettingsDigestBefore === missingSettingsDigest() && snapshot.settings.status !== 'missing') {
+        throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+      }
+      fs.rmSync(transactionPath(scope), { force: true });
+      return;
+    }
+    if (snapshot.settings.digest === txn.providerSettingsDigestAfter) {
+      if (snapshot.settings.status !== 'readable' || !snapshot.settings.utf8) {
+        throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+      }
+      parseSettingsUtf8(snapshot.settings.utf8);
+      await persistTransaction(scope, { ...txn, state: 'settings_published' });
+      await settingsRecoverHook?.('settings_published');
+      await fillCommitted({ ...txn, state: 'settings_published' });
+      return;
+    }
+    throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+  }
+
+  if (txn.state === 'settings_published') {
+    const snapshot = reread();
+    if (snapshot.settings.digest === txn.providerSettingsDigestAfter) {
+      if (snapshot.settings.status !== 'readable') {
+        throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+      }
+      await fillCommitted(txn);
+      return;
+    }
+    throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+  }
+
+  if (txn.state === 'committed') {
+    const snapshot = reread();
+    if (
+      snapshot.registry.registry.registryGeneration !== txn.intendedRegistryGeneration
+      || snapshot.settings.status !== 'readable'
+      || snapshot.settings.utf8 === undefined
+    ) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'committed settings_only generation pair mismatch');
+    }
+    const settings = parseSettingsUtf8(snapshot.settings.utf8);
+    if (settings.configGeneration !== txn.intendedProviderConfigGeneration) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'committed settings_only generation pair mismatch');
+    }
+    return;
+  }
+
+  throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
+}
+
+async function recoverTransaction(
+  scope: RegistryOwnerScope,
+  current: { registry: WorkspaceIdentityRegistryV1; utf8: string },
+  txn: WorkspaceRegistryTransactionV1 | undefined,
+): Promise<{ registry: WorkspaceIdentityRegistryV1; utf8: string }> {
+  if (!txn) return current;
+  if (txn.operationKind === 'registry_only') {
+    return recoverRegistryOnlyTransaction(scope, current, txn);
+  }
+  if (txn.operationKind === 'settings_only') {
+    await recoverSettingsOnlyTransaction(scope, txn);
+    return currentRegistrySnapshot(scope);
+  }
   throw new XdtPrepareError('CONFIG_INVALID', 'incomplete workspace registry transaction');
 }
 
@@ -321,21 +609,15 @@ async function withRegistryLock<T>(scope: RegistryOwnerScope, task: () => Promis
   });
 }
 
-function loadLockedRegistry(scope: RegistryOwnerScope): {
+async function loadLockedRegistry(scope: RegistryOwnerScope): Promise<{
   registry: WorkspaceIdentityRegistryV1;
   utf8: string;
-} {
-  const read = readRegistry(scope);
-  if (read.status === 'unreadable') {
-    throw new XdtPrepareError('CONFIG_INVALID', 'workspace identity registry is unreadable');
-  }
-  const current =
-    read.status === 'missing'
-      ? { registry: emptyRegistry(), utf8: serializeRegistry(emptyRegistry()) }
-      : { registry: read.registry!, utf8: read.utf8! };
+}> {
+  const current = currentRegistrySnapshot(scope);
   const txn = readTransaction(scope);
   return recoverTransaction(scope, current, txn);
 }
+
 
 export async function lookupLocalAlias(
   input: RegistryOwnerScope & { absDir: string },
@@ -343,7 +625,7 @@ export async function lookupLocalAlias(
   assertOwnerScope(input);
   const { digest } = localLocatorDigest(input.absDir);
   return withRegistryLock(input, async () => {
-    const current = loadLockedRegistry(input);
+    const current = await loadLockedRegistry(input);
     const alias = findActiveAlias(current.registry, digest);
     if (!alias) {
       throw new XdtPrepareError('MAKER_MEMORY_NOT_READY', 'local workspace alias is missing');
@@ -361,7 +643,7 @@ export async function createLocalAlias(
   }
   const { digest } = localLocatorDigest(input.absDir);
   return withRegistryLock(input, async () => {
-    const current = loadLockedRegistry(input);
+    const current = await loadLockedRegistry(input);
     const existing = findActiveAlias(current.registry, digest);
     if (existing) {
       return {
@@ -425,9 +707,14 @@ export async function createLocalAlias(
       providerSettingsDigestAfter: sentinel.digest,
       state: 'prepared',
     };
-    const writeTxn = async (state: WorkspaceRegistryTransactionV1['state']) => {
-      const body: WorkspaceRegistryTransactionV1 = { ...txnPrepared, state };
-      const utf8 = `${JSON.stringify(body)}\n`.replace(/\r/g, '');
+    const writeTxn = async (
+      state: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'registry_only' }>['state'],
+    ) => {
+      const body: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'registry_only' }> = {
+        ...txnPrepared,
+        state,
+      };
+      const utf8 = serializeTransaction(body);
       validateKind(validator.KIND.registryTransaction, utf8);
       await writeUtf8Atomic(transactionPath(input), utf8);
     };
@@ -439,12 +726,136 @@ export async function createLocalAlias(
   });
 }
 
+export function readMemoryProviderSettings(scope: RegistryOwnerScope): ProviderSettingsReadResult {
+  assertOwnerScope(scope);
+  const raw = readSettingsRaw(scope);
+  if (raw.status === 'missing') {
+    return {
+      status: 'missing',
+      filePath: raw.filePath,
+      effectiveProvider: 'internal',
+    };
+  }
+  if (raw.status === 'unreadable' || raw.utf8 === undefined) {
+    return { status: 'unreadable', filePath: raw.filePath, effectiveProvider: undefined };
+  }
+  try {
+    const settings = parseSettingsUtf8(raw.utf8);
+    return {
+      status: 'readable',
+      settings,
+      filePath: raw.filePath,
+      utf8: raw.utf8,
+      effectiveProvider: settings.defaultProvider,
+    };
+  } catch {
+    return { status: 'invalid', filePath: raw.filePath, utf8: raw.utf8, effectiveProvider: undefined };
+  }
+}
+
+export async function loadMemoryProviderSettings(
+  scope: RegistryOwnerScope,
+): Promise<ProviderSettingsReadResult> {
+  assertOwnerScope(scope);
+  const txnPresent = readFileTriState(transactionPath(scope)).status !== 'missing';
+  const settingsPresent = readFileTriState(settingsPath(scope)).status !== 'missing';
+  if (!txnPresent && !settingsPresent) {
+    return readMemoryProviderSettings(scope);
+  }
+  return withRegistryLock(scope, async () => {
+    await loadLockedRegistry(scope);
+    const read = readMemoryProviderSettings(scope);
+    if (read.status === 'unreadable' || read.status === 'invalid') {
+      throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings is invalid');
+    }
+    return read;
+  });
+}
+
+export async function publishMemoryProviderSettings(
+  scope: RegistryOwnerScope & { settings: MemoryProviderSettingsV1 },
+): Promise<MemoryProviderSettingsV1> {
+  assertOwnerScope(scope);
+  assertDigestNamespaces();
+  const nextUtf8 = serializeSettings(scope.settings);
+  parseSettingsUtf8(nextUtf8);
+  const afterDigest = digestSettingsUtf8(nextUtf8);
+
+  return withRegistryLock(scope, async () => {
+    await loadLockedRegistry(scope);
+    const registry = currentRegistrySnapshot(scope);
+    const before = currentSettingsDigest(scope);
+    if (before.status === 'readable' && before.utf8) {
+      const previous = parseSettingsUtf8(before.utf8);
+      if (previous.configGeneration === scope.settings.configGeneration) {
+        throw new XdtPrepareError('CONFIG_INVALID', 'settings_only must mint a new configGeneration');
+      }
+    }
+    if (afterDigest === before.digest) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'settings_only must change provider settings digest');
+    }
+
+    const txnPrepared: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'settings_only' }> = {
+      schemaVersion: 1,
+      transactionId: randomUUID(),
+      operationKind: 'settings_only',
+      expectedRegistryGeneration: registry.registry.registryGeneration,
+      expectedProviderConfigGeneration:
+        before.status === 'readable' && before.utf8
+          ? parseSettingsUtf8(before.utf8).configGeneration
+          : 'settings-unpublished',
+      intendedRegistryGeneration: registry.registry.registryGeneration,
+      intendedProviderConfigGeneration: scope.settings.configGeneration,
+      registryDigestBefore: registry.digest,
+      providerSettingsDigestBefore: before.digest,
+      registryDigestAfter: registry.digest,
+      providerSettingsDigestAfter: afterDigest,
+      state: 'prepared',
+    };
+
+    const writeTxn = async (
+      state: Extract<WorkspaceRegistryTransactionV1, { operationKind: 'settings_only' }>['state'],
+    ) => {
+      await persistTransaction(scope, { ...txnPrepared, state });
+    };
+
+    const rereadBoth = () => {
+      const liveRegistry = currentRegistrySnapshot(scope);
+      const liveSettings = currentSettingsDigest(scope);
+      assertUnchangedRegistrySide(txnPrepared, liveRegistry.digest);
+      return liveSettings;
+    };
+
+    await writeTxn('prepared');
+    rereadBoth();
+    await writeUtf8Atomic(settingsPath(scope), nextUtf8);
+    const afterPublish = rereadBoth();
+    if (afterPublish.status !== 'readable' || afterPublish.digest !== afterDigest) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'settings_only published digest drifted');
+    }
+    await writeTxn('settings_published');
+    await settingsRecoverHook?.('settings_published');
+    const afterFill = rereadBoth();
+    if (afterFill.status !== 'readable' || afterFill.digest !== afterDigest) {
+      throw new XdtPrepareError('CONFIG_INVALID', 'settings_only published digest drifted');
+    }
+    await writeTxn('committed');
+    return scope.settings;
+  });
+}
+
 export const __testOnly = {
   aliasKeyForDigest,
   emptyRegistry,
+  emptyRegistryDigest,
   localLocatorDigest,
+  missingSettingsDigest,
   registryPath,
+  settingsPath,
+  booleanMemorySettingsPath,
   settingsSentinel,
+  setSettingsRecoverHookForTest,
   transactionPath,
   LOCATOR_HASH_PREFIX,
+  SETTINGS_FILE,
 };
