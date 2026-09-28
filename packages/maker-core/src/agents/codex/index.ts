@@ -47,6 +47,10 @@ import {
   type TurnPermissionPolicy,
 } from '../base-agent.js';
 import { skillEntryPath, snapshotDisabledSkillLaunch, currentDisabledSkillLaunchPaths } from '../shared/skill-activation.js';
+import {
+  forgetCodexCindyMemoryWriteSlot,
+  rememberCodexCindyMemoryWriteSlot,
+} from '../../memory/codex-cindy-memory-write-slot.js';
 import type { AgentCredentialMode } from '../../interfaces/auth-adapter.js';
 import type {
   Capabilities,
@@ -9015,6 +9019,11 @@ export class CodexAgent extends BaseAgent {
         && completedActiveToolTurns.get(active.id) === turnId
       ) return;
       activeToolContexts.set(active.id, active.ctx);
+      rememberCodexCindyMemoryWriteSlot({
+        sessionId: sid,
+        sessionInstanceId: opts.sessionInstanceId,
+        item,
+      });
     }
 
     function completeActiveToolContext(item: unknown, turnId?: string | null): void {
@@ -9025,6 +9034,10 @@ export class CodexAgent extends BaseAgent {
       if (!itemId) return;
       activeToolContexts.delete(itemId);
       completedActiveToolTurns.set(itemId, turnId);
+      forgetCodexCindyMemoryWriteSlot({
+        sessionInstanceId: opts.sessionInstanceId,
+        itemId,
+      });
     }
 
     function activeDynamicToolUseId(params: DynamicToolCallParams): string | undefined {

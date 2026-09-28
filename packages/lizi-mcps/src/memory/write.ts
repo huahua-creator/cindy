@@ -19,7 +19,10 @@ import { z } from 'zod';
 import { isXdtWriteNotApplicable, withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolCallExtra, MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
-import type { WriteOptions } from '@cindy/maker-core';
+import {
+  peekCodexCindyMemoryWriteSlot,
+  type WriteOptions,
+} from '@cindy/maker-core';
 import { classifyMemoryLane } from './resolve-store.js';
 
 const FACADE_RESERVED_ARG_KEYS = new Set([
@@ -68,12 +71,12 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       const ctx = deps.getSessionContext?.();
       const lane = classifyMemoryLane(ctx);
       const mode = args.mode ?? 'create';
-      const claudeFacade =
-        ctx?.agentKind === 'claude-code'
+      const facadeEligible =
+        (ctx?.agentKind === 'claude-code' || ctx?.agentKind === 'codex')
         && (mode === 'create' || mode === 'update')
         && Boolean(deps.executeXdtFacadeWrite)
         && (lane === 'xdt' || lane === 'internal');
-      if (!claudeFacade) {
+      if (!facadeEligible) {
         if (lane === 'xdt') {
           return xdtWriteForbiddenResult();
         }
@@ -95,7 +98,12 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
           isError: true,
         };
       }
-      const callId = extra?.requestId;
+      const slot = ctx.agentKind === 'codex'
+        ? peekCodexCindyMemoryWriteSlot(ctx.sessionInstanceId)
+        : undefined;
+      const callId = ctx.agentKind === 'codex'
+        ? (slot && slot.sessionId === ctx.sessionId ? slot.itemId : undefined)
+        : extra?.requestId;
       if (!callId || !deps.executeXdtFacadeWrite) {
         return xdtWriteForbiddenResult();
       }

@@ -124,6 +124,13 @@ export {
 } from './memory/xdt-snapshot-token.js';
 export { createXdtFrozenSessionStore } from './memory/xdt-frozen-store.js';
 export {
+  rememberCodexCindyMemoryWriteSlot,
+  peekCodexCindyMemoryWriteSlot,
+  forgetCodexCindyMemoryWriteSlot,
+  resetCodexCindyMemoryWriteSlotsForTest,
+  type CodexCindyMemoryWriteSlot,
+} from './memory/codex-cindy-memory-write-slot.js';
+export {
   isolatedCodexStanzaPresent,
   readIsolatedCodexStanzaPresent,
   assertNoDuplicateWritableMemorySource,

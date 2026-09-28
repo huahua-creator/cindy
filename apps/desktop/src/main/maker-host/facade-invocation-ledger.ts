@@ -256,6 +256,31 @@ async function readLedgerFile(
   }
 }
 
+export async function listInvocationLedgersForTurn(
+  owner: RegistryOwnerScope,
+  identity: Pick<CallIdentity, 'threadId' | 'turnId'>,
+): Promise<FacadeInvocationLedgerV1[]> {
+  const root = invocationLedgerRoot(owner);
+  let names: string[];
+  try {
+    names = await fsp.readdir(root);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw err;
+  }
+  const rows: FacadeInvocationLedgerV1[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const digest = name.slice(0, -'.json'.length);
+    if (!HEX64_RE.test(digest)) continue;
+    const row = await readLedgerFile(owner, digest);
+    if (row && row.threadId === identity.threadId && row.turnId === identity.turnId) {
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
 export async function readInvocationLedger(
   owner: RegistryOwnerScope,
   identity: CallIdentity,

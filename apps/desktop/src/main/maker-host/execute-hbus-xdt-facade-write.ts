@@ -1,6 +1,6 @@
 /**
  * H-Bus cindy_memory.create/update → 1c facade upsert。
- * 本刀仅 Claude；Codex/Pi 继续红。缺 sessionId/sessionInstanceId/writeTarget 不 mint。
+ * Claude 与本地 Codex 可写；Pi / remote / 缺 session 身份仍红。
  */
 
 import type { PreparedMemorySession } from '@cindy/maker-core';
@@ -15,7 +15,11 @@ import {
 } from './memory-facade-codex-dynamic-tools.js';
 import { FacadeWriteError } from './facade-xdt-write.js';
 import { FacadeWriteTargetError } from './facade-write-target.js';
-import { FacadeInvocationLedgerError } from './facade-invocation-ledger.js';
+import {
+  FacadeInvocationLedgerError,
+  listInvocationLedgersForTurn,
+  readInvocationLedger,
+} from './facade-invocation-ledger.js';
 import { FacadeJournalError } from './facade-journal.js';
 import { FacadeSecretError } from './facade-capability-secret.js';
 import { resolveHostFacadeWriteTarget } from './resolve-host-facade-write-target.js';
@@ -86,20 +90,27 @@ export interface HbusXdtFacadeWriteDeps {
   randomUuid?: MemoryFacadeDynamicToolDeps['randomUuid'];
   ensurePrepared?: typeof ensurePreparedXdtForLiveSession;
   ensureDeps?: EnsurePreparedXdtForLiveSessionDeps;
-  loadSettings?: typeof loadMemoryProviderSettings;
+  loadSettings?: (owner: RegistryOwnerScope) => Promise<{
+    status: string;
+    settings?: { configGeneration?: string };
+  }>;
 }
 
 export async function executeHbusXdtFacadeWrite(
   input: ExecuteInput,
   deps: HbusXdtFacadeWriteDeps,
 ): Promise<ExecuteResult> {
-  if (input.sessionContext.agentKind !== 'claude-code') {
+  const agentKind = input.sessionContext.agentKind;
+  if (agentKind !== 'claude-code' && agentKind !== 'codex') {
     return forbidden();
   }
   const sessionId = input.sessionContext.sessionId;
   const sessionInstanceId = input.sessionContext.sessionInstanceId;
   if (!sessionId || !sessionInstanceId) {
     return forbidden();
+  }
+  if (input.sessionContext.remoteHostId) {
+    return notApplicable();
   }
   const owner = deps.getOwner();
   const preparedId = input.sessionContext.preparedMemorySessionId;
@@ -112,6 +123,9 @@ export async function executeHbusXdtFacadeWrite(
     committedGeneration = undefined;
   }
   if (!isCurrentProductionXdtPrepared({ prepared, committedConfigGeneration: committedGeneration })) {
+    if (agentKind !== 'claude-code') {
+      return notApplicable();
+    }
     const ensure = deps.ensurePrepared ?? ensurePreparedXdtForLiveSession;
     const ensured = await ensure(sessionId, deps.ensureDeps);
     if (ensured.status === 'failed') return forbidden();
@@ -131,6 +145,23 @@ export async function executeHbusXdtFacadeWrite(
   });
   if (!writeTarget) {
     return notApplicable();
+  }
+  if (agentKind === 'codex') {
+    const identity = {
+      threadId: sessionId,
+      turnId: sessionInstanceId,
+      callId: input.callId,
+    };
+    const existing = await readInvocationLedger(owner, identity);
+    if (!existing) {
+      const siblings = await listInvocationLedgersForTurn(owner, {
+        threadId: sessionId,
+        turnId: sessionInstanceId,
+      });
+      if (siblings.length > 0) {
+        return forbidden();
+      }
+    }
   }
   const facadeDeps: MemoryFacadeDynamicToolDeps = {
     getOwner: deps.getOwner,

@@ -3,7 +3,7 @@
  * 生产 UUID 夹具用 temp 树，不写 Roaming。
  */
 
-import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -13,7 +13,11 @@ import { resolveXdtMemoryRoot, type PreparedMemorySession } from '@cindy/maker-c
 
 import { executeHbusXdtFacadeWrite } from '../execute-hbus-xdt-facade-write.js';
 import { PRODUCTION_WRITE_WORKSPACE } from '../facade-write-target.js';
-import { FACADE_INVOCATION_LEDGER_DIR, readInvocationLedger } from '../facade-invocation-ledger.js';
+import {
+  FACADE_INVOCATION_LEDGER_DIR,
+  invocationLedgerRoot,
+  readInvocationLedger,
+} from '../facade-invocation-ledger.js';
 import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 
 const OWNER = 'owner-fixture-hbus';
@@ -221,13 +225,36 @@ describe('executeHbusXdtFacadeWrite', () => {
     expect(repoRoot.replaceAll('\\', '/')).not.toBe(resolveXdtMemoryRoot().replaceAll('\\', '/'));
   });
 
-  it('keeps Codex and missing request identity red without minting', async () => {
+  it('keeps Pi and remote Codex writes red without minting', async () => {
     const ownerRoot = await tempDir('cindy-hbus-codex-red-');
     const frozenWrite = vi.fn();
     const session = prepared(PRODUCTION_WRITE_WORKSPACE, frozenWrite);
-    const result = await executeHbusXdtFacadeWrite({
+    const deps = {
+      getOwner: () => ({ dataOwnerId: OWNER, ownerRoot }),
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedMemorySession: () => session,
+      resolveWriteRoots: () => ({ repoRoot: ownerRoot, dataRoot: ownerRoot }),
+      ensurePrepared: async () => {
+        throw new Error('must not thaw Pi or remote Codex');
+      },
+    };
+    const pi = await executeHbusXdtFacadeWrite({
       args: WRITE_ARGS,
-      callId: 'rpc-codex',
+      callId: 'item-pi',
+      sessionContext: {
+        agentKind: 'pi' as const,
+        workingDir: '/tmp/xdt-fixture-repo',
+        sessionId: SESSION_ID,
+        sessionInstanceId: SESSION_INSTANCE,
+        preparedMemorySessionId: PREPARED_SESSION,
+        memoryBinding: session.binding,
+      },
+    }, deps);
+    expect(parse(pi)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+
+    const remote = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'item-remote',
       sessionContext: {
         agentKind: 'codex' as const,
         workingDir: '/tmp/xdt-fixture-repo',
@@ -235,18 +262,122 @@ describe('executeHbusXdtFacadeWrite', () => {
         sessionInstanceId: SESSION_INSTANCE,
         preparedMemorySessionId: PREPARED_SESSION,
         memoryBinding: session.binding,
+        remoteHostId: 'remote-host',
       },
-    }, {
-      getOwner: () => ({ dataOwnerId: OWNER, ownerRoot }),
-      getCapabilitySecret: () => FIXTURE_SECRET,
-      getPreparedMemorySession: () => session,
-      resolveWriteRoots: () => ({ repoRoot: ownerRoot, dataRoot: ownerRoot }),
-      ensurePrepared: async () => ({ status: 'failed' as const, code: 'MAKER_MEMORY_NOT_READY' as const }),
-    });
-    expect(parse(result)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    }, deps);
+    expect(parse(remote)).toMatchObject({ ok: false, code: 'XDT_WRITE_NOT_APPLICABLE' });
+
+    const missingInstance = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'item-missing-instance',
+      sessionContext: {
+        agentKind: 'codex' as const,
+        workingDir: '/tmp/xdt-fixture-repo',
+        sessionId: SESSION_ID,
+        preparedMemorySessionId: PREPARED_SESSION,
+        memoryBinding: session.binding,
+      },
+    }, deps);
+    expect(parse(missingInstance)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
     await expect(stat(path.join(ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+    expect(frozenWrite).not.toHaveBeenCalled();
+  });
+
+  it('accepts local Codex item.id, replays the same id, and H4-rejects a second item.id before mint', async () => {
+    const ownerRoot = await tempDir('cindy-hbus-codex-h4-');
+    expect(ownerRoot.replaceAll('\\', '/')).not.toMatch(/AppData\/Roaming\/Cindy/i);
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER,
+      ownerRoot,
+      canonicalWorkspaceId: PRODUCTION_WRITE_WORKSPACE,
+      provider: 'xdt',
+    });
+    const repoRoot = await tempDir('cindy-hbus-codex-h4-repo-');
+    const dataRoot = path.join(repoRoot, 'data');
+    await mkdir(dataRoot, { recursive: true });
+    const frozenWrite = vi.fn();
+    const upsert = vi.fn(async (input: Record<string, unknown>) => ({
+      shared: true,
+      phase: 'shared',
+      operation_id: input.operation_id,
+      key: String(input.id),
+      revision: 'sha256:' + '1'.repeat(64),
+      push_verified: true,
+    }));
+    const session = prepared(PRODUCTION_WRITE_WORKSPACE, frozenWrite);
+    const owner = { dataOwnerId: OWNER, ownerRoot };
+    const ctx = {
+      agentKind: 'codex' as const,
+      workingDir: '/tmp/xdt-fixture-repo',
+      sessionId: SESSION_ID,
+      sessionInstanceId: SESSION_INSTANCE,
+      preparedMemorySessionId: PREPARED_SESSION,
+      memoryBinding: session.binding,
+    };
+    const deps = {
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedMemorySession: () => session,
+      resolveWriteRoots: () => ({ repoRoot, dataRoot }),
+      ensurePrepared: async () => {
+        throw new Error('Codex must not thaw live sessions');
+      },
+      loadSettings: async () => ({
+        status: 'readable' as const,
+        settings: { configGeneration: 'cfg-1' },
+      }),
+      createWriteStore: () => ({
+        async get() { return null; },
+        upsert,
+      }),
+    };
+
+    const first = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'item-codex-1',
+      mcpSessionId: 'mcp-session-a',
+      sessionContext: ctx,
+    }, deps);
+    expect(parse(first).ok).toBe(true);
+    const firstLedger = await readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: SESSION_INSTANCE,
+      callId: 'item-codex-1',
+    });
+    expect(firstLedger?.callId).toBe('item-codex-1');
+
+    const replay = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'item-codex-1',
+      mcpSessionId: 'mcp-session-b',
+      sessionContext: ctx,
+    }, deps);
+    expect(parse(replay).ok).toBe(true);
+    const replayLedger = await readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: SESSION_INSTANCE,
+      callId: 'item-codex-1',
+    });
+    expect(replayLedger?.invocationId).toBe(firstLedger?.invocationId);
+    const upsertsAfterReplay = upsert.mock.calls.length;
+
+    const second = await executeHbusXdtFacadeWrite({
+      args: WRITE_ARGS,
+      callId: 'item-codex-2',
+      mcpSessionId: 'mcp-session-a',
+      sessionContext: ctx,
+    }, deps);
+    expect(parse(second)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    await expect(readInvocationLedger(owner, {
+      threadId: SESSION_ID,
+      turnId: SESSION_INSTANCE,
+      callId: 'item-codex-2',
+    })).resolves.toBeUndefined();
+    const ledgerFiles = (await readdir(invocationLedgerRoot(owner))).filter((name) => name.endsWith('.json'));
+    expect(ledgerFiles).toHaveLength(1);
+    expect(upsert.mock.calls.length).toBe(upsertsAfterReplay);
     expect(frozenWrite).not.toHaveBeenCalled();
   });
 

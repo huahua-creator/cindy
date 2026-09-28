@@ -23,7 +23,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { runWithLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
 
-import { isXdtMemoryBinding, type Logger } from '@cindy/maker-core';
+import { isXdtMemoryBinding, peekCodexCindyMemoryWriteSlot, type Logger } from '@cindy/maker-core';
 import {
   createCodexMcpThreadContextStore,
   isSameCodexMcpSessionContext,
@@ -719,15 +719,19 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
       writeBlockedToolCallResponse(res, parsedBody, pluginId, blockedToolCall.reason);
       return;
     }
-    // Codex 本刀预期只读：JSON-RPC id 无法证明跨重试稳定，禁止为 xdt
-    // memory_write create/update 铸造 Host 随机 callId。internal lane 放行。
+    // Codex xdt create/update 仅在 Host 已登记 mcpToolCall.id slot 时放行。
+    // 无 slot 不得进 handleRequest，也不得用 JSON-RPC id 当 callId。
     if (
-      serverName === REMOTE_MEMORY_SERVER_NAME
+      activeContext
+      && serverName === REMOTE_MEMORY_SERVER_NAME
       && isXdtPreparedMemoryContext(activeContext)
       && hasCindyMemoryWriteCreateOrUpdate(parsedBody)
     ) {
-      writeXdtCodexWriteRejectedResponse(res, parsedBody);
-      return;
+      const slot = peekCodexCindyMemoryWriteSlot(activeContext.sessionInstanceId);
+      if (!slot || slot.sessionId !== activeContext.sessionId) {
+        writeXdtCodexWriteRejectedResponse(res, parsedBody);
+        return;
+      }
     }
     if (activeContext) {
       await runWithLiziMcpSessionContext(activeContext, () =>

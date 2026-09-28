@@ -13,6 +13,8 @@ import {
   EMPTY_MEMORY_INDEX,
   EMPTY_MEMORY_INDEX_DIGEST,
   prepareMemorySession,
+  rememberCodexCindyMemoryWriteSlot,
+  resetCodexCindyMemoryWriteSlotsForTest,
   type PreparedMemorySession,
   type XdtMemoryBindingV1,
 } from '@cindy/maker-core';
@@ -73,6 +75,7 @@ function markedMemory() {
 const temps: string[] = [];
 
 afterEach(async () => {
+  resetCodexCindyMemoryWriteSlotsForTest();
   await Promise.all(temps.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -343,6 +346,119 @@ describe('cindy_memory three lanes', () => {
         },
       },
       { requestId: 'rpc-pi' },
+    );
+    expect(parse(written as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
+    expect(frozenWrite).not.toHaveBeenCalled();
+  });
+
+  it('uses the Host Codex item.id slot as callId and ignores JSON-RPC requestId', async () => {
+    const prepared = await preparedSession();
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, facade: true }) }],
+    }));
+    const provider = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({ isEnabled: () => true, getStore: async () => ({}) }) as never,
+        getPreparedMemorySession: () => prepared,
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!provider) throw new Error('cindy_memory missing');
+    const ctx: LiziMcpSessionContext = {
+      agentKind: 'codex',
+      workingDir: '/tmp/xdt-fixture-repo',
+      vendorOptions: {},
+      sessionId: 'session-codex-slot',
+      sessionInstanceId: SESSION_INSTANCE,
+      memoryBinding: prepared.binding,
+      preparedMemorySessionId: PREPARED_ID,
+    };
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: 'session-codex-slot',
+      sessionInstanceId: SESSION_INSTANCE,
+      item: {
+        id: 'item-codex-1',
+        type: 'mcpToolCall',
+        server: 'cindy_memory',
+        tool: 'call_tool',
+        arguments: { name: 'memory_write', args: { mode: 'create' } },
+      },
+    });
+    const cfg = provider.toClaudeSdkConfig(ctx) as { instance: unknown };
+    const written = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'codex-slot',
+          title: 'yes',
+          description: 'callId from item.id',
+          body: 'ok',
+        },
+      },
+      { requestId: 'jsonrpc-must-not-win' },
+    );
+    expect(parse(written as never)).toMatchObject({ ok: true, facade: true });
+    expect(executeXdtFacadeWrite.mock.calls.at(0)?.at(0)).toMatchObject({
+      callId: 'item-codex-1',
+    });
+    const replay = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'codex-slot',
+          title: 'yes',
+          description: 'same item.id replay',
+          body: 'ok',
+        },
+      },
+      { requestId: 'jsonrpc-must-not-win-2' },
+    );
+    expect(parse(replay as never)).toMatchObject({ ok: true, facade: true });
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(2);
+    expect(executeXdtFacadeWrite.mock.calls.at(1)?.at(0)).toMatchObject({
+      callId: 'item-codex-1',
+    });
+  });
+
+  it('keeps Codex xdt writes red without a Host item.id slot even if requestId is present', async () => {
+    const prepared = await preparedSession();
+    const frozenWrite = vi.spyOn(prepared.sessionStore, 'write');
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, facade: true }) }],
+    }));
+    const provider = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({ isEnabled: () => true, getStore: async () => ({}) }) as never,
+        getPreparedMemorySession: () => prepared,
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!provider) throw new Error('cindy_memory missing');
+    const ctx: LiziMcpSessionContext = {
+      agentKind: 'codex',
+      workingDir: '/tmp/xdt-fixture-repo',
+      vendorOptions: {},
+      sessionId: 'session-codex-noslot',
+      sessionInstanceId: SESSION_INSTANCE,
+      memoryBinding: prepared.binding,
+      preparedMemorySessionId: PREPARED_ID,
+    };
+    const cfg = provider.toClaudeSdkConfig(ctx) as { instance: unknown };
+    const written = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'codex-noslot',
+          title: 'no',
+          description: 'missing slot must stay red',
+          body: 'nope',
+        },
+      },
+      { requestId: 'jsonrpc-1' },
     );
     expect(parse(written as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
     expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
