@@ -28,7 +28,7 @@ export interface MemoryToolResult {
 
 export interface MemoryToolCallExtra {
   requestId?: string;
-  /** MCP transport session id; used as H-Bus turn key so JSON-RPC ids cannot collide across Query rebuilds. */
+  /** MCP transport session id. H-Bus ledger turnId is Host sessionInstanceId, not this value. */
   mcpSessionId?: string;
 }
 

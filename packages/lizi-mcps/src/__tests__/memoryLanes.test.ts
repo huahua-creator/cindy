@@ -349,6 +349,71 @@ describe('cindy_memory three lanes', () => {
     expect(frozenWrite).not.toHaveBeenCalled();
   });
 
+  it('falls back to internal store only for XDT_WRITE_NOT_APPLICABLE on Claude internal lane', async () => {
+    const write = vi.fn(async () => ({ filename: 'project_internal.md' }));
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({ ok: false, code: 'XDT_WRITE_NOT_APPLICABLE' }),
+      }],
+      isError: true,
+    }));
+    const provider = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({
+          isEnabled: () => true,
+          getStore: async () => ({ write }),
+        }) as never,
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!provider) throw new Error('cindy_memory missing');
+    const cfg = provider.toClaudeSdkConfig({
+      agentKind: 'claude-code',
+      workingDir: '/claude-repo',
+      vendorOptions: {},
+    }) as { instance: unknown };
+    const written = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'internal-fallback',
+          title: 'yes',
+          description: 'not applicable falls back',
+          body: 'ok',
+        },
+      },
+      { requestId: 'rpc-internal' },
+    );
+    expect(parse(written as never)).toMatchObject({ ok: true });
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(1);
+
+    executeXdtFacadeWrite.mockResolvedValueOnce({
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify({ ok: false, code: 'MAKER_MEMORY_NOT_READY' }),
+      }],
+      isError: true,
+    });
+    const forbidden = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'internal-no-fallback',
+          title: 'no',
+          description: 'forbidden must not fall back',
+          body: 'nope',
+        },
+      },
+      { requestId: 'rpc-internal-2' },
+    );
+    expect(parse(forbidden as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
   it('returns MAKER_MEMORY_NOT_READY when xdt accessor is undefined', async () => {
     const getStore = vi.fn(async () => ({ list: async () => [] }));
     const provider = createLiziMcpProviders({

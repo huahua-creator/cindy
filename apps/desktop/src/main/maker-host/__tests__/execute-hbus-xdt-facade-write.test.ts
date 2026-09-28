@@ -119,11 +119,24 @@ describe('executeHbusXdtFacadeWrite', () => {
     const frozenWrite = vi.fn();
     const session = prepared(PRODUCTION_WRITE_WORKSPACE, frozenWrite);
     const owner = { dataOwnerId: OWNER, ownerRoot };
+    const ctx = {
+      agentKind: 'claude-code' as const,
+      workingDir: '/tmp/xdt-fixture-repo',
+      sessionId: SESSION_ID,
+      sessionInstanceId: SESSION_INSTANCE,
+      preparedMemorySessionId: PREPARED_SESSION,
+      memoryBinding: session.binding,
+    };
     const deps = {
       getOwner: () => owner,
       getCapabilitySecret: () => FIXTURE_SECRET,
       getPreparedMemorySession: () => session,
       resolveWriteRoots: () => ({ repoRoot, dataRoot }),
+      ensurePrepared: async () => ({ status: 'ready' as const, prepared: session, context: ctx }),
+      loadSettings: async () => ({
+        status: 'readable' as const,
+        settings: { configGeneration: 'cfg-1' },
+      }),
       createWriteStore: () => ({
         async get() { return null; },
         async upsert(input: Record<string, unknown>) {
@@ -137,14 +150,6 @@ describe('executeHbusXdtFacadeWrite', () => {
           };
         },
       }),
-    };
-    const ctx = {
-      agentKind: 'claude-code' as const,
-      workingDir: '/tmp/xdt-fixture-repo',
-      sessionId: SESSION_ID,
-      sessionInstanceId: SESSION_INSTANCE,
-      preparedMemorySessionId: PREPARED_SESSION,
-      memoryBinding: session.binding,
     };
     const first = await executeHbusXdtFacadeWrite({
       args: WRITE_ARGS,
@@ -236,6 +241,7 @@ describe('executeHbusXdtFacadeWrite', () => {
       getCapabilitySecret: () => FIXTURE_SECRET,
       getPreparedMemorySession: () => session,
       resolveWriteRoots: () => ({ repoRoot: ownerRoot, dataRoot: ownerRoot }),
+      ensurePrepared: async () => ({ status: 'failed' as const, code: 'MAKER_MEMORY_NOT_READY' as const }),
     });
     expect(parse(result)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
     await expect(stat(path.join(ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
@@ -265,6 +271,9 @@ describe('executeHbusXdtFacadeWrite', () => {
       getCapabilitySecret: () => FIXTURE_SECRET,
       getPreparedMemorySession: () => session,
       resolveWriteRoots: () => ({ repoRoot: ownerRoot, dataRoot: ownerRoot }),
+      ensurePrepared: async () => {
+        throw new Error('must not ensure before sessionInstanceId gate');
+      },
     });
     expect(parse(result)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
     await expect(stat(path.join(ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({

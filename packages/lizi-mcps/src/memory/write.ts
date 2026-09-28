@@ -16,7 +16,7 @@
 
 import { z } from 'zod';
 
-import { withStore, xdtWriteForbiddenResult } from './_shared.js';
+import { isXdtWriteNotApplicable, withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolCallExtra, MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
 import type { WriteOptions } from '@cindy/maker-core';
@@ -66,17 +66,20 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
     },
     handler: async (args, extra?: MemoryToolCallExtra) => {
       const ctx = deps.getSessionContext?.();
-      if (classifyMemoryLane(ctx) !== 'xdt') {
+      const lane = classifyMemoryLane(ctx);
+      const mode = args.mode ?? 'create';
+      const claudeFacade =
+        ctx?.agentKind === 'claude-code'
+        && (mode === 'create' || mode === 'update')
+        && Boolean(deps.executeXdtFacadeWrite)
+        && (lane === 'xdt' || lane === 'internal');
+      if (!claudeFacade) {
+        if (lane === 'xdt') {
+          return xdtWriteForbiddenResult();
+        }
         return withStore(deps, (store) => store.write(args as WriteOptions));
       }
       if (!ctx) {
-        return xdtWriteForbiddenResult();
-      }
-      const mode = args.mode ?? 'create';
-      if (mode !== 'create' && mode !== 'update') {
-        return xdtWriteForbiddenResult();
-      }
-      if (ctx.agentKind !== 'claude-code') {
         return xdtWriteForbiddenResult();
       }
       if (Object.keys(args).some((key) => FACADE_RESERVED_ARG_KEYS.has(key))) {
@@ -96,7 +99,7 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       if (!callId || !deps.executeXdtFacadeWrite) {
         return xdtWriteForbiddenResult();
       }
-      return deps.executeXdtFacadeWrite({
+      const facade = await deps.executeXdtFacadeWrite({
         args: {
           type: args.type,
           name: args.name,
@@ -109,6 +112,10 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
         mcpSessionId: extra?.mcpSessionId,
         sessionContext: ctx,
       });
+      if (lane === 'internal' && isXdtWriteNotApplicable(facade)) {
+        return withStore(deps, (store) => store.write(args as WriteOptions));
+      }
+      return facade;
     },
   });
 }

@@ -70,6 +70,11 @@ import {
 } from '../base-agent.js';
 import { preparePinnedClaudeSkillInvocation } from './pinned-skill-invocation.js';
 import { isBotMcpServerAllowed } from '../shared/bot-runtime-policy.js';
+import {
+  forgetLiveClaudeMcpContext,
+  getLiveClaudeMcpContext,
+  rememberLiveClaudeMcpContext,
+} from './live-mcp-context.js';
 import { SYSTEM_PROMPT_APPEND as MAKER_SYSTEM_PROMPT_APPEND } from './system-prompt-append.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
 import { isXdtMemoryBinding } from '../../memory/xdt-binding.js';
@@ -1650,7 +1655,9 @@ export class ClaudeCodeAgent extends BaseAgent {
         nonHarnessMcpServerNames = hostMcpServerNames;
         return undefined;
       }
-      const context: McpProviderContext = {
+      const sessionId = opts.sessionId;
+      const existing = sessionId ? getLiveClaudeMcpContext(sessionId) : undefined;
+      const context: McpProviderContext = existing ?? {
         agentKind: 'claude-code' as const,
         workingDir: opts.workingDir,
         ...((makerMemoryEnabled || opts.makerMemoryScopeKey) ? { memoryScopeKey } : {}),
@@ -1667,12 +1674,15 @@ export class ClaudeCodeAgent extends BaseAgent {
         // 工厂闭包绑定此值, 控制类工具 (如 start_team / create_worker) 用它把回调路由
         // 到对应 session 的业务函数。host 直接调 startSession 而没透 sessionId
         // 时此处为 undefined, 工具按"无 session 绑定"语义处理。
-        sessionId: opts.sessionId,
+        sessionId,
         mcpCallerKind: 'root',
         mcpCallerAttested: true,
         ...(opts.sessionInstanceId ? { sessionInstanceId: opts.sessionInstanceId } : {}),
-        getSessionContext: () => context,
       };
+      if (!existing) {
+        context.getSessionContext = () => context;
+        if (sessionId) rememberLiveClaudeMcpContext(sessionId, context);
+      }
       // null-prototype: server 名来自用户可控的自定义 MCP id, 而 id 正则允许下划线,
       // `__proto__` 是合法 id。用普通 `{}` 时 `out['__proto__'] = config` 命中的是原型
       // 访问器 —— 不产生自有属性(hasOwnProperty / Object.keys 都看不见, 去重与归属判定
@@ -6560,6 +6570,7 @@ export class ClaudeCodeAgent extends BaseAgent {
 
       async close() {
         if (closed) return;
+        if (opts.sessionId) forgetLiveClaudeMcpContext(opts.sessionId);
         // Closing/dead sessions settle through Session status (or their queued
         // terminal event), never through the successful task-stop path.
         resetClaudeGenerationTiming(runtimeState.generation);
@@ -6598,6 +6609,7 @@ export class ClaudeCodeAgent extends BaseAgent {
         ? {
             async detach() {
               if (closed) return;
+              if (opts.sessionId) forgetLiveClaudeMcpContext(opts.sessionId);
               resetClaudeGenerationTiming(runtimeState.generation);
               discardActiveContinuation('session_detached', true);
               clearUpstreamResponseIdle();

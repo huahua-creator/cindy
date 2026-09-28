@@ -41,7 +41,7 @@ import {
   rememberSessionWorkspaceIdentity,
   resetSessionWorkspaceIdentityForTest,
 } from '../session-workspace-identity.js';
-import { createLocalAlias } from '../workspace-identity-registry.js';
+import { createLocalAlias, loadMemoryProviderSettings } from '../workspace-identity-registry.js';
 import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 
 const HEX_B = 'b'.repeat(64);
@@ -850,14 +850,38 @@ describe('prepareReadonlyXdtSession', () => {
     await expect(rm(missingData, { recursive: false })).rejects.toThrow();
   });
 
-  it('no-ops when preparedMemorySession is already present', async () => {
-    const existing = { preparedMemorySessionId: PREPARED_FIXTURE_ID } as never;
-    rememberPreparedMemorySession({
+  it('no-ops when the current production prepared session is already present', async () => {
+    const ownerRoot = await tempDir('cindy-xdt-ro-owner-');
+    const absDir = await tempDir('cindy-xdt-ro-ws-');
+    await createLocalAlias({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      absDir,
+      confirmed: true,
+    });
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: OWNER_ID,
+      ownerRoot,
+      canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+      provider: 'xdt',
+    });
+    const settings = await loadMemoryProviderSettings({ dataOwnerId: OWNER_ID, ownerRoot });
+    rememberSessionWorkspaceIdentity('session-fixture-noop', {
+      canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+      locatorDigest: 'a'.repeat(64),
+    });
+    const existing = {
       preparedMemorySessionId: PREPARED_FIXTURE_ID,
-    } as never);
+      binding: {
+        provider: 'xdt',
+        canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+        configGeneration: settings.settings?.configGeneration,
+      },
+    } as never;
+    rememberPreparedMemorySession(existing);
     const opts: CreateSessionOptions = {
       agentKind: 'claude-code',
-      workingDir: '/tmp/fixture',
+      workingDir: absDir,
       model: 'claude-sonnet-4-5',
       preparedMemorySession: existing,
       sessionInstanceId: SESSION_INSTANCE,
@@ -867,9 +891,11 @@ describe('prepareReadonlyXdtSession', () => {
     await prepareReadonlyXdtSession('session-fixture-noop', opts, {
       getAgent: () => createAgent({ startSession: async () => createHandle('x'), setMemory }),
       getMakerMemory: () => managerStub().manager as never,
+      resolveOwner: () => ({ dataOwnerId: OWNER_ID, ownerRoot }),
       resolveIndexSource: () => {
-        throw new Error('fixture no-op must not index a production-shaped tree');
+        throw new Error('current production prepared must not re-index');
       },
+      userDataDir: () => ownerRoot,
     });
     expect(opts.preparedMemorySession).toBe(existing);
     expect(setMemory).not.toHaveBeenCalled();

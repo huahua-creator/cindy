@@ -40,6 +40,16 @@ export function xdtWriteForbiddenResult(): MemoryToolResult {
   );
 }
 
+export function isXdtWriteNotApplicable(result: MemoryToolResult): boolean {
+  try {
+    const text = result.content[0] && 'text' in result.content[0] ? result.content[0].text : '';
+    const parsed = JSON.parse(text) as { code?: unknown };
+    return parsed.code === 'XDT_WRITE_NOT_APPLICABLE';
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 拿当前 session 绑定 workdir 的 Store. manager 不可用 (没注入 / disabled) 时
  * 返 MAKER_MEMORY_NOT_READY 错误, 调用方按 plan 决定是否提示用户开 mode。

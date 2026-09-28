@@ -27,7 +27,8 @@ import {
   rememberSessionWorkspaceIdentity,
   resetSessionWorkspaceIdentityForTest,
 } from '../session-workspace-identity.js';
-import { createLocalAlias, readRegistry } from '../workspace-identity-registry.js';
+import { createLocalAlias, loadMemoryProviderSettings, readRegistry } from '../workspace-identity-registry.js';
+import { publishWorkspaceMemoryProviderOverride } from './publish-workspace-override.js';
 import { createIpcError } from '../../../shared/ipc-errors.js';
 
 const temps: string[] = [];
@@ -343,10 +344,18 @@ describe('attachSessionWorkspaceIdentity', () => {
     expect(getSessionWorkspaceIdentity('session-worktree')).toBeUndefined();
   });
 
-  it('no-ops when preparedMemorySession is already present', async () => {
+  it('no-ops when the current production prepared session is already present', async () => {
     const lookup = vi.fn();
+    const ownerRoot = await tempDir('cindy-xdt-attach-owner-');
+    await publishWorkspaceMemoryProviderOverride({
+      dataOwnerId: 'owner-fixture-1',
+      ownerRoot,
+      canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+      provider: 'xdt',
+    });
+    const settings = await loadMemoryProviderSettings({ dataOwnerId: 'owner-fixture-1', ownerRoot });
     rememberSessionWorkspaceIdentity('session-fixture', {
-      canonicalWorkspaceId: '11111111-1111-4111-8111-111111111111',
+      canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
       locatorDigest: 'a'.repeat(64),
     });
     await attachSessionWorkspaceIdentity(
@@ -355,13 +364,23 @@ describe('attachSessionWorkspaceIdentity', () => {
         agentKind: 'claude-code',
         workingDir: '/tmp/fixture',
         model: 'claude-sonnet-4-5',
-        preparedMemorySession: { preparedMemorySessionId: 'prep' } as never,
+        preparedMemorySession: {
+          preparedMemorySessionId: 'prep',
+          binding: {
+            provider: 'xdt',
+            canonicalWorkspaceId: 'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
+            configGeneration: settings.settings?.configGeneration,
+          },
+        } as never,
       },
-      { lookup },
+      {
+        lookup,
+        resolveOwner: () => ({ dataOwnerId: 'owner-fixture-1', ownerRoot }),
+      },
     );
     expect(lookup).not.toHaveBeenCalled();
     expect(getSessionWorkspaceIdentity('session-fixture')?.canonicalWorkspaceId).toBe(
-      '11111111-1111-4111-8111-111111111111',
+      'dc703d5e-1ce0-4543-be4d-014cfa3a1955',
     );
   });
 

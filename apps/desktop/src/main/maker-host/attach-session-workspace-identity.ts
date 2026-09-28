@@ -11,12 +11,17 @@ import type { CreateSessionOptions } from '@cindy/maker-core';
 import { XdtPrepareError } from '@cindy/maker-core';
 
 import { isIpcError } from '../../shared/ipc-errors.js';
+import { isCurrentProductionXdtPrepared } from './current-production-xdt-prepared.js';
+import {
+  forgetPreparedMemorySessionForSessionId,
+} from './prepared-memory-sessions.js';
 import {
   assertEligibleLocalProjectDir,
   resolveOwnerScopedRegistryRoot,
   type AssembledOwnerScope,
 } from './workspace-identity-assembler.js';
 import {
+  loadMemoryProviderSettings,
   lookupLocalAlias,
   readRegistry,
   type RegistryReadResult,
@@ -55,7 +60,25 @@ export async function attachSessionWorkspaceIdentity(
   overrides: Partial<AttachSessionWorkspaceIdentityDeps> = {},
 ): Promise<void> {
   const deps = { ...defaultDeps, ...overrides };
-  if (opts.preparedMemorySession) return;
+  const existing = opts.preparedMemorySession;
+  if (existing) {
+    let committedGeneration: string | undefined;
+    try {
+      const owner = deps.resolveOwner();
+      const settings = await loadMemoryProviderSettings(owner);
+      committedGeneration = settings.settings?.configGeneration;
+    } catch {
+      committedGeneration = undefined;
+    }
+    if (isCurrentProductionXdtPrepared({
+      prepared: existing,
+      committedConfigGeneration: committedGeneration,
+    })) {
+      return;
+    }
+    delete opts.preparedMemorySession;
+    forgetPreparedMemorySessionForSessionId(sessionId);
+  }
   deps.forget(sessionId);
   if (opts.remoteHostId) return;
   if (!opts.workingDir) return;

@@ -26,10 +26,12 @@ import {
 } from '@cindy/maker-core';
 
 import { getActiveAppSession } from '../appSessionState.js';
+import { isCurrentProductionXdtPrepared } from './current-production-xdt-prepared.js';
 import {
   bindPreparedMemorySessionToSessionId,
   forgetPreparedMemorySession,
   forgetPreparedMemorySessionForSessionId,
+  getPreparedMemorySessionForSessionId,
   prepareAndRememberMemorySession,
 } from './prepared-memory-sessions.js';
 import { getSessionWorkspaceIdentity } from './session-workspace-identity.js';
@@ -228,6 +230,35 @@ function rollbackPreparedOpts(opts: CreateSessionOptions, sessionId: string, pre
   if (preparedId) forgetPreparedMemorySession(preparedId);
 }
 
+export { isCurrentProductionXdtPrepared } from './current-production-xdt-prepared.js';
+
+async function forgetStalePreparedIfNeeded(
+  sessionId: string,
+  opts: CreateSessionOptions,
+  owner: RegistryOwnerScope,
+  loadSettings: typeof loadMemoryProviderSettings,
+): Promise<boolean> {
+  const existing = opts.preparedMemorySession ?? getPreparedMemorySessionForSessionId(sessionId);
+  if (!existing) return false;
+  let settings;
+  try {
+    settings = await loadSettings(owner);
+  } catch {
+    rollbackPreparedOpts(opts, sessionId, existing.preparedMemorySessionId);
+    return false;
+  }
+  if (isCurrentProductionXdtPrepared({
+    prepared: existing,
+    committedConfigGeneration: settings.settings?.configGeneration,
+  })) {
+    opts.preparedMemorySession = existing;
+    bindPreparedMemorySessionToSessionId(sessionId, existing.preparedMemorySessionId);
+    return true;
+  }
+  rollbackPreparedOpts(opts, sessionId, existing.preparedMemorySessionId);
+  return false;
+}
+
 function sessionMemoryWouldEnable(
   opts: CreateSessionOptions,
   manager: MakerMemoryManager | undefined,
@@ -243,7 +274,6 @@ export async function prepareReadonlyXdtSession(
   overrides: Partial<PrepareReadonlyXdtSessionDeps> = {},
 ): Promise<void> {
   const deps = { ...defaultDeps(), ...overrides };
-  if (opts.preparedMemorySession) return;
   if (opts.remoteHostId) return;
   if (opts.reviewMode) return;
   const forcedXdt = (opts as CreateSessionOptions & { memoryProviderRequested?: unknown })
@@ -295,6 +325,7 @@ export async function prepareReadonlyXdtSession(
   }
 
   const loadSettings = deps.loadCommittedSettings ?? loadMemoryProviderSettings;
+  if (await forgetStalePreparedIfNeeded(sessionId, opts, owner, loadSettings)) return;
   const settingsRead = await loadSettings(owner);
   if (settingsRead.status === 'unreadable' || settingsRead.status === 'invalid') {
     throw new XdtPrepareError('CONFIG_INVALID', 'memory provider settings is invalid');

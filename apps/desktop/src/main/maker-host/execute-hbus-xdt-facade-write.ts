@@ -19,6 +19,13 @@ import { FacadeInvocationLedgerError } from './facade-invocation-ledger.js';
 import { FacadeJournalError } from './facade-journal.js';
 import { FacadeSecretError } from './facade-capability-secret.js';
 import { resolveHostFacadeWriteTarget } from './resolve-host-facade-write-target.js';
+import {
+  ensurePreparedXdtForLiveSession,
+  XDT_WRITE_NOT_APPLICABLE,
+  type EnsurePreparedXdtForLiveSessionDeps,
+} from './ensure-prepared-xdt-for-live-session.js';
+import { isCurrentProductionXdtPrepared } from './current-production-xdt-prepared.js';
+import { loadMemoryProviderSettings } from './workspace-identity-registry.js';
 import type { RegistryOwnerScope } from './workspace-identity-registry.js';
 
 type ExecuteInput = Parameters<NonNullable<MemoryMcpDeps['executeXdtFacadeWrite']>>[0];
@@ -33,6 +40,10 @@ function jsonResult(payload: unknown, isError = false): ExecuteResult {
 
 function forbidden(): ExecuteResult {
   return jsonResult(XDT_WRITE_FORBIDDEN, true);
+}
+
+function notApplicable(): ExecuteResult {
+  return jsonResult(XDT_WRITE_NOT_APPLICABLE, true);
 }
 
 function errorResult(code: string, message: string): ExecuteResult {
@@ -73,6 +84,9 @@ export interface HbusXdtFacadeWriteDeps {
   createWriteStore?: MemoryFacadeDynamicToolDeps['createWriteStore'];
   now?: MemoryFacadeDynamicToolDeps['now'];
   randomUuid?: MemoryFacadeDynamicToolDeps['randomUuid'];
+  ensurePrepared?: typeof ensurePreparedXdtForLiveSession;
+  ensureDeps?: EnsurePreparedXdtForLiveSessionDeps;
+  loadSettings?: typeof loadMemoryProviderSettings;
 }
 
 export async function executeHbusXdtFacadeWrite(
@@ -87,12 +101,26 @@ export async function executeHbusXdtFacadeWrite(
   if (!sessionId || !sessionInstanceId) {
     return forbidden();
   }
-  const preparedId = input.sessionContext.preparedMemorySessionId;
-  const prepared = preparedId ? deps.getPreparedMemorySession(preparedId) : undefined;
-  if (!prepared) {
-    return forbidden();
-  }
   const owner = deps.getOwner();
+  const preparedId = input.sessionContext.preparedMemorySessionId;
+  let prepared = preparedId ? deps.getPreparedMemorySession(preparedId) : undefined;
+  const loadSettings = deps.loadSettings ?? loadMemoryProviderSettings;
+  let committedGeneration: string | undefined;
+  try {
+    committedGeneration = (await loadSettings(owner)).settings?.configGeneration;
+  } catch {
+    committedGeneration = undefined;
+  }
+  if (!isCurrentProductionXdtPrepared({ prepared, committedConfigGeneration: committedGeneration })) {
+    const ensure = deps.ensurePrepared ?? ensurePreparedXdtForLiveSession;
+    const ensured = await ensure(sessionId, deps.ensureDeps);
+    if (ensured.status === 'failed') return forbidden();
+    if (ensured.status === 'not_applicable') return notApplicable();
+    prepared = ensured.prepared;
+  }
+  if (!prepared) {
+    return notApplicable();
+  }
   const roots = deps.resolveWriteRoots();
   const writeTarget = await resolveHostFacadeWriteTarget({
     prepared,
@@ -102,7 +130,7 @@ export async function executeHbusXdtFacadeWrite(
     remoteHostId: input.sessionContext.remoteHostId,
   });
   if (!writeTarget) {
-    return forbidden();
+    return notApplicable();
   }
   const facadeDeps: MemoryFacadeDynamicToolDeps = {
     getOwner: deps.getOwner,
