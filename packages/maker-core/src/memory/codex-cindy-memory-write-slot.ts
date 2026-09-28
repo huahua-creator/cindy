@@ -11,6 +11,7 @@ export interface CodexCindyMemoryWriteSlot {
 }
 
 const slots = new Map<string, CodexCindyMemoryWriteSlot>();
+const occupied = new Set<string>();
 
 function isCindyMemoryWriteCreateOrUpdate(item: unknown): item is {
   id: string;
@@ -72,6 +73,31 @@ export function forgetCodexCindyMemoryWriteSlot(input: {
   if (slot?.itemId === itemId) slots.delete(key);
 }
 
+/**
+ * Host-owned occupancy for one HTTP cindy_memory create/update.
+ * Peek still returns the unique slot; a second HTTP while occupied must reject.
+ */
+export function tryAcquireCodexCindyMemoryWriteSlot(input: {
+  sessionId?: string;
+  sessionInstanceId?: string;
+}): CodexCindyMemoryWriteSlot | undefined {
+  const sessionId = input.sessionId?.trim();
+  const key = input.sessionInstanceId?.trim();
+  if (!sessionId || !key) return undefined;
+  const slot = slots.get(key);
+  if (!slot || slot.sessionId !== sessionId) return undefined;
+  if (occupied.has(key)) return undefined;
+  occupied.add(key);
+  return slot;
+}
+
+export function releaseCodexCindyMemoryWriteSlot(sessionInstanceId?: string): void {
+  const key = sessionInstanceId?.trim();
+  if (!key) return;
+  occupied.delete(key);
+}
+
 export function resetCodexCindyMemoryWriteSlotsForTest(): void {
   slots.clear();
+  occupied.clear();
 }

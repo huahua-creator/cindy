@@ -23,7 +23,12 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { runWithLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
 
-import { isXdtMemoryBinding, peekCodexCindyMemoryWriteSlot, type Logger } from '@cindy/maker-core';
+import {
+  isXdtMemoryBinding,
+  releaseCodexCindyMemoryWriteSlot,
+  tryAcquireCodexCindyMemoryWriteSlot,
+  type Logger,
+} from '@cindy/maker-core';
 import {
   createCodexMcpThreadContextStore,
   isSameCodexMcpSessionContext,
@@ -719,27 +724,38 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
       writeBlockedToolCallResponse(res, parsedBody, pluginId, blockedToolCall.reason);
       return;
     }
-    // Codex xdt create/update 仅在 Host 已登记 mcpToolCall.id slot 时放行。
-    // 无 slot 不得进 handleRequest，也不得用 JSON-RPC id 当 callId。
+    // Codex xdt create/update 仅在 Host 已登记且未占用的唯一 slot 时放行。
+    // 无 slot / 占用中不得进 handleRequest，也不得用 JSON-RPC id 当 callId。
+    let acquiredWriteSlot = false;
     if (
       activeContext
       && serverName === REMOTE_MEMORY_SERVER_NAME
       && isXdtPreparedMemoryContext(activeContext)
       && hasCindyMemoryWriteCreateOrUpdate(parsedBody)
     ) {
-      const slot = peekCodexCindyMemoryWriteSlot(activeContext.sessionInstanceId);
-      if (!slot || slot.sessionId !== activeContext.sessionId) {
+      const slot = tryAcquireCodexCindyMemoryWriteSlot({
+        sessionId: activeContext.sessionId,
+        sessionInstanceId: activeContext.sessionInstanceId,
+      });
+      if (!slot) {
         writeXdtCodexWriteRejectedResponse(res, parsedBody);
         return;
       }
+      acquiredWriteSlot = true;
     }
-    if (activeContext) {
-      await runWithLiziMcpSessionContext(activeContext, () =>
-        existing.transport.handleRequest(req, res, parsedBody),
-      );
-      return;
+    try {
+      if (activeContext) {
+        await runWithLiziMcpSessionContext(activeContext, () =>
+          existing.transport.handleRequest(req, res, parsedBody),
+        );
+        return;
+      }
+      await existing.transport.handleRequest(req, res, parsedBody);
+    } finally {
+      if (acquiredWriteSlot) {
+        releaseCodexCindyMemoryWriteSlot(activeContext?.sessionInstanceId);
+      }
     }
-    await existing.transport.handleRequest(req, res, parsedBody);
     return;
   }
 

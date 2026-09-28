@@ -249,6 +249,136 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
       result: { content: [{ text: expect.stringContaining('"slotted":true') }] },
     });
     expect(reached).toHaveBeenCalled();
+    const replay = await fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 100,
+        method: 'tools/call',
+        params: {
+          name: 'call_tool',
+          arguments: { name: 'memory_write', args: WRITE_ARGS },
+          _meta: { threadId: 'thread-xdt-slot' },
+        },
+      }),
+    });
+    expect(replay.status).toBe(200);
+    expect(await readRpcResponse(replay)).toMatchObject({
+      result: { content: [{ text: expect.stringContaining('"slotted":true') }] },
+    });
+    expect(reached).toHaveBeenCalledTimes(2);
+  });
+
+  it('Codex 占用中的第二路 create/update 在 handleRequest 前红', async () => {
+    const reached = vi.fn();
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SLOT_SESSION,
+      sessionInstanceId: SLOT_INSTANCE,
+      item: {
+        id: 'item-A',
+        type: 'mcpToolCall',
+        server: 'cindy_memory',
+        tool: 'call_tool',
+        arguments: { name: 'memory_write', args: { mode: 'create' } },
+      },
+    });
+    let releaseFirst: () => void = () => {};
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    bridge = await startCodexHttpBridge({
+      serverFactories: {
+        cindy_memory: () => {
+          const server = new McpServer({ name: 'cindy_memory', version: '1.0.0' });
+          server.tool(
+            'call_tool',
+            'spy',
+            {
+              name: z.string(),
+              args: z.record(z.string(), z.unknown()),
+            },
+            async (args) => {
+              reached(args);
+              await firstGate;
+              return { content: [{ type: 'text', text: JSON.stringify({ ok: true, slotted: true }) }] };
+            },
+          );
+          return server;
+        },
+      },
+      logger: noopLogger(),
+    });
+    const current = bridge;
+    current.registerThreadContext('thread-xdt-hold', {
+      agentKind: 'codex',
+      sessionId: SLOT_SESSION,
+      sessionInstanceId: SLOT_INSTANCE,
+      workingDir: '/tmp/xdt-fixture-repo',
+      memoryBinding: xdtBinding(),
+      preparedMemorySessionId: '44444444-4444-4444-8444-444444444444',
+    });
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${current.token}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+    const init = await fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'codex-occupy-test', version: '1' },
+        },
+      }),
+    });
+    headers['mcp-session-id'] = init.headers.get('mcp-session-id')!;
+    await init.text();
+    const first = fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'call_tool',
+          arguments: { name: 'memory_write', args: WRITE_ARGS },
+          _meta: { threadId: 'thread-xdt-hold' },
+        },
+      }),
+    });
+    await vi.waitFor(() => {
+      expect(reached).toHaveBeenCalledTimes(1);
+    });
+    const second = await fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'call_tool',
+          arguments: { name: 'memory_write', args: { ...WRITE_ARGS, name: 'second-call' } },
+          _meta: { threadId: 'thread-xdt-hold' },
+        },
+      }),
+    });
+    expect(second.status).toBe(200);
+    const payload = await readRpcResponse(second) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    expect(payload.result?.isError).toBe(true);
+    expect(payload.result?.content?.[0]?.text).toContain('MAKER_MEMORY_NOT_READY');
+    expect(reached).toHaveBeenCalledTimes(1);
+    releaseFirst();
+    expect((await first).status).toBe(200);
   });
 
   it('Codex 第二路不同 item.id 不得覆盖 in-flight slot，peek 绝不是 B', async () => {

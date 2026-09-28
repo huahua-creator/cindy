@@ -8,8 +8,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   forgetCodexCindyMemoryWriteSlot,
   peekCodexCindyMemoryWriteSlot,
+  releaseCodexCindyMemoryWriteSlot,
   rememberCodexCindyMemoryWriteSlot,
   resetCodexCindyMemoryWriteSlotsForTest,
+  tryAcquireCodexCindyMemoryWriteSlot,
 } from '../codex-cindy-memory-write-slot.js';
 
 const SESSION = 'session-slot';
@@ -108,5 +110,29 @@ describe('codex cindy_memory write slot', () => {
       item: writeItem('item-A'),
     });
     expect(peekCodexCindyMemoryWriteSlot(INSTANCE)?.itemId).toBe('item-A');
+  });
+
+  it('lets only one HTTP occupy the unique slot until release', () => {
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      item: writeItem('item-A'),
+    });
+    const first = tryAcquireCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+    });
+    expect(first?.itemId).toBe('item-A');
+    expect(peekCodexCindyMemoryWriteSlot(INSTANCE)?.itemId).toBe('item-A');
+    expect(tryAcquireCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+    })).toBeUndefined();
+    releaseCodexCindyMemoryWriteSlot(INSTANCE);
+    expect(tryAcquireCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+    })?.itemId).toBe('item-A');
+    releaseCodexCindyMemoryWriteSlot(INSTANCE);
   });
 });
