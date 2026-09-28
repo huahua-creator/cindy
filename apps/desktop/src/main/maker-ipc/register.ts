@@ -481,6 +481,7 @@ import { isBotCanonicalReplacementBusy } from './botCanonicalReplacementGuard.js
 import { configureBotCanonicalReplacementCoordinator } from './botCanonicalReplacementCoordinator.js';
 import { botSessionInputBlockReason } from './botSessionInputGuard.js';
 import { configureBotRuntimeEpochRefreshRequest } from './botRuntimeEpochRefreshSignal.js';
+import { createWorkspaceIdentityIpc } from './workspace-identity-ipc.js';
 import { createGitSnapshotCoordinator } from '../maker-host/git-snapshot-host.js';
 import {
   cancelCodexAuthModeChange,
@@ -1611,6 +1612,11 @@ const agentResourceSettingsIpc = createAgentResourceSettingsIpc({
   readState: readAgentResourceSettingsState,
   write: writeAgentResourceSetting,
   reset: resetAgentResourceSettings,
+});
+
+const workspaceIdentityIpc = createWorkspaceIdentityIpc({
+  assertTrustedSender: (event) =>
+    assertTrustedAppRendererEvent(event as Parameters<typeof assertTrustedAppRendererEvent>[0]),
 });
 
 function memorySettingsWire() {
@@ -7511,13 +7517,26 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         makerMemoryEnabled?: boolean;
       };
       mutableCreateOpts.remoteHostId = remoteHostIdToEnsure;
+      const laneCreateOpts = createOpts as {
+        makerMemoryEnabled?: boolean;
+        preparedMemorySession?: unknown;
+        memoryProviderRequested?: unknown;
+      };
+      const isXdtOrDisabledLane =
+        laneCreateOpts.makerMemoryEnabled === false
+        || Boolean(laneCreateOpts.preparedMemorySession)
+        || laneCreateOpts.memoryProviderRequested === 'xdt';
       // SSH remote 与本地同语义:Maker Memory 跟随控制端设置 (scope 由
       // maker-core 按 remoteHostId+workingDir 隔离)。调用方显式给的值优先
       // (renderer 已按全局设置填);main 侧发起、快照缺该字段的路径 (Orca
       // worker 派活 / scheduler / lazy-resume 等) 按全局开关补齐 — 这里
       // 不得再强制 false (review R1 P1:此前的强制覆盖让远端会话永远
       // 拿不到记忆注入)。
-      mutableCreateOpts.makerMemoryEnabled ??= maker.makerMemory?.isEnabled() ?? false;
+      // 第 2 / 第 3 路禁止 ??= isEnabled()：xdt fixture 与旧 Orca rehydrate
+      // 必须保持调用方显式值，不得被全局 manager 覆盖。
+      if (!isXdtOrDisabledLane) {
+        mutableCreateOpts.makerMemoryEnabled ??= maker.makerMemory?.isEnabled() ?? false;
+      }
       // stale-bridge 钳制 (见 activeBridgeMissingMemory):窗口内本会话统一
       // 按关闭注入 (prompt 与工具面同源), bridge 重建后新会话自然恢复。
       if (mutableCreateOpts.makerMemoryEnabled && activeBridgeMissingMemory()) {
@@ -18751,6 +18770,14 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     log.info('maker-memory:reset');
     return maker.makerMemory.resetAll();
   });
+
+  // 段 3：owner-scoped 本机一条 alias。不进 CREATE_SESSION，不挂早期 MEMORY_GET_SETTINGS。
+  ipcMain.handle(MAKER_INVOKE.WORKSPACE_IDENTITY_LOOKUP, async (event, body: unknown) =>
+    workspaceIdentityIpc.lookup(event, body),
+  );
+  ipcMain.handle(MAKER_INVOKE.WORKSPACE_IDENTITY_CREATE, async (event, body: unknown) =>
+    workspaceIdentityIpc.create(event, body),
+  );
 
   // 占位：MetaAgent 入口
   ipcMain.handle(MAKER_INVOKE.RUN, () => {

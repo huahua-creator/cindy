@@ -38,10 +38,19 @@ import {
   ClaudeCodeAgent,
   CodexAgent,
   configureDefaultImageResizer,
+  resolveXdtMemoryRoot,
   type AgentKind,
   type InteractionRequest,
   type McpProvider,
 } from '@cindy/maker-core';
+import {
+  forgetPreparedMemorySessionForSessionId,
+  getPreparedMemorySession,
+  getPreparedMemorySessionForSessionId,
+} from './prepared-memory-sessions.js';
+import { attachSessionWorkspaceIdentity } from './attach-session-workspace-identity.js';
+import { prepareReadonlyXdtSession } from './prepare-readonly-xdt-session.js';
+import { forgetSessionWorkspaceIdentity } from './session-workspace-identity.js';
 import type { ProviderView } from '@cindy/model-providers';
 import {
   getActiveCatalog,
@@ -249,6 +258,14 @@ import { invalidatePiEnvironment } from '../mcp-integrations/piEnvironment.js';
 import { getIOSSimulatorMcpDeps } from '../mcp-integrations/ios-simulator.js';
 import { readContactsSettings } from './contacts-settings-store.js';
 import { createIOSSimulatorCodexDynamicToolProvider } from './ios-simulator-codex-dynamic-tools.js';
+import { loadHostFacadeCapabilitySecret } from './facade-capability-secret.js';
+import {
+  composeCodexHostDynamicToolProviders,
+  createMemoryFacadeCodexDynamicToolProvider,
+} from './memory-facade-codex-dynamic-tools.js';
+import { createHbusXdtFacadeWrite } from './execute-hbus-xdt-facade-write.js';
+import { getElectronSecretIo } from '../secrets/providerSecretStore.js';
+import { resolveOwnerScopedRegistryRoot } from './workspace-identity-assembler.js';
 import { captureKnownFileBefore, noteOpaqueTurnChange } from '../turn-change-set/store.js';
 
 /**
@@ -924,6 +941,19 @@ export function getMaker(): Maker {
       },
       getAppVersion: () => app.getVersion(),
       getMakerMemoryManager: () => makerMemoryManager,
+      getPreparedMemorySession,
+      executeXdtFacadeWrite: createHbusXdtFacadeWrite({
+        getOwner: () => resolveOwnerScopedRegistryRoot(),
+        getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
+        getPreparedMemorySession,
+        resolveWriteRoots: () => {
+          const repoRoot = resolveXdtMemoryRoot();
+          return {
+            repoRoot,
+            dataRoot: process.env.XDT_MEMORY_HOME || path.join(repoRoot, 'data'),
+          };
+        },
+      }),
       lspPool: getLspPool(),
       pluginRegistry,
       resolveIOSSimulatorAccess,
@@ -1053,9 +1083,12 @@ export function getMaker(): Maker {
           id: params.sessionId,
           agentKind: params.agentKind,
           remoteHostId: params.remoteHostId,
+          // 第 3 路旧 Orca persist：显式 false，避免 ??= isEnabled() 把远端
+          // cindy_memory 注入当成开启，也避免 SSH preflight 把缺 binding 当 true。
+          makerMemoryEnabled: false,
         };
         await getRemoteSessionStartEnsure()?.({ createOpts });
-        return { makerMemoryEnabled: createOpts.makerMemoryEnabled === true };
+        return { makerMemoryEnabled: false };
       },
       orcaTeamStore: orcaTeamStoreAdapter,
       readLeadHistory: async ({ leadSessionId, fromMs, limit, cursor }) => {
@@ -1540,9 +1573,18 @@ export function getMaker(): Maker {
         });
       },
       makerMemory: makerMemoryManager,
-      codexHostDynamicToolProvider: createIOSSimulatorCodexDynamicToolProvider({
-        deps: getIOSSimulatorMcpDeps({ resolveAccess: resolveIOSSimulatorAccess }),
-      }),
+      codexHostDynamicToolProvider: composeCodexHostDynamicToolProviders([
+        createIOSSimulatorCodexDynamicToolProvider({
+          deps: getIOSSimulatorMcpDeps({ resolveAccess: resolveIOSSimulatorAccess }),
+        }),
+        createMemoryFacadeCodexDynamicToolProvider({
+          getOwner: () => resolveOwnerScopedRegistryRoot(),
+          getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
+          getPreparedBySessionId: getPreparedMemorySessionForSessionId,
+          advertiseTools: true,
+          getWriteTarget: () => undefined,
+        }),
+      ]),
       // 通讯录 prompt 段有效状态(codex 版): 在 claude 的判定链之上再与「实际应用
       // 到 running app-server 的 spawn 快照」对齐 —— 开关切换后失效失败(busy,
       // contacts-ipc 折成 codexMcpRefreshed:false)时 stale 桥里没有新工具面,
@@ -2628,7 +2670,21 @@ export function getMaker(): Maker {
           }
           // 所有创建路径共用的派发边界,opts.providerId 此刻已是本次启动的终值。
           freezeSessionProviderAtStart(sessionId, opts.providerId);
-          await preparePersistedOrcaSessionStart(sessionId, opts as MakerSessionCreateOpts);
+          await attachSessionWorkspaceIdentity(sessionId, opts);
+          await prepareReadonlyXdtSession(sessionId, opts, {
+            getAgent: (kind) => makerAgents[kind],
+            getMakerMemory: () => makerMemoryManager,
+            userDataDir: () => app.getPath('userData'),
+          });
+          try {
+            await preparePersistedOrcaSessionStart(sessionId, opts as MakerSessionCreateOpts);
+          } catch (err) {
+            // prepareStartOptions 抛错时 onClose 不会跑；段 5 remember 必须在本钩子内回滚。
+            forgetSessionWorkspaceIdentity(sessionId);
+            forgetPreparedMemorySessionForSessionId(sessionId);
+            delete opts.preparedMemorySession;
+            throw err;
+          }
           if (opts.agentKind === 'pi' && opts.thinkingEnabled === undefined) {
             const thinkingEnabled = getThinkingEnabledFromMemory(
               opts.agentKind,
@@ -2788,6 +2844,10 @@ export function getMaker(): Maker {
               desktopMakerLogger.warn('worktree runtime lease release postponed', { sessionId, code: (error as NodeJS.ErrnoException).code });
             });
           }
+          // 段 4 快照必须在 rehydrateCloseSuppression 之外 forget：resume 按当前
+          // workingDir 重新 lookup，不得从 sqlite 或被跳过的 close 副作用里恢复 UUID。
+          forgetSessionWorkspaceIdentity(sessionId);
+          forgetPreparedMemorySessionForSessionId(sessionId);
           // rehydrate close suppression 只跳过 worktree / temp file 这类重副作用;
           // registry 必须先清,后续 resume 会在首个 /responses 前重新登记,避免旧 thread prompt 驻留。
           unregisterCodexProxyPrompt(sessionId);

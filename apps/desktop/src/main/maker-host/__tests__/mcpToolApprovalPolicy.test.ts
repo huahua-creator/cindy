@@ -198,6 +198,15 @@ describe('desktop MCP approval policy', () => {
     expect(getDesktopMcpToolApprovalPolicy({ serverName: 'cindy_ssh' })).toBe('prompt');
     expect(getDesktopMcpToolApprovalPolicy({ serverName: 'cindy_future_tool' })).toBe('prompt');
     expect(getDesktopMcpToolApprovalPolicy({ serverName: 'third_party' })).toBe('prompt');
+    // 1b facade 入口不得整 server 进 TRUSTED_MCP_SERVERS；inner 仍禁写，默认 prompt。
+    expect(getDesktopMcpToolApprovalPolicy({
+      serverName: 'cindy_memory_facade',
+      toolName: 'call_tool',
+    })).toBe('prompt');
+    expect(getDesktopMcpToolApprovalPolicy({
+      serverName: 'cindy_memory_facade',
+      toolName: 'list_tools',
+    })).toBe('prompt');
   });
 
   it('prompts for simulator setup actions while device-gated actions stay trusted', () => {

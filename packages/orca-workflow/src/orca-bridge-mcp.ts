@@ -143,10 +143,9 @@ export interface OrcaBridgeMcpDeps {
     workingDir: string;
   }) => Promise<void | {
     /**
-     * 宿主 preflight 归一化后的 per-session Maker Memory 开关 (全局设置
-     * backfill + stale-bridge 钳制, 与 IPC create/send 路径同一套 mutate)。
-     * rehydrate 的 createSession 必须用它 — 缺省 (老宿主 / no-op) 按 false
-     * 保守处理, 不得在未归一化的情况下注入记忆 (review R6 P2)。
+     * 本刀旧 Orca persist 无完整 XdtMemoryBindingV1，rehydrate 一律显式
+     * makerMemoryEnabled:false。preflight 仍负责 SSH 重连 / agent install /
+     * 远端 MCP 注入，但其 makerMemoryEnabled 回传不得把缺 binding 当成 true。
      */
     makerMemoryEnabled?: boolean;
   }>;
@@ -541,21 +540,17 @@ async function ensureSessionFromMeta(
   // 远端 lead 重建前必须跑宿主 remote preflight (SSH 重连 / agent install /
   // 远端 MCP 注入):bridge 直调 core createSession 不经 maker-ipc, 跳过这步
   // 会让 app 重启后的首次 worker 回报 host-not-ready 或远端无协同 MCP。
-  let remoteMakerMemoryEnabled = false;
   if (meta.remoteHostId) {
-    const preflight = await deps.ensureRemoteSessionStart?.({
+    await deps.ensureRemoteSessionStart?.({
       sessionId: meta.sessionId,
       agentKind: meta.agentKind,
       remoteHostId: meta.remoteHostId,
       workingDir: meta.workingDir,
     });
-    // SSH remote 的 Maker Memory 与 IPC create/send 路径同语义:开关由
-    // preflight 归一化 (全局设置 backfill + stale-bridge 钳制) 后回传;
-    // 老宿主 / 未注入 preflight 时保守按 false — 不得在未归一化的情况下
-    // 注入 (review R6 P2:此前这里硬编码 false, 把远端 rehydrate 会话的
-    // 记忆永久关死, 与已放开的其余路径分叉)。
-    remoteMakerMemoryEnabled = preflight?.makerMemoryEnabled === true;
   }
+  // 第 3 路:旧 Orca persist 无完整 XdtMemoryBindingV1。本地与 SSH rehydrate
+  // 都必须显式 makerMemoryEnabled:false，禁止回落 runtimeConfig / settings
+  // 默认 maker=true，也禁止再走 ??= isEnabled() backfill。
   const session = await maker.createSession({
     id: meta.sessionId,
     agentKind: meta.agentKind,
@@ -568,12 +563,10 @@ async function ensureSessionFromMeta(
     permissionMode: meta.permissionMode,
     fastMode: meta.fastMode,
     title: meta.title,
+    makerMemoryEnabled: false,
     ...(vendorOptions ? { vendorOptions } : {}),
     ...(meta.sdkSessionId ? { resumeSessionId: meta.sdkSessionId } : {}),
-    // 远端 lead 在同一台 SSH 主机上重建; 本地 lead 无这两个字段。
-    ...(meta.remoteHostId
-      ? { remoteHostId: meta.remoteHostId, makerMemoryEnabled: remoteMakerMemoryEnabled }
-      : {}),
+    ...(meta.remoteHostId ? { remoteHostId: meta.remoteHostId } : {}),
   });
   deps.wireSession(session);
   return session;

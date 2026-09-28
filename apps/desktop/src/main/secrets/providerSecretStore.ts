@@ -25,6 +25,7 @@ import {
   GHOST_SECRET_HINT_PREFIX,
   PROVIDER_SECRET_IDS,
   PI_PROXY_DERIVATION_KEY_STORAGE_KEY,
+  FACADE_CAPABILITY_HMAC_STORAGE_KEY,
   REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY,
   type ProviderSecretId,
 } from '../../shared/providerSecrets.js';
@@ -287,6 +288,7 @@ export function createProviderSecretStore(
     // 旧账号远端 host 上仍在跑的 daemon env 里的 token 必须失效,防串号。
     io.remove(REMOTE_MCP_BRIDGE_TOKEN_STORAGE_KEY);
     io.remove(PI_PROXY_DERIVATION_KEY_STORAGE_KEY);
+    io.remove(FACADE_CAPABILITY_HMAC_STORAGE_KEY);
     // 动态键名密钥同清(按前缀扫 io.list()):自定义 MCP bearer token(mcp_token_<id>)、
     // 自定义供应商 per-runtime key(provider_key_*)、通用 OAuth 凭证 blob(provider_oauth_*)、
     // 意识 network 槽凭证(ghost_secret_*)。这些不在 PROVIDER_SECRET_IDS 静态集合里,
@@ -620,6 +622,10 @@ export function writePiProxyDerivationKey(value: string): boolean {
     );
     return false;
   }
+}
+
+export function getElectronSecretIo(): SecretStorageIo {
+  return electronSecretIo;
 }
 
 /** 删除某自定义供应商 runtime 的 API key；不存在视为成功。 */

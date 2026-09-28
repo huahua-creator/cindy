@@ -6263,6 +6263,17 @@ interface ElectronAPI {
       /** true = Codex 正忙, 存活会话的软重启在任务结束后自动补做 (设置已生效) */
       codexRestartDeferred: boolean;
     }>;
+    workspaceIdentityLookup: (payload: { absDir: string }) => Promise<{
+      status: 'missing' | 'bound';
+      canonicalWorkspaceId?: string;
+      locatorDigest?: string;
+    }>;
+    workspaceIdentityCreate: (payload: { absDir: string; confirmed: true }) => Promise<{
+      status: 'bound';
+      canonicalWorkspaceId: string;
+      locatorDigest: string;
+      created: boolean;
+    }>;
 
     /** IM 新会话默认 agent/model/effort/provider。传 channel 时按渠道独立读写。 */
     imDefaultSettingsGet: (channel?: ImDefaultSettingsChannel) => Promise<ImDefaultSettingsState>;

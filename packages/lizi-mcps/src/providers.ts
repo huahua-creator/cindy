@@ -31,6 +31,7 @@ import { createBrowserMcpServer } from './browser/index.js';
 import { createComputerMcpServer } from './computer/index.js';
 import { createAndroidMcpServer } from './android/index.js';
 import { createIOSSimulatorMcpServer } from './ios-simulator/index.js';
+import { isXdtMemoryBinding } from '@cindy/maker-core';
 import { resolveLiziMcpSessionContext } from './session-context.js';
 
 export interface CreateLiziMcpProvidersOptions {
@@ -454,13 +455,25 @@ export function createLiziMcpProviders(
       // Codex 端: 第一次 host spawn 时 prepareCodexExtraSpawnConfig 调本函数, host
       //   长生命周期下后续 disable 不影响已 spawn 的 host (老 thread 仍看到 server,
       //   但 withStore 会用 MAKER_MEMORY_NOT_READY 兜底)。
-      isEnabled: (ctx) =>
-        ctx.memoryScopeKey?.startsWith('bot:') === true
-        // Shared Codex/Pi bridges are assembled before a concrete Session
-        // exists. Keep the factory structurally present there; each Session
-        // descriptor still removes it when neither global nor Bot Memory applies.
-        || ((ctx.agentKind === 'codex' || ctx.agentKind === 'pi') && !ctx.workingDir)
-        || opts.memory!.getManager().isEnabled(),
+      isEnabled: (ctx) => {
+        const runtime = resolveLiziMcpSessionContext(ctx);
+        if (runtime.memoryBinding && isXdtMemoryBinding(runtime.memoryBinding)) {
+          return runtime.memoryBinding.enabled === true;
+        }
+        if (
+          runtime.preparedMemorySessionId
+          || runtime.memoryBinding
+          || runtime.memoryProviderRequested === 'xdt'
+        ) {
+          return false;
+        }
+        return ctx.memoryScopeKey?.startsWith('bot:') === true
+          // Shared Codex/Pi bridges are assembled before a concrete Session
+          // exists. Keep the factory structurally present there; each Session
+          // descriptor still removes it when neither global nor Bot Memory applies.
+          || ((ctx.agentKind === 'codex' || ctx.agentKind === 'pi') && !ctx.workingDir)
+          || opts.memory!.getManager().isEnabled();
+      },
       toClaudeSdkConfig: (ctx) => ({
         type: 'sdk',
         name: 'cindy_memory',
@@ -468,6 +481,12 @@ export function createLiziMcpProviders(
           getManager: opts.memory!.getManager,
           workdir: ctx.workingDir,
           getSessionContext: () => resolveLiziMcpSessionContext(ctx),
+          ...(opts.memory!.getPreparedMemorySession
+            ? { getPreparedMemorySession: opts.memory!.getPreparedMemorySession }
+            : {}),
+          ...(opts.memory!.executeXdtFacadeWrite
+            ? { executeXdtFacadeWrite: opts.memory!.executeXdtFacadeWrite }
+            : {}),
           ...(opts.memory!.searchSessions ? { searchSessions: opts.memory!.searchSessions } : {}),
           ...(opts.memory!.logger ? { logger: opts.memory!.logger } : {}),
         }),

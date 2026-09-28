@@ -7,9 +7,10 @@
 
 import { z } from 'zod';
 
-import { withStore } from './_shared.js';
+import { withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
+import { classifyMemoryLane } from './resolve-store.js';
 
 export function registerMemoryDeleteTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -21,10 +22,14 @@ export function registerMemoryDeleteTool(registry: MemoryToolRegistry, deps: Mem
     inputShape: {
       filename: z.string().min(1).describe('memory 分片文件名'),
     },
-    handler: async ({ filename }) =>
-      withStore(deps, async (store) => {
+    handler: async ({ filename }) => {
+      if (classifyMemoryLane(deps.getSessionContext?.()) === 'xdt') {
+        return xdtWriteForbiddenResult();
+      }
+      return withStore(deps, async (store) => {
         await store.delete(filename);
         return { deleted: filename };
-      }),
+      });
+    },
   });
 }

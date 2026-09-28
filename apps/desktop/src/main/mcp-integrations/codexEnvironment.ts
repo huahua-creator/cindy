@@ -277,6 +277,10 @@ async function doStart(
         ...(active.sessionInstanceId
           ? { sessionInstanceId: active.sessionInstanceId }
           : {}),
+        ...(active.memoryBinding ? { memoryBinding: active.memoryBinding } : {}),
+        ...(active.preparedMemorySessionId
+          ? { preparedMemorySessionId: active.preparedMemorySessionId }
+          : {}),
         getSessionContext: ctx.getSessionContext,
       };
     },

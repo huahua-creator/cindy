@@ -47,6 +47,10 @@ import {
   type TurnPermissionPolicy,
 } from '../base-agent.js';
 import { skillEntryPath, snapshotDisabledSkillLaunch, currentDisabledSkillLaunchPaths } from '../shared/skill-activation.js';
+import {
+  forgetCodexCindyMemoryWriteSlot,
+  rememberCodexCindyMemoryWriteSlot,
+} from '../../memory/codex-cindy-memory-write-slot.js';
 import type { AgentCredentialMode } from '../../interfaces/auth-adapter.js';
 import type {
   Capabilities,
@@ -207,6 +211,7 @@ import { CodexInteractionBroker } from './interaction-broker.js';
 import { SYSTEM_PROMPT_APPEND as MAKER_CODEX_SYSTEM_PROMPT_APPEND } from './system-prompt-append.js';
 import { nativeAutoReviewContinuationConfig } from './native-auto-review-policy.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
+import { isXdtMemoryBinding } from '../../memory/xdt-binding.js';
 import {
   CONTACTS_RULES_DISABLED,
   CONTACTS_RULES_ENABLED,
@@ -3575,11 +3580,14 @@ assertRouteCurrent();
     let makerMemoryIndex = '';
     let memoryFlushController: MemoryFlushController | null = null;
     // opts.makerMemoryEnabled 优先 (per-session, renderer 透传); fallback 到 runtimeConfig。
+    const preparedMemory = opts.preparedMemorySession;
     const makerMemoryFlag = reviewMode
       ? false
-      : opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false;
+      : preparedMemory
+        ? true
+        : opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false;
     const makerMemory = this.deps.makerMemory;
-    const makerMemoryEnabled = makerMemoryFlag === true && !!makerMemory;
+    const makerMemoryEnabled = makerMemoryFlag === true && (!!makerMemory || !!preparedMemory);
     // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key;
     // 本地会话额外做 git worktree 归一化 (#2379)。已注入的 makerMemoryScopeKey
     // (含 bot:) 原样透传。Maker Memory 关闭时跳过 git 探测 (Codex #2399 P1):
@@ -3588,13 +3596,23 @@ assertRouteCurrent();
       ? (opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)))
       : (opts.makerMemoryScopeKey ?? opts.workingDir);
     // This per-session injection flag must not mutate the shared manager.
-    if (makerMemoryEnabled && makerMemory) {
+    if (makerMemoryEnabled) {
       try {
-        const store = await makerMemory.getStore(memoryScopeKey);
-        makerMemoryRules = opts.makerMemoryScopeKey?.startsWith('bot:')
-          ? ''
-          : MAKER_MEMORY_RULES;
-        makerMemoryIndex = opts.makerMemoryIndexSnapshot ?? await store.getIndex();
+        if (preparedMemory) {
+          if (!isXdtMemoryBinding(preparedMemory.binding)) {
+            throw new Error('PreparedMemorySession.binding must be XdtMemoryBindingV1');
+          }
+          makerMemoryRules = MAKER_MEMORY_RULES;
+          makerMemoryIndex = preparedMemory.indexSnapshot.content;
+        } else if (makerMemory) {
+          const store = await makerMemory.getStore(memoryScopeKey);
+          makerMemoryRules = opts.makerMemoryScopeKey?.startsWith('bot:')
+            ? ''
+            : MAKER_MEMORY_RULES;
+          makerMemoryIndex = opts.makerMemoryIndexSnapshot ?? await store.getIndex();
+        } else {
+          throw new Error('maker memory enabled without manager or prepared session');
+        }
         memoryFlushController = new MemoryFlushController({
           logger: log.child('memory-flush'),
           workdir: memoryScopeKey,
@@ -3605,6 +3623,7 @@ assertRouteCurrent();
           indexBytes: makerMemoryIndex.length,
         });
       } catch (e) {
+        if (preparedMemory) throw e;
         log.warn('maker memory load failed at session start (skipping injection)', {
           error: String(e),
         });
@@ -5693,6 +5712,12 @@ assertRouteCurrent();
           // remote thread ctx: scope key 语义见 buildMemoryScopeKey。
           ...(opts.remoteHostId ? { remoteHostId: opts.remoteHostId } : {}),
           vendorOptions: vo,
+          ...(preparedMemory
+            ? {
+                memoryBinding: preparedMemory.binding,
+                preparedMemorySessionId: preparedMemory.preparedMemorySessionId,
+              }
+            : {}),
         });
         log.debug('codex MCP thread context registered', {
           threadId: prefixId(threadId),
@@ -9315,6 +9340,11 @@ assertRouteCurrent();
         && completedActiveToolTurns.get(active.id) === turnId
       ) return;
       activeToolContexts.set(active.id, active.ctx);
+      rememberCodexCindyMemoryWriteSlot({
+        sessionId: sid,
+        sessionInstanceId: opts.sessionInstanceId,
+        item,
+      });
     }
 
     function completeActiveToolContext(item: unknown, turnId?: string | null): void {
@@ -9325,6 +9355,10 @@ assertRouteCurrent();
       if (!itemId) return;
       activeToolContexts.delete(itemId);
       completedActiveToolTurns.set(itemId, turnId);
+      forgetCodexCindyMemoryWriteSlot({
+        sessionInstanceId: opts.sessionInstanceId,
+        itemId,
+      });
     }
 
     function activeDynamicToolUseId(params: DynamicToolCallParams): string | undefined {

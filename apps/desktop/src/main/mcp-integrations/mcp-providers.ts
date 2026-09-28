@@ -22,7 +22,7 @@ import {
 } from '@cindy/mcps';
 import type { OrcaMcpDeps } from '@cindy/mcps';
 import { createCindyGhostsMcpServer } from 'cindy-tools';
-import type { MakerMemoryManager } from '@cindy/maker-core';
+import type { MakerMemoryManager, PreparedMemorySession } from '@cindy/maker-core';
 import {
   authorizeDesktopSessionPath,
   getCindyGhostsMcpDeps,
@@ -101,6 +101,8 @@ export interface DesktopMcpProvidersDeps {
   /** 当前 Desktop 版本，供 Forge 为具体插件包生成默认 minCindyVersion。 */
   getAppVersion?: () => string;
   getMakerMemoryManager: () => MakerMemoryManager;
+  getPreparedMemorySession?: (preparedMemorySessionId: string) => PreparedMemorySession | undefined;
+  executeXdtFacadeWrite?: import('@cindy/mcps').MemoryMcpDeps['executeXdtFacadeWrite'];
   lspPool: LspServerPool;
   /** 按会话控制启用状态的 plugin registry。 */
   pluginRegistry: PluginRegistry;
@@ -350,6 +352,12 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
     },
     memory: {
       getManager: deps.getMakerMemoryManager,
+      ...(deps.getPreparedMemorySession
+        ? { getPreparedMemorySession: deps.getPreparedMemorySession }
+        : {}),
+      ...(deps.executeXdtFacadeWrite
+        ? { executeXdtFacadeWrite: deps.executeXdtFacadeWrite }
+        : {}),
       searchSessions: searchSessionsFn,
       logger: createLogger('mcp/cindy_memory'),
     },
@@ -886,6 +894,8 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         const deferOrdinaryGate =
           (ctx.agentKind === 'codex' || ctx.agentKind === 'pi')
           && !ctx.workingDir
+          && !ctx.memoryBinding
+          && !ctx.preparedMemorySessionId
           && !GLOBAL_PLUGIN_IDS.has(pluginId);
         // Orca 工具面必须在会话生命周期内保持稳定：Claude query 不会在项目策略
         // 动态启用后重建 MCP。创建入口仍由 Main 按调用时的项目策略 fail closed。

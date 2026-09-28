@@ -6879,6 +6879,22 @@ contextBridge.exposeInMainWorld('electronAPI', {
       codexRestartDeferred: boolean;
     }> => ipcRenderer.invoke('maker:memory:reset-settings'),
 
+    workspaceIdentityLookup: (
+      payload: { absDir: string },
+    ): Promise<{
+      status: 'missing' | 'bound';
+      canonicalWorkspaceId?: string;
+      locatorDigest?: string;
+    }> => ipcRenderer.invoke('maker:workspace-identity:lookup', payload),
+    workspaceIdentityCreate: (
+      payload: { absDir: string; confirmed: true },
+    ): Promise<{
+      status: 'bound';
+      canonicalWorkspaceId: string;
+      locatorDigest: string;
+      created: boolean;
+    }> => ipcRenderer.invoke('maker:workspace-identity:create', payload),
+
     /** IM 新会话默认 agent/model/effort/provider。传 channel 时按渠道独立读写。 */
     imDefaultSettingsGet: (channel?: ImDefaultSettingsChannel): Promise<ImDefaultSettingsState> =>
       ipcRenderer.invoke('maker:im-default-settings:get', channel),

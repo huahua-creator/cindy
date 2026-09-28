@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { backup, DatabaseSync } from 'node:sqlite';
+import * as sqlite from 'node:sqlite';
 
 import {
   MANAGED_CDP_PORT,
@@ -376,13 +376,13 @@ function publishStagedSnapshot(options: {
 async function copySqliteDatabase(src: string, dest: string, optional: boolean): Promise<void> {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   removeSqliteAndSidecars(dest);
-  if (typeof backup !== 'function') {
+  if (typeof sqlite.backup !== 'function') {
     throw new Error('sqlite backup API unavailable');
   }
   // Keep OS permission errors distinguishable from SQLite's generic CANTOPEN.
   const fd = fs.openSync(src, 'r');
   fs.closeSync(fd);
-  const source = new DatabaseSync(src, { readOnly: true, timeout: optional ? 0 : 5000 });
+  const source = new sqlite.DatabaseSync(src, { readOnly: true, timeout: optional ? 0 : 5000 });
   try {
     // Acquire a read snapshot before async backup: an exclusive Chrome password
     // lock should fail promptly, not leave backup retrying SQLITE_BUSY indefinitely.
@@ -392,7 +392,7 @@ async function copySqliteDatabase(src: string, dest: string, optional: boolean):
     // Node 24 / Electron 41: backup is module-level `backup(sourceDb, dest)`.
     // DatabaseSync#backup does not exist; copyFile + WAL sidecars is not a
     // consistent snapshot while the source Chrome is open.
-    await backup(source, dest);
+    await sqlite.backup(source, dest);
   } finally {
     source.close();
   }

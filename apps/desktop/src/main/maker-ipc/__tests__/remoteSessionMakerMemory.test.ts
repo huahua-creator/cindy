@@ -38,6 +38,9 @@ describe('ensureRemoteReadyForSessionStart Maker Memory flag (R1 P1)', () => {
       fnStart,
     );
     expect(backfill).toBeGreaterThan(fnStart);
+    const laneGuard = source.indexOf('const isXdtOrDisabledLane =', fnStart);
+    expect(laneGuard).toBeGreaterThan(fnStart);
+    expect(laneGuard).toBeLessThan(backfill);
   });
 
   it('clamps the session flag when the active (stale) bridge lacks cindy_memory (R2 P2)', () => {

@@ -55,6 +55,8 @@ interface CreateSessionOpts {
   userPrompt?: string;
   providerId?: string | null;
   vendorOptions?: Record<string, unknown>;
+  makerMemoryEnabled?: boolean;
+  remoteHostId?: string;
 }
 
 interface FakeTool {
@@ -794,10 +796,9 @@ describe('orca_worker_bridge MCP helpers', () => {
     expect(base.createSessionCalls[0]).toMatchObject({ makerMemoryEnabled: false });
   });
 
-  it('applies the preflight-normalized Maker Memory flag to remote rehydration (R6 P2)', async () => {
-    // SSH remote 与 IPC create/send 同语义:全局开着时远端 rehydrate 不再
-    // 硬编码 false;开关值 = 宿主 preflight 归一化 (backfill + stale-bridge
-    // 钳制) 后回传的结果。
+  it('keeps old Orca SSH rehydrate disabled even if preflight reports makerMemoryEnabled true', async () => {
+    // 第 3 路:旧 persist 无完整 XdtMemoryBindingV1。SSH preflight 不得把缺
+    // binding / 未归一化字段当成 true；即使宿主回传 true 也必须显式 false。
     const workerLink: OrcaWorkerLink = {
       workerId: 'worker-1',
       workflowId: 'workflow-1',
@@ -845,7 +846,7 @@ describe('orca_worker_bridge MCP helpers', () => {
     expect(createSessionCalls[0]).toMatchObject({
       id: 'lead-1',
       remoteHostId: 'host-remote-1',
-      makerMemoryEnabled: true,
+      makerMemoryEnabled: false,
     });
   });
 
@@ -896,6 +897,56 @@ describe('orca_worker_bridge MCP helpers', () => {
 
     expect(parseToolJson(result)).toMatchObject({ ok: true });
     expect(ensureSpy).not.toHaveBeenCalled();
+  });
+
+  it('sets makerMemoryEnabled false when rehydrating a local lead without XdtMemoryBindingV1', async () => {
+    const workerLink: OrcaWorkerLink = {
+      workerId: 'worker-1',
+      workflowId: 'workflow-1',
+      workerSessionId: 'worker-session-1',
+      leadSessionId: 'lead-1',
+      leadSession: {
+        sessionId: 'lead-1',
+        agentKind: 'claude-code',
+        workingDir: '/repo',
+        model: 'claude-opus-4-7',
+        providerId: 'anthropic',
+      },
+    };
+    const { createSessionCalls, maker } = makeProvider({ workerLink });
+    const provider = createOrcaWorkerBridgeMcpProvider({
+      getMaker: () => maker as unknown as Maker,
+      logger: makeLogger() as never,
+      persistUserMessage: async () => {},
+      wireSession: () => {},
+      orcaTeamStore: {
+        async getWorkerLink() {
+          return workerLink;
+        },
+        async updateWorkerStatus() {},
+      },
+    });
+    const server = getServer(provider, {
+      agentKind: 'claude-code',
+      workingDir: '/repo',
+      vendorOptions: {
+        orcaRole: 'worker',
+        orcaWorkerId: 'worker-1',
+        orcaWorkerSessionId: 'worker-session-1',
+      },
+    });
+
+    const result = await server._registeredTools.send_to_lead.handler({
+      worker_id: 'worker-1',
+      message: 'hello local lead',
+    });
+
+    expect(parseToolJson(result)).toMatchObject({ ok: true });
+    expect(createSessionCalls[0]).toMatchObject({
+      id: 'lead-1',
+      makerMemoryEnabled: false,
+    });
+    expect(createSessionCalls[0]).not.toHaveProperty('remoteHostId');
   });
 
   it('hydrates lead provider route even when send_to_lead reuses an active lead', async () => {

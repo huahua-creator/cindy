@@ -100,6 +100,70 @@ export {
   type MemoryFlushControllerDeps,
 } from './memory/flush-controller.js';
 export { MAKER_MEMORY_RULES } from './memory/system-prompt.js';
+export {
+  UUID_V4_RE,
+  HEX64_RE,
+  XdtPrepareError,
+  isXdtMemoryBinding,
+  assertCanonicalWorkspaceUuid,
+  type XdtPrepareErrorCode,
+  type XdtMemoryBindingV1,
+  type FrozenIndexSnapshotV1,
+  type NativeMemoryDisabledProofV1,
+  type FrozenFacadeRecord,
+  type MemorySessionStore,
+  type PreparedMemorySession,
+} from './memory/xdt-binding.js';
+export {
+  EMPTY_MEMORY_INDEX,
+  EMPTY_MEMORY_INDEX_DIGEST,
+  CANONICAL_LIMITS,
+  limitsDigest,
+  snapshotToken,
+  assertFrozenIndexSnapshot,
+} from './memory/xdt-snapshot-token.js';
+export { createXdtFrozenSessionStore } from './memory/xdt-frozen-store.js';
+export {
+  rememberCodexCindyMemoryWriteSlot,
+  peekCodexCindyMemoryWriteSlot,
+  forgetCodexCindyMemoryWriteSlot,
+  tryAcquireCodexCindyMemoryWriteSlot,
+  releaseCodexCindyMemoryWriteSlot,
+  resetCodexCindyMemoryWriteSlotsForTest,
+  type CodexCindyMemoryWriteSlot,
+} from './memory/codex-cindy-memory-write-slot.js';
+export {
+  isolatedCodexStanzaPresent,
+  readIsolatedCodexStanzaPresent,
+  assertNoDuplicateWritableMemorySource,
+  defaultCindyCodexConfigPath,
+  cindyIsolatedCodexConfigPath,
+} from './memory/xdt-writable-sources.js';
+export {
+  nativeProofMechanism,
+  buildNativeMemoryDisabledProof,
+  assertNativeMemoryDisabledProof,
+  nativeSetMemoryIsProof,
+} from './memory/xdt-native-proof.js';
+export { prepareMemorySession, type PrepareMemorySessionInput } from './memory/xdt-prepare.js';
+export {
+  readFrozenIndexFromXdt,
+  createXdtMemoryIndexClient,
+  assertRecordsMatchSnapshot,
+  type XdtIndexSource,
+  type MemoryIndexClient,
+} from './memory/xdt-index.js';
+export {
+  assertXdtBindingSchema,
+  assertFrozenIndexSchema,
+  assertNativeProofSchema,
+  resolveXdtMemoryRoot,
+  loadXdtSchemaValidator,
+  loadUpdateCindyCodexConfig,
+  type XdtSchemaValidator,
+  type UpdateCindyCodexConfigFn,
+} from './memory/xdt-schema.js';
+export { freezeUtcZ } from './memory/xdt-native-proof.js';
 
 // maker contacts (agent-native 智能通讯录, 全局人物实体库)
 export * from './contacts/types.js';
