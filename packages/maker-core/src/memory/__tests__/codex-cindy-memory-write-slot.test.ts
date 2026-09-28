@@ -85,4 +85,28 @@ describe('codex cindy_memory write slot', () => {
     forgetCodexCindyMemoryWriteSlot({ sessionInstanceId: INSTANCE, itemId: 'item-1' });
     expect(peekCodexCindyMemoryWriteSlot(INSTANCE)).toBeUndefined();
   });
+
+  it('refuses a second different item.id instead of overwriting the in-flight slot', () => {
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      item: writeItem('item-A'),
+    });
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      item: writeItem('item-B'),
+    });
+    expect(peekCodexCindyMemoryWriteSlot(INSTANCE)).toEqual({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      itemId: 'item-A',
+    });
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      item: writeItem('item-A'),
+    });
+    expect(peekCodexCindyMemoryWriteSlot(INSTANCE)?.itemId).toBe('item-A');
+  });
 });

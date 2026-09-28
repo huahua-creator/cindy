@@ -44,6 +44,8 @@ export function rememberCodexCindyMemoryWriteSlot(input: {
   const sessionInstanceId = input.sessionInstanceId?.trim();
   if (!sessionId || !sessionInstanceId) return;
   if (!isCindyMemoryWriteCreateOrUpdate(input.item)) return;
+  const existing = slots.get(sessionInstanceId);
+  if (existing && existing.itemId !== input.item.id) return;
   slots.set(sessionInstanceId, {
     sessionId,
     sessionInstanceId,
