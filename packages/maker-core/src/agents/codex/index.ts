@@ -10594,6 +10594,10 @@ assertRouteCurrent();
 
       state.automaticRecoveryAttempted = true;
       terminalErroredTurnIds.add(deadTurnId);
+      forgetCodexCindyMemoryWriteSlotsForTurn({
+        sessionInstanceId: opts.sessionInstanceId,
+        turnId: deadTurnId,
+      });
       dismissPendingUserInputForTurn(deadTurnId, 'turn_failed');
       clearActiveToolContextsForTurn(deadTurnId);
       stopActiveRolloutPlanFallback();
