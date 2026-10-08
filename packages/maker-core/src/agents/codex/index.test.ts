@@ -10,6 +10,10 @@ import {
   isCodexRollbackUnavailableError,
   isExactNoRolloutThreadResumeError,
 } from './index.js';
+import {
+  peekCodexCindyMemoryWriteSlot,
+  resetCodexCindyMemoryWriteSlotsForTest,
+} from '../../memory/codex-cindy-memory-write-slot.js';
 import { CodexForkError } from './fork-error.js';
 import { Session } from '../../session.js';
 import { Method } from './app-server/protocol.js';
@@ -307,6 +311,7 @@ const tempRoots: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  resetCodexCindyMemoryWriteSlotsForTest();
   await Promise.all(tempRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
@@ -7406,6 +7411,146 @@ describe('CodexAgent send', () => {
     turnStart.resolve({ turn: { id: 'late-turn' } });
 
     await expect(sendPromise).rejects.toThrow(/session is closed after turn\/start/i);
+  });
+
+  const CINDY_MEMORY_WRITE_ITEM = {
+    id: 'item-cindy-write',
+    type: 'mcpToolCall',
+    server: 'cindy_memory',
+    tool: 'call_tool',
+    arguments: {
+      name: 'memory_write',
+      args: {
+        type: 'project',
+        name: 'codex-slot',
+        title: 'yes',
+        description: 'callId from item.id',
+        body: 'ok',
+      },
+    },
+  };
+
+  it('does not keep a cindy_memory write slot after a stale item/started', async () => {
+    const instanceId = 'instance-stale-cindy-memory-slot';
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnStart) return { turn: { id: 'turn-1' } };
+      return undefined;
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-stale-cindy-memory-slot',
+      sessionInstanceId: instanceId,
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    await handle.send({ type: 'user', content: 'first' });
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.turnCompleted) {
+      throw new Error('expected handlers');
+    }
+    handlers.itemStarted({
+      turnId: 'turn-1',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write');
+    handlers.turnCompleted({ turn: { id: 'turn-1', status: 'completed' } });
+    handlers.itemStarted({
+      turnId: 'turn-1',
+      item: { ...CINDY_MEMORY_WRITE_ITEM, id: 'item-cindy-write-late' },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)).toBeUndefined();
+    await handle.close();
+  });
+
+  it('keeps a live cindy_memory write slot when forgetting a stale turn', async () => {
+    const instanceId = 'instance-live-cindy-memory-slot';
+    let turnStarts = 0;
+    const agent = new CodexAgent(createDeps());
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnStart) {
+        turnStarts += 1;
+        return { turn: { id: `turn-${turnStarts}` } };
+      }
+      return undefined;
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-live-cindy-memory-slot',
+      sessionInstanceId: instanceId,
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    await handle.send({ type: 'user', content: 'first' });
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.itemCompleted || !handlers.turnCompleted) {
+      throw new Error('expected handlers');
+    }
+    handlers.itemStarted({
+      turnId: 'turn-1',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    handlers.itemCompleted({
+      turnId: 'turn-1',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    handlers.turnCompleted({ turn: { id: 'turn-1', status: 'completed' } });
+    await handle.send({ type: 'user', content: 'second' });
+    handlers.itemStarted({
+      turnId: 'turn-2',
+      item: {
+        ...CINDY_MEMORY_WRITE_ITEM,
+        id: 'item-cindy-write-live',
+        arguments: {
+          name: 'memory_write',
+          args: {
+            ...CINDY_MEMORY_WRITE_ITEM.arguments.args,
+            name: 'codex-slot-live',
+          },
+        },
+      },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write-live');
+    handlers.itemStarted({
+      turnId: 'turn-1',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write-live');
+    await handle.close();
+  });
+
+  it('forgets a cindy_memory write slot when turn/start hits the tombstone discard path', async () => {
+    const instanceId = 'instance-tombstone-cindy-memory-slot';
+    const agent = new CodexAgent(createDeps());
+    const firstStart = deferred<{ turn: { id: string } }>();
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnStart) return firstStart.promise;
+      if (method === Method.TurnInterrupt) return {};
+      return undefined;
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-tombstone-cindy-memory-slot',
+      sessionInstanceId: instanceId,
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    const sendPromise = handle.send({ type: 'user', content: 'first' });
+    for (let i = 0; i < 10; i += 1) {
+      if (host.request.mock.calls.some(([method]) => method === Method.TurnStart)) break;
+      await Promise.resolve();
+    }
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.turnCompleted) {
+      throw new Error('expected handlers');
+    }
+    handlers.itemStarted({
+      turnId: 'turn-tombstone',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write');
+    handlers.turnCompleted({ turn: { id: 'turn-tombstone', status: 'completed' } });
+    firstStart.resolve({ turn: { id: 'turn-tombstone' } });
+    await sendPromise;
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)).toBeUndefined();
+    await handle.close();
   });
 });
 

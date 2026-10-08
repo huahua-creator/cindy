@@ -10190,6 +10190,10 @@ assertRouteCurrent();
      */
     const tombstoneIdleOrphanTurn = (turnId: string, reason: string): void => {
       terminalErroredTurnIds.add(turnId);
+      forgetCodexCindyMemoryWriteSlotsForTurn({
+        sessionInstanceId: opts.sessionInstanceId,
+        turnId,
+      });
       if (!threadId) return;
       host.request(Method.TurnInterrupt, { threadId, turnId }).catch((e: unknown) => {
         log.warn('idle orphan turn interrupt failed (best-effort)', {
@@ -12416,13 +12420,6 @@ assertRouteCurrent();
         handleTurnCompleted(params);
       },
       itemStarted: (params) => {
-        // cindy_memory write slot 必须在缓冲对账之前登记，HTTP tools/call 可能更早到达。
-        rememberCodexCindyMemoryWriteSlot({
-          sessionId: sid,
-          sessionInstanceId: opts.sessionInstanceId,
-          item: params.item,
-          turnId: params.turnId,
-        });
         // 血缘不能跟着 turn 对账队列一起迟到:AppServerHost 只为未知 child 缓冲 5s。
         // 卡片/翻译仍在队列内,这里只保留 provisional claim；父 turn 被接受后
         // 重放 item 才 commit root route，孤儿则 discard。
@@ -12430,13 +12427,30 @@ assertRouteCurrent();
         if (enqueueIfBufferedTurn(params.turnId, () => handlers.itemStarted?.(params), {
           modelWork: itemRepresentsModelWork(params.item),
         })) {
+          // HTTP tools/call 可能比缓冲出队更早到达，入缓冲时先登记。
+          rememberCodexCindyMemoryWriteSlot({
+            sessionId: sid,
+            sessionInstanceId: opts.sessionInstanceId,
+            item: params.item,
+            turnId: params.turnId,
+          });
           rememberPendingSpawnLineage(params.turnId, reservedChildThreadIds);
           return;
         }
         if (shouldIgnoreStaleTurnEvent(params.turnId)) {
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: params.turnId,
+          });
           discardPendingSpawnLineageIds(reservedChildThreadIds);
           return;
         }
+        rememberCodexCindyMemoryWriteSlot({
+          sessionId: sid,
+          sessionInstanceId: opts.sessionInstanceId,
+          item: params.item,
+          turnId: params.turnId,
+        });
         if (params.item.type === 'contextCompaction' && !compactingTurnIds.has(params.turnId)) {
           compactingTurnIds.add(params.turnId);
           // Native compaction owns this wait; retain the bounded upstream-idle
@@ -12555,23 +12569,33 @@ assertRouteCurrent();
         if (replayedSubagentUpdate) emitSubagentCardUpdate(replayedSubagentUpdate);
       },
       itemUpdated: (params) => {
+        const reservedChildThreadIds = reserveSubagentSpawnLineage(params.item);
+        if (enqueueIfBufferedTurn(params.turnId, () => handlers.itemUpdated?.(params), {
+          modelWork: itemRepresentsModelWork(params.item),
+        })) {
+          rememberCodexCindyMemoryWriteSlot({
+            sessionId: sid,
+            sessionInstanceId: opts.sessionInstanceId,
+            item: params.item,
+            turnId: params.turnId,
+          });
+          rememberPendingSpawnLineage(params.turnId, reservedChildThreadIds);
+          return;
+        }
+        if (shouldIgnoreStaleTurnEvent(params.turnId)) {
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: params.turnId,
+          });
+          discardPendingSpawnLineageIds(reservedChildThreadIds);
+          return;
+        }
         rememberCodexCindyMemoryWriteSlot({
           sessionId: sid,
           sessionInstanceId: opts.sessionInstanceId,
           item: params.item,
           turnId: params.turnId,
         });
-        const reservedChildThreadIds = reserveSubagentSpawnLineage(params.item);
-        if (enqueueIfBufferedTurn(params.turnId, () => handlers.itemUpdated?.(params), {
-          modelWork: itemRepresentsModelWork(params.item),
-        })) {
-          rememberPendingSpawnLineage(params.turnId, reservedChildThreadIds);
-          return;
-        }
-        if (shouldIgnoreStaleTurnEvent(params.turnId)) {
-          discardPendingSpawnLineageIds(reservedChildThreadIds);
-          return;
-        }
         if (interceptProposedPlanItem(params.turnId, params.item)) {
           discardPendingSpawnLineageIds(reservedChildThreadIds);
           return;
@@ -12631,6 +12655,10 @@ assertRouteCurrent();
             !collabTerminalKey
             || (!completedTurnIds.has(params.turnId) && !terminalErroredTurnIds.has(params.turnId))
           ) {
+            forgetCodexCindyMemoryWriteSlotsForTurn({
+              sessionInstanceId: opts.sessionInstanceId,
+              turnId: params.turnId,
+            });
             discardPendingSpawnLineageIds(reservedChildThreadIds);
             return;
           }
@@ -13601,6 +13629,10 @@ assertRouteCurrent();
             } else {
               // 未激活 (墓碑): 队列丢弃, 挂起请求按拒绝释放 — 不得穿透。
               bufferedTurnEventQueues.delete(resp.turn.id);
+              forgetCodexCindyMemoryWriteSlotsForTurn({
+                sessionInstanceId: opts.sessionInstanceId,
+                turnId: resp.turn.id,
+              });
               settleBufferedTurnReconcile(resp.turn.id, false);
             }
             // turn/start 在飞期间权限档或可写根被收紧 → 本 turn 携带的还是旧宽松策略,

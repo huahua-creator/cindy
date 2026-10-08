@@ -144,6 +144,20 @@ describe('codex cindy_memory write slot', () => {
     expect(peekCodexCindyMemoryWriteSlot(INSTANCE)).toBeUndefined();
   });
 
+  it('does not delete a live slot when forgetting a different turn that never owned it', () => {
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SESSION,
+      sessionInstanceId: INSTANCE,
+      item: writeItem('item-live'),
+      turnId: 'turn-live',
+    });
+    forgetCodexCindyMemoryWriteSlotsForTurn({
+      sessionInstanceId: INSTANCE,
+      turnId: 'turn-stale',
+    });
+    expect(peekCodexCindyMemoryWriteSlot(INSTANCE)?.itemId).toBe('item-live');
+  });
+
   it('refuses a second different item.id instead of overwriting the in-flight slot', () => {
     rememberCodexCindyMemoryWriteSlot({
       sessionId: SESSION,
