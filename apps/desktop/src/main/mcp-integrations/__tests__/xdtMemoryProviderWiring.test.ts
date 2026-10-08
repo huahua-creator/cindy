@@ -25,6 +25,7 @@ describe('desktop MCP providers carry frozen xdt binding', () => {
     expect(providers).toContain('executeXdtFacadeWrite: deps.executeXdtFacadeWrite');
     expect(host).toContain('createHbusXdtFacadeWrite');
     expect(host).toContain('getWriteTarget: () => undefined');
+    expect(host).toMatch(/createMemoryFacadeCodexDynamicToolProvider\(\{[\s\S]*executeXdtFacadeWrite,/);
   });
 
   it('copies frozen binding through Codex ALS and Pi liziCtx', () => {

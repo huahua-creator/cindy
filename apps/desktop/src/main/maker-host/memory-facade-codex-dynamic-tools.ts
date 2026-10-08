@@ -1,7 +1,8 @@
 /**
  * 前置刀 1c：Cindy Codex mutation 入口走 Host dynamic tool。
  * 能力只在进程内 mint；模型 args/_meta 里的 invocationId/capability 一律 INVALID_ARGS。
- * 隔离树可 memory_write create/update；生产 getWriteTarget 缺省失败。
+ * 隔离树可 memory_write create/update。生产 getWriteTarget 仍缺省；
+ * 无 target 时转 executeXdtFacadeWrite（H-Bus），不在此 mint 第二套账本。
  * 不改 write.ts:55，不给 frozen store 开写。
  */
 
@@ -14,6 +15,7 @@ import type {
   PreparedMemorySession,
 } from '@cindy/maker-core';
 import { freezeUtcZ, UUID_V4_RE, XdtPrepareError } from '@cindy/maker-core';
+import type { MemoryMcpDeps } from '@cindy/mcps';
 
 import { objectDigest } from './facade-canonical.js';
 import {
@@ -104,7 +106,7 @@ const TOOLS: readonly DynamicToolSpec[] = [
     type: 'function',
     name: CALL_TOOL_NAME,
     description:
-      'Host-owned xdt facade mutation entry. Pass inner name and arguments. Isolated trees may accept memory_write create/update; production trees stay fail-closed.',
+      'Host-owned xdt facade mutation entry. Pass inner name and arguments. Isolated trees may accept memory_write create/update; production trees go through Host H-Bus.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -124,6 +126,12 @@ export interface MemoryFacadeDynamicToolDeps {
   getPreparedBySessionId: (sessionId: string) => PreparedMemorySession | undefined;
   advertiseTools?: boolean;
   getWriteTarget?: () => FacadeWriteTarget | undefined;
+  /**
+   * Production / live-session write. Mutually exclusive with an injected writeTarget:
+   * isolated fixtures keep executeFacadeMemoryWrite; production keeps getWriteTarget
+   * undefined and forwards once through this Host H-Bus.
+   */
+  executeXdtFacadeWrite?: NonNullable<MemoryMcpDeps['executeXdtFacadeWrite']>;
   createWriteStore?: CreateFacadeWriteStore;
   now?: () => Date;
   randomUuid?: () => string;
@@ -550,23 +558,43 @@ export function createMemoryFacadeCodexDynamicToolProvider(
         }
         const innerArgs = normalizeInnerArgs(innerName, asRecord(envelope.args) ?? {});
         const writeTarget = deps.getWriteTarget?.();
-        if (!writeTarget) {
-          return denyWriteResponse();
+        if (writeTarget) {
+          const result = await executeFacadeMemoryWrite({
+            deps,
+            owner,
+            prepared,
+            identity: {
+              threadId: params.threadId,
+              turnId: params.turnId,
+              callId: params.callId,
+            },
+            innerName,
+            innerArgs,
+            writeTarget,
+          });
+          return textResponse(result, true);
         }
-        const result = await executeFacadeMemoryWrite({
-          deps,
-          owner,
-          prepared,
-          identity: {
-            threadId: params.threadId,
-            turnId: params.turnId,
+        if (deps.executeXdtFacadeWrite) {
+          const sessionInstanceId = prepared.nativeMemoryProof.sessionInstanceId;
+          if (!sessionInstanceId) {
+            return denyWriteResponse();
+          }
+          const facade = await deps.executeXdtFacadeWrite({
+            args: innerArgs,
             callId: params.callId,
-          },
-          innerName,
-          innerArgs,
-          writeTarget,
-        });
-        return textResponse(result, true);
+            sessionContext: {
+              agentKind: 'codex',
+              sessionId: context.sessionId,
+              sessionInstanceId,
+              preparedMemorySessionId: prepared.preparedMemorySessionId,
+              remoteHostId: context.remoteHostId,
+              workingDir: context.workingDir,
+            },
+          });
+          const payload = facade.content.find((block) => block.type === 'text')?.text ?? JSON.stringify(facade);
+          return textResponse(payload, facade.isError !== true);
+        }
+        return denyWriteResponse();
       } catch (err) {
         return mapCaught(err);
       }

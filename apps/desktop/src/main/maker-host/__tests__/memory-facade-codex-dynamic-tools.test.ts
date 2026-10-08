@@ -9,7 +9,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   loadXdtSchemaValidator,
@@ -241,6 +241,122 @@ describe('memory facade Codex dynamic tools', () => {
     await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
       code: 'ENOENT',
     });
+  });
+
+  it('forwards production writes through H-Bus with Host identity and does not mint a Codex-thread ledger', async () => {
+    const owner = await ownerScope();
+    const constructs: unknown[] = [];
+    const executeXdtFacadeWrite = vi.fn(async (input: {
+      args: Record<string, unknown>;
+      callId: string;
+      sessionContext: {
+        agentKind: string;
+        workingDir: string;
+        sessionId?: string;
+        sessionInstanceId?: string;
+        preparedMemorySessionId?: string;
+        remoteHostId?: string;
+      };
+    }) => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, data: { shared: true } }) }],
+    }));
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      getWriteTarget: () => undefined,
+      executeXdtFacadeWrite,
+      createWriteStore: (options) => {
+        constructs.push(options);
+        throw new Error('must not construct MemoryStore');
+      },
+    });
+    const result = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 'thread-codex-app', turnId: 'turn-codex-app', callId: 'call-hbus' }),
+      CONTEXT,
+    );
+    expect(result?.success).toBe(true);
+    expect(payload(result!).ok).toBe(true);
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(1);
+    const forwarded = executeXdtFacadeWrite.mock.calls[0][0];
+    expect(forwarded.callId).toBe('call-hbus');
+    expect(forwarded.sessionContext).toEqual({
+      agentKind: 'codex',
+      sessionId: SESSION_ID,
+      sessionInstanceId: SESSION_INSTANCE,
+      preparedMemorySessionId: PREPARED_SESSION,
+      remoteHostId: undefined,
+      workingDir: CONTEXT.workingDir,
+    });
+    expect(constructs).toEqual([]);
+    await expect(readInvocationLedger(owner, {
+      threadId: 'thread-codex-app',
+      turnId: 'turn-codex-app',
+      callId: 'call-hbus',
+    })).resolves.toBeUndefined();
+    await expect(stat(path.join(owner.ownerRoot, FACADE_INVOCATION_LEDGER_DIR))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('maps H-Bus isError onto dynamic-tool success:false without wrapping as success', async () => {
+    const owner = await ownerScope();
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify(XDT_WRITE_FORBIDDEN) }],
+      isError: true,
+    }));
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: () => fixturePrepared(),
+      advertiseTools: true,
+      getWriteTarget: () => undefined,
+      executeXdtFacadeWrite,
+    });
+    const result = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't-err', turnId: 'u-err', callId: 'c-err' }),
+      CONTEXT,
+    );
+    expect(result?.success).toBe(false);
+    expect(payload(result!)).toEqual(XDT_WRITE_FORBIDDEN);
+  });
+
+  it('keeps an injected writeTarget exclusive of H-Bus even when both deps are present', async () => {
+    const owner = await ownerScope();
+    const writeTarget = await isolatedWriteTarget();
+    const executeXdtFacadeWrite = vi.fn(async () => {
+      throw new Error('must not call H-Bus when writeTarget is injected');
+    });
+    const constructs: unknown[] = [];
+    const provider = createMemoryFacadeCodexDynamicToolProvider({
+      getOwner: () => owner,
+      getCapabilitySecret: () => FIXTURE_SECRET,
+      getPreparedBySessionId: (sessionId) => {
+        if (sessionId !== SESSION_ID) return undefined;
+        const prepared = fixturePrepared();
+        prepared.binding.canonicalWorkspaceId = writeTarget.workspace;
+        return prepared;
+      },
+      advertiseTools: true,
+      getWriteTarget: () => writeTarget,
+      executeXdtFacadeWrite,
+      createWriteStore: (options) => {
+        constructs.push(options);
+        return stubWriteStore();
+      },
+    });
+    const result = await provider.callTool(
+      writeCall(WRITE_ARGS, { threadId: 't-xor', turnId: 'u-xor', callId: 'c-xor' }),
+      CONTEXT,
+    );
+    expect(result?.success).toBe(true);
+    expect(payload(result!).shared).toBe(true);
+    expect(executeXdtFacadeWrite).toHaveBeenCalledTimes(0);
+    expect(constructs).toHaveLength(1);
+    const ledger = await readInvocationLedger(owner, { threadId: 't-xor', turnId: 'u-xor', callId: 'c-xor' });
+    expect(ledger?.callId).toBe('c-xor');
+    expect(ledger?.sessionInstanceId).toBe(SESSION_INSTANCE);
   });
 
   it('does not advertise tools without a prepared xdt session', () => {

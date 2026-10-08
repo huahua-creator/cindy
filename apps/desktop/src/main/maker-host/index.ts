@@ -950,6 +950,19 @@ export function getMaker(): Maker {
       return getIOSSimulatorPluginAccessDecision(workingDir);
     };
 
+    const executeXdtFacadeWrite = createHbusXdtFacadeWrite({
+      getOwner: () => resolveOwnerScopedRegistryRoot(),
+      getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
+      getPreparedMemorySession,
+      resolveWriteRoots: () => {
+        const repoRoot = resolveXdtMemoryRoot();
+        return {
+          repoRoot,
+          dataRoot: process.env.XDT_MEMORY_HOME || path.join(repoRoot, 'data'),
+        };
+      },
+    });
+
     const makerMemoryProviderDeps = {
       runtimeCapabilities: async (context: import('@cindy/mcps').LiziMcpSessionContext, query: AgentCapabilityQuery) => {
         const session = context.sessionId ? _maker?.getSession(context.sessionId) : undefined;
@@ -990,18 +1003,7 @@ export function getMaker(): Maker {
       getAppVersion: () => app.getVersion(),
       getMakerMemoryManager: () => makerMemoryManager,
       getPreparedMemorySession,
-      executeXdtFacadeWrite: createHbusXdtFacadeWrite({
-        getOwner: () => resolveOwnerScopedRegistryRoot(),
-        getCapabilitySecret: () => loadHostFacadeCapabilitySecret(getElectronSecretIo()),
-        getPreparedMemorySession,
-        resolveWriteRoots: () => {
-          const repoRoot = resolveXdtMemoryRoot();
-          return {
-            repoRoot,
-            dataRoot: process.env.XDT_MEMORY_HOME || path.join(repoRoot, 'data'),
-          };
-        },
-      }),
+      executeXdtFacadeWrite,
       lspPool: getLspPool(),
       pluginRegistry,
       resolveIOSSimulatorAccess,
@@ -1634,6 +1636,7 @@ export function getMaker(): Maker {
           getPreparedBySessionId: getPreparedMemorySessionForSessionId,
           advertiseTools: true,
           getWriteTarget: () => undefined,
+          executeXdtFacadeWrite,
         }),
       ]),
       // 通讯录 prompt 段有效状态(codex 版): 在 claude 的判定链之上再与「实际应用
