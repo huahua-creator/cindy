@@ -12,6 +12,7 @@ import {
   probeOsSourceProfileReadAccess,
   probeSourceProfileReadAccess,
   profileIsLocked,
+  profileUsesAppBoundEncryption,
   readCopiedLoginsCdpPort,
   realProfileDestDir,
   realProfileProfileDir,
@@ -77,6 +78,33 @@ function setCookieEncryptionPrefix(filePath: string, prefix: 'v10' | 'v20'): voi
   );
   db.close();
 }
+
+describe('app-bound encryption probe', () => {
+  it.each(['v20', 'v10'] as const)('detects %s and closes the synthetic database', prefix => {
+    const root = makeTempDir();
+    const cookieDb = path.join(root, 'Cookies');
+    writeSqlite(cookieDb, 'cookies', 'synthetic');
+    setCookieEncryptionPrefix(cookieDb, prefix);
+    const close = vi.spyOn(DatabaseSync.prototype, 'close');
+    try {
+      expect(profileUsesAppBoundEncryption(root)).toBe(prefix === 'v20');
+      expect(close).toHaveBeenCalledOnce();
+    } finally { close.mockRestore(); }
+  });
+
+  it('closes the synthetic database when a query fails', () => {
+    const root = makeTempDir();
+    writeSqlite(path.join(root, 'Cookies'), 'cookies', 'synthetic');
+    const close = vi.spyOn(DatabaseSync.prototype, 'close');
+    const prepare = vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementationOnce(() => {
+      throw new Error('synthetic query failure');
+    });
+    try {
+      expect(() => profileUsesAppBoundEncryption(root)).toThrow('synthetic query failure');
+      expect(close).toHaveBeenCalledOnce();
+    } finally { prepare.mockRestore(); close.mockRestore(); }
+  });
+});
 
 function seedSource(root: string, lastUsed = 'Profile 6'): InstalledChromium {
   const userDataDir = path.join(root, 'Chrome');

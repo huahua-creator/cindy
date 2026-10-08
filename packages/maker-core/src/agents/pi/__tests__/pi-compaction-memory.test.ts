@@ -74,6 +74,7 @@ describe('PiAgent compaction → memory digest', () => {
     resetDigestsMock = vi.fn(async () => ({ removedCount: 2 }));
   });
   afterEach(() => {
+    vi.restoreAllMocks();
     rmSync(agentHome, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   });
@@ -249,8 +250,8 @@ describe('PiAgent compaction → memory digest', () => {
     });
     const deps = buildDeps(true);
     deps.logger = logger;
-    (deps.makerMemory as { isEnabled: () => boolean; write: typeof writeMock }).isEnabled = () => enabled.value;
-    (deps.makerMemory as { write: typeof writeMock }).write = writeMock;
+    vi.spyOn(deps.makerMemory!, 'isEnabled').mockImplementation(() => enabled.value);
+    vi.spyOn(deps.makerMemory!, 'write').mockImplementation(writeMock);
     const handle = await new PiAgent(deps).startSession({
       sessionId: 'cm-session',
       workingDir: cwd,

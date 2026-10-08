@@ -257,7 +257,7 @@ export function profileUsesAppBoundEncryption(profileDir: string): boolean {
   for (const relative of COOKIE_DB_CANDIDATES) {
     const cookieDb = path.join(profileDir, relative);
     if (!fs.existsSync(cookieDb)) continue;
-    const db = new DatabaseSync(cookieDb, { readOnly: true, timeout: 5000 });
+    const db = new sqlite.DatabaseSync(cookieDb, { readOnly: true, timeout: 5000 });
     try {
       const columns = db.prepare('PRAGMA table_info(cookies)').all() as Array<{
         name?: unknown;

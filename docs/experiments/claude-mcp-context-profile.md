@@ -52,3 +52,9 @@ MCP；不调用真实 MCP 或共享模型。子进程环境采用白名单，不
 
 正式代码事后审查：同一 reviewer 对实际 diff、调用路径、测试及合成 summary 给出 GO，无 P0/P1，独立复跑直接相关测试 47/47 通过。主代理 153 项定向单测、12 组原生矩阵、114×2 大组、docs 合同 10 项及 diff-check 通过。新增/helper/test lint 通过；index.ts 的三个未使用变量错误用 HEAD 版本 stdin 复现。maker-core 的 tsc --noEmit 实际执行未通过：未修改的 pi-compaction-memory.test.ts:252/253 两处 TS2352，未将其伪报通过，也未修改无关代码。
 
+
+## 构建阻塞窄修复核（2026-10-08）
+
+为继续验证源码，补齐既有两处类型检查错误：浏览器 SQLite 使用已有 namespace，Pi 测试用 spyOn 替代错误结构强转。独立 reviewer `context_pre_review` / gpt-5.6-sol medium 前审与实际后审均 GO。snapshot 合成测试 44 通过、1 个既有平台 skip；Pi 12 通过；maker-core build 与 Desktop typecheck 均通过，diff-check 通过。没有访问或复制真实浏览器 profile。
+
+安装版仍未替换。优先使用文档支持的同区域 shared/passive/preserve-running 开发预览验证；它会添加两个测试任务并可正常续期登录态，不是全局只读。不得强停 primary，不得复制凭证绕过启动门禁。真实 A/B 结果尚待执行。
