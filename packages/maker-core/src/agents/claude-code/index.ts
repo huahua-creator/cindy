@@ -177,6 +177,7 @@ import { ensureClaudeTranscriptInWorkingDir } from './transcript-relocation.js';
 import { findClaudeSessionJsonl } from './claude-projects-fs.js';
 import { normalizeClaudeSessionJsonlToolIds } from './jsonl-tool-id-normalize.js';
 import { isClaudeResumeSessionNotFound } from './invalid-resume.js';
+import { snapshotClaudeMcpExclusions, mergeClaudeMcpDisallowedTools } from './mcp-exclusions.js';
 import { translateSdkMessage, newRuntimeState, type TurnState, type RuntimeState } from './translator.js';
 import { resetClaudeGenerationTiming } from './generation-timing.js';
 import type { Effort, PermissionMode } from '../../types/common.js';
@@ -1310,6 +1311,9 @@ export class ClaudeCodeAgent extends BaseAgent {
   }
 
   async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    // Validate before any auth, filesystem, provider or process side effects.
+    // Internal Query rebuilds retain this snapshot; mutable vendorOptions cannot change it.
+    const excludedMcpServers = snapshotClaudeMcpExclusions(opts);
     // scope 带完整 s:<sessionId> 前缀 → host logger 落盘时提取 business sessionId,
     // 路由到 sessions/<id>/<date>.ndjson (logger.ts extractSessionId / sessionAgentSlot)。
     const sid = opts.sessionId ?? '';
@@ -1838,6 +1842,7 @@ export class ClaudeCodeAgent extends BaseAgent {
       // 普通字符串键。
       const out: Record<string, McpServerConfig> = Object.create(null);
       for (const provider of providers) {
+        if (excludedMcpServers.includes(provider.name)) continue;
         // cindy_memory: per-session flag 关 → 不注册; remote → in-process sdk 实例
         // 不可序列化, 这里跳过, 由 host 的 remoteCcQueryFactory 按同一 flag 以
         // http 形态经 bridge 注入 (见 cc-remote-mcp.ts)。
@@ -4158,6 +4163,9 @@ export class ClaudeCodeAgent extends BaseAgent {
           // 第一方只读工具由 host 精确列名, 直接走 SDK public allowlist, 避免
           // permissionMode=auto 时再调用远程安全分类器。动态聚合入口不在列表中。
           ...(claudeAllowedTools ? { allowedTools: [...claudeAllowedTools] } : {}),
+          ...(excludedMcpServers.length
+            ? { disallowedTools: mergeClaudeMcpDisallowedTools(excludedMcpServers) }
+            : {}),
           canUseTool,
           // Bot MCP selection is explicit; native delegation remains available.
           ...(opts.botRuntimeProfile ? { strictMcpConfig: true } : {}),

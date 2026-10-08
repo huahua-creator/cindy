@@ -148,6 +148,8 @@ async function startHarness(args: {
   transcriptExists: boolean;
   onInvalidResumeSession: StartSessionOptions['onInvalidResumeSession'];
   forkSession?: boolean;
+  vendorOptions?: Record<string, unknown>;
+  deps?: Partial<AgentDeps>;
 }) {
   const configDir = await makeTempDir();
   const workingDir = await makeTempDir();
@@ -178,7 +180,7 @@ async function startHarness(args: {
     return queries[index];
   });
 
-  const deps = createDeps();
+  const deps = createDeps(args.deps);
   const debug = vi.spyOn(deps.logger!, 'debug');
   const agent = new ClaudeCodeAgent(deps);
   const handle = await agent.startSession({
@@ -188,7 +190,7 @@ async function startHarness(args: {
     permissionMode: 'acceptEdits',
     resumeSessionId: args.resumeSessionId,
     onInvalidResumeSession: args.onInvalidResumeSession,
-    vendorOptions: args.forkSession ? { forkSession: true } : undefined,
+    vendorOptions: { ...args.vendorOptions, ...(args.forkSession ? { forkSession: true } : {}) },
   });
   const events: AgentEvent[] = [];
   const collected = (async () => {
@@ -220,6 +222,37 @@ afterEach(async () => {
 });
 
 describe('Claude invalid-resume recovery', () => {
+  it('keeps MCP exclusions frozen through a directory fork and restores defaults in a new handle', async () => {
+    const names = ['probe_bulk'];
+    const isEnabled = vi.fn(() => true);
+    const factory = vi.fn(() => ({ type: 'sdk', name: 'probe_bulk', instance: {} }));
+    const deps = { mcpProviders: [
+      { name: 'probe_bulk', isEnabled, toClaudeSdkConfig: factory },
+      { name: 'probe_bulkish', toClaudeSdkConfig: () => ({ type: 'sdk', name: 'probe_bulkish', instance: {} }) },
+    ] };
+    const h = await startHarness({ transcriptExists: false, onInvalidResumeSession: undefined,
+      vendorOptions: { claudeExcludedMcpServers: names }, deps });
+    try {
+      names[0] = 'probe_bulkish';
+      await h.handle.setVendorOptions?.({ claudeExcludedMcpServers: ['probe_bulkish'] });
+      await h.handle.setExtraDirs?.([await makeTempDir()]);
+      await h.handle.send({ type: 'user', content: 'synthetic directory rebuild' });
+      expect(h.queryOptions).toHaveLength(2);
+      expect(h.queryOptions[1]).toMatchObject({ forkSession: true });
+      for (const options of h.queryOptions) {
+        expect(options.disallowedTools).toEqual(['mcp__probe_bulk__*']);
+        expect(Object.keys(options.mcpServers as object)).toEqual(['probe_bulkish']);
+        expect(options.settingSources).toEqual(['user', 'project', 'local']);
+      }
+      expect(isEnabled).not.toHaveBeenCalled();
+      expect(factory).not.toHaveBeenCalled();
+    } finally { await h.handle.close(); for (const stream of h.streams) stream.end(); await h.collected; }
+    const restored = await startHarness({ transcriptExists: false, onInvalidResumeSession: undefined, deps });
+    try {
+      expect(restored.queryOptions[0]).not.toHaveProperty('disallowedTools');
+      expect(Object.keys(restored.queryOptions[0].mcpServers as object)).toEqual(['probe_bulk', 'probe_bulkish']);
+    } finally { await restored.handle.close(); for (const stream of restored.streams) stream.end(); await restored.collected; }
+  });
   it('binds a new native session before SDK init so its first request can resolve the provider', async () => {
     const h = await startHarness({ transcriptExists: false, onInvalidResumeSession: undefined });
     const sessionId = h.queryOptions[0].sessionId;
@@ -844,6 +877,7 @@ describe('Claude invalid-resume recovery', () => {
       resumeSessionId: undefined,
       transcriptExists: false,
       onInvalidResumeSession: clear,
+      vendorOptions: { claudeExcludedMcpServers: ['wwise-mcp'] },
     });
 
     // 全新会话:首个 query 不带 resume。
@@ -864,6 +898,9 @@ describe('Claude invalid-resume recovery', () => {
     // 幽灵 id 被清;重建 query 仍是全新(无 resume);没有 surface 终态错误。
     expect(clear).toHaveBeenCalledWith('sdk-fresh-phantom');
     expect(h.queryOptions[1]).not.toHaveProperty('resume');
+    expect(h.queryOptions.map(options => options.disallowedTools)).toEqual([
+      ['mcp__wwise-mcp__*'], ['mcp__wwise-mcp__*'],
+    ]);
 
     h.streams[1].emit({ type: 'system', subtype: 'init', session_id: 'sdk-fresh-2' });
     h.streams[1].emit({
