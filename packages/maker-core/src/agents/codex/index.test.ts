@@ -7552,6 +7552,57 @@ describe('CodexAgent send', () => {
     expect(peekCodexCindyMemoryWriteSlot(instanceId)).toBeUndefined();
     await handle.close();
   });
+
+  it('forgets a cindy_memory write slot when turn/start quarantine sits the orphan', async () => {
+    const instanceId = 'instance-quarantine-cindy-memory-slot';
+    const agent = new CodexAgent(createDeps());
+    const firstStart = deferred<{ turn: { id: string } }>();
+    let turnStarts = 0;
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnStart) {
+        turnStarts += 1;
+        if (turnStarts === 1) return firstStart.promise;
+        return { turn: { id: `turn-${turnStarts}` } };
+      }
+      if (method === Method.TurnInterrupt) return {};
+      return undefined;
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-quarantine-cindy-memory-slot',
+      sessionInstanceId: instanceId,
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    const firstSend = handle.send({ type: 'user', content: 'first' });
+    for (let i = 0; i < 10; i += 1) {
+      if (host.request.mock.calls.some(([method]) => method === Method.TurnStart)) break;
+      await Promise.resolve();
+    }
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.turnStarted) {
+      throw new Error('expected handlers');
+    }
+    handlers.turnStarted({ turn: { id: 'turn-quarantined' } });
+    handlers.itemStarted({
+      turnId: 'turn-quarantined',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write');
+    firstStart.reject(new Error('turn/start timed out'));
+    await firstSend.catch(() => undefined);
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)).toBeUndefined();
+
+    await handle.send({ type: 'user', content: 'second' });
+    handlers.itemStarted({
+      turnId: 'turn-2',
+      item: {
+        ...CINDY_MEMORY_WRITE_ITEM,
+        id: 'item-cindy-write-next',
+      },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write-next');
+    await handle.close();
+  });
 });
 
 describe('CodexAgent MCP thread context hooks', () => {

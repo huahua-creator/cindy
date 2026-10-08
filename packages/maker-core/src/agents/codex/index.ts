@@ -11882,16 +11882,20 @@ assertRouteCurrent();
      */
     const quarantineTurnsAfterStartFailure = (
       reason: string,
-      opts?: { ownsSession?: boolean },
+      quarantineOpts?: { ownsSession?: boolean },
     ): void => {
       turnStartFailedWithoutTurnId = true;
       // currentTurnId 未必属于**这一次**失败的请求: Stop 之后下一轮 send 可能已经激活了它
       // 自己的 turn, 这时把它当孤儿收掉 = 误杀一个合法在跑的 turn(review #844 codex P1)。
       // 只有"我这一轮还拥有会话"时才动它; 否则只留孤儿守卫与缓冲清理。
-      const mayClaimActiveTurn = opts?.ownsSession !== false;
+      const mayClaimActiveTurn = quarantineOpts?.ownsSession !== false;
       if (currentTurnId && mayClaimActiveTurn) {
         const orphanTurnId = currentTurnId;
         terminalErroredTurnIds.add(orphanTurnId);
+        forgetCodexCindyMemoryWriteSlotsForTurn({
+          sessionInstanceId: opts.sessionInstanceId,
+          turnId: orphanTurnId,
+        });
         if (threadId) {
           host.request(Method.TurnInterrupt, { threadId, turnId: orphanTurnId }).catch((e2: unknown) => {
             log.warn('turn/start-failure orphan interrupt failed (best-effort)', {
@@ -11917,8 +11921,16 @@ assertRouteCurrent();
       // 集子在那时才被清。本函数的两个调用点都在各自请求 endTurnStart 之后, 所以这里的
       // size>0 只可能是**别的**请求。
       if (inFlightStarts.size === 0) {
-        for (const bufferedId of bufferedOrphanTurnIds) {
+        const bufferedIds = new Set([
+          ...bufferedOrphanTurnIds,
+          ...bufferedTurnEventQueues.keys(),
+        ]);
+        for (const bufferedId of bufferedIds) {
           terminalErroredTurnIds.add(bufferedId);
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: bufferedId,
+          });
           settleBufferedTurnReconcile(bufferedId, false);
           if (threadId) {
             host.request(Method.TurnInterrupt, { threadId, turnId: bufferedId }).catch((e2: unknown) => {
