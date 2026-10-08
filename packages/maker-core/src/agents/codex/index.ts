@@ -11536,6 +11536,10 @@ assertRouteCurrent();
       const turnId = currentTurnId;
       if (!turnId) return;
       terminalErroredTurnIds.add(turnId);
+      forgetCodexCindyMemoryWriteSlotsForTurn({
+        sessionInstanceId: opts.sessionInstanceId,
+        turnId,
+      });
       dismissPendingUserInputForTurn(turnId, 'turn_interrupted');
       clearActiveToolContextsForTurn(turnId);
       if (threadId && !skipIfStaleHost('turn/interrupt')) {
