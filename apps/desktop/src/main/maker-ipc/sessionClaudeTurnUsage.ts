@@ -26,6 +26,7 @@ import {
 } from '../usage/usageHistory.js';
 import {
   billingRouteForExplicitProvider,
+  claudeSdkCostMoney,
   buildClaudeTurnUsageDetails,
   computePriceQuoteTurnMoney,
   normalizeTurnUsageSegments,
@@ -41,7 +42,6 @@ import {
 } from '../../shared/subscriptionModels.js';
 import {
   addRegionalMoney,
-  usdToLedgerCurrency,
   type RegionalMoney,
 } from '../../shared/regionalMoney.js';
 import { currentLedgerCurrency } from '../usage/ledgerCurrency.js';
@@ -450,17 +450,22 @@ export function recordSessionClaudeTurnUsage(
           await recordUsageOnly();
           return;
         }
-        // A cumulative SDK dollar value is authoritative only for an
-        // explicitly selected provider API. Remote/unknown routing cannot
-        // be attributed to this local account and must stay usage-only.
+        // Only an explicit provider API can use this SDK value; third-party
+        // models remain estimates. Remote/unknown routing stays usage-only.
         if (route !== 'provider-api' || turnContext.accessKind === 'managed') {
           await recordUsageOnly();
           return;
         }
         const ledgerCurrency = (await getGatewayAccountCurrency()) ?? currentLedgerCurrency();
-        const money = usdToLedgerCurrency(rawDelta, ledgerCurrency);
-        recordTurnSpend(money);
-        recordSessionTurnSpend(session.id, money);
+        const money = claudeSdkCostMoney(resolvedModel, rawDelta, ledgerCurrency);
+        if (!money) {
+          await recordUsageOnly();
+          return;
+        }
+        if (money.kind === 'actual-cost') {
+          recordTurnSpend(money);
+          recordSessionTurnSpend(session.id, money);
+        }
         const changedScheduleId = await recordSchedulerTurnCost({
           sessionId: session.id,
           clientId: turnAssistantPersistId,

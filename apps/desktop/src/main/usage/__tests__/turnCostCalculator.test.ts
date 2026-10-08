@@ -6,6 +6,7 @@ import type { ModelUsageDeltaEntry } from '../modelUsageDelta';
 import { __resetActiveLedgerCurrencyForTesting, setActiveLedgerCurrency } from '../ledgerCurrency';
 import {
   billingRouteForExplicitProvider,
+  claudeSdkCostMoney,
   buildClaudeTurnUsageDetails,
   computePriceQuoteTurnMoney,
   computeGatewaySegmentedTurnCost,
@@ -608,6 +609,7 @@ describe('resolveTurnCost', () => {
       rawModel: 'deepseek-v4-pro',
       tokens: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0 },
       sdkCostDelta: 0.052635,
+      sdkSource: 'claude-code',
       pricing: catalog(
         quote('deepseek-v4-pro', 0.435, 0.87, {
           providerId: 'deepseek',
@@ -622,7 +624,7 @@ describe('resolveTurnCost', () => {
     expect(result).toEqual({
       model: 'deepseek-v4-pro',
       source: 'sdk',
-      money: { amount: 0.052635, currency: 'USD', approximate: false, kind: 'actual-cost' },
+      money: { amount: 0.052635, currency: 'USD', approximate: true, kind: 'value-estimate' },
     });
   });
 
@@ -771,6 +773,26 @@ describe('resolveTurnCost', () => {
 });
 
 describe('resolveClaudeTurnCostSinks', () => {
+  it('keeps Astra SDK estimates out of actual spend without changing the amount', () => {
+    const result = resolveClaudeTurnCostSinks(
+      [delta('gpt-6-astra', { inputTokensDelta: 98_476, outputTokensDelta: 6, costUsdDelta: 0.49253 })],
+      {},
+      PROVIDER_API,
+    );
+    expect(result.turnMoney).toBeNull();
+    expect(result.estimatedTurnMoney).toMatchObject({ amount: 0.49253, currency: 'USD', kind: 'value-estimate', approximate: true });
+    expect(result.perModel[0].source).toBe('sdk');
+    expect(result.perModel[0].money?.estimateReasons).toBeUndefined();
+  });
+
+  it('separates native Claude costs and third-party SDK estimates in a mixed turn', () => {
+    const result = resolveClaudeTurnCostSinks(
+      [delta('claude-opus-4-8', { costUsdDelta: 1 }), delta('gpt-6-astra', { costUsdDelta: 0.49253 })],
+      {}, PROVIDER_API,
+    );
+    expect(result.turnMoney).toMatchObject({ amount: 1, kind: 'actual-cost' });
+    expect(result.estimatedTurnMoney).toMatchObject({ amount: 0.49253, kind: 'value-estimate' });
+  });
   it('sums structured per-model money using one billing route', () => {
     const pricing = catalog(quote('claude-opus-4-8', 5, 25), quote('gpt-5.5', 2, 8));
     const result = resolveClaudeTurnCostSinks(
@@ -940,13 +962,29 @@ describe('resolveClaudeTurnCostSinks', () => {
     const result = resolveClaudeTurnCostSinks(
       [
         delta('claude-opus-4-8', { inputTokensDelta: 1_000_000 }),
-        delta('other-model', { costUsdDelta: 2 }),
+        delta('claude-sonnet-4-6', { costUsdDelta: 2 }),
       ],
       pricing,
       PROVIDER_API,
     );
     expect(result.turnMoney).toMatchObject({ amount: 2, kind: 'actual-cost' });
     expect(result.estimatedTurnMoney).toMatchObject({ amount: 5, kind: 'value-estimate' });
+  });
+});
+
+describe('claudeSdkCostMoney', () => {
+  it('does not reclassify SDK costs from other harnesses', () => {
+    const result = resolveTurnCost({ rawModel: 'gpt-6-astra', tokens: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreateTokens: 0 }, sdkCostDelta: 0.49253, pricing: {}, context: PROVIDER_API });
+    expect(result.money).toMatchObject({ amount: 0.49253, kind: 'actual-cost', approximate: false });
+  });
+
+  it.each([0, -1, NaN, Infinity, -Infinity])('rejects invalid or empty SDK amount %s', (amount) => {
+    expect(claudeSdkCostMoney('gpt-6-astra', amount, 'USD')).toBeNull();
+  });
+
+  it('preserves ledger FX and normalizes native Claude model names', () => {
+    expect(claudeSdkCostMoney('gpt-6-astra', 1, 'CNY')).toMatchObject({ amount: 6.7, currency: 'CNY', kind: 'value-estimate', approximate: true });
+    expect(claudeSdkCostMoney('claude-opus-4-8[1m]', 1, 'USD')).toEqual({ amount: 1, currency: 'USD', kind: 'actual-cost', approximate: false });
   });
 });
 

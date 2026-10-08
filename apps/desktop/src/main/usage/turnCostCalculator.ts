@@ -272,10 +272,24 @@ export function computePriceQuoteTurnMoney(
   return price.source === 'gateway' ? money : toLedgerCurrency(money, ledgerCurrency);
 }
 
+/** Claude SDK cannot attest a third-party provider's bill. */
+export function claudeSdkCostMoney(
+  rawModel: string,
+  amount: number,
+  ledgerCurrency: MoneyCurrency,
+): RegionalMoney | null {
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const money = usdToLedgerCurrency(amount, ledgerCurrency);
+  return isAnthropicModel(normalizeModelIdForPricing(rawModel))
+    ? money
+    : { ...money, kind: 'value-estimate', approximate: true };
+}
+
 export function resolveTurnCost(args: {
   rawModel: string;
   tokens: TurnTokenDeltas;
   sdkCostDelta?: number;
+  sdkSource?: 'claude-code';
   pricing: ModelPricingCatalog | null | undefined;
   context: TurnPricingContext;
   segments?: readonly TurnUsageSegment[];
@@ -353,9 +367,14 @@ export function resolveTurnCost(args: {
 
   // 其它第三方供应商 / 未知路由:SDK 值是 USD 口径,投影到账本币种而不是构建区域,
   // 否则 USD 结算账号上这些花费会变成 CNY 并被账本守卫丢弃。
-  const sdkAmount = Math.max(0, sdkCostDelta ?? 0);
-  if (context.billingRoute === 'provider-api' && sdkAmount > 0) {
-    return { model, money: usdToLedgerCurrency(sdkAmount, ledgerCurrency), source: 'sdk' };
+  const sdkAmount = sdkCostDelta ?? 0;
+  const sdkMoney = args.sdkSource === 'claude-code'
+    ? claudeSdkCostMoney(model, sdkAmount, ledgerCurrency)
+    : Number.isFinite(sdkAmount) && sdkAmount > 0
+      ? usdToLedgerCurrency(sdkAmount, ledgerCurrency)
+      : null;
+  if (context.billingRoute === 'provider-api' && sdkMoney) {
+    return { model, money: sdkMoney, source: 'sdk' };
   }
   return {
     model,
@@ -495,6 +514,7 @@ export function resolveClaudeTurnCostSinks(
       rawModel: delta.model,
       tokens,
       sdkCostDelta: delta.costUsdDelta,
+      sdkSource: 'claude-code',
       pricing,
       context,
       segments: delta.segments,
