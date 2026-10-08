@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as os from 'node:os';
@@ -33,6 +33,10 @@ import {
   validateBundledWindowsUpdaterRuntime,
   windowsUpdaterRuntimeExtraResourceForTarget,
 } from './src/main/windowsUpdaterPrerequisites';
+import {
+  PINNED_UPSTREAM_COMMIT,
+  resolvePinnedUpstreamTag,
+} from './src/main/cindySourceMetadata';
 
 const _require = createRequire(__filename);
 const DESKTOP_PACKAGE_VERSION = (_require('./package.json') as { version: string }).version;
@@ -44,6 +48,40 @@ function resolveSourceCommit(): string {
   } catch {
     return '';
   }
+}
+
+function gitText(args: string[]): string | null {
+  try {
+    const value = execFileSync('git', args, {
+      cwd: __dirname,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+function gitOk(args: string[]): boolean {
+  try {
+    execFileSync('git', args, {
+      cwd: __dirname,
+      stdio: 'ignore',
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolvePinnedUpstreamTagFromEnv(): string | undefined {
+  return resolvePinnedUpstreamTag({
+    tag: process.env.CINDY_UPSTREAM_TAG,
+    expectedCommit: PINNED_UPSTREAM_COMMIT,
+    resolveTagCommit: (tag) => gitText(['rev-parse', `${tag}^{commit}`]),
+    isAncestor: (commit) => gitOk(['merge-base', '--is-ancestor', commit, 'HEAD']),
+  });
 }
 
 function formatLocalBuildTime(date = new Date()): string {
@@ -69,13 +107,21 @@ function formatLocalBuildTime(date = new Date()): string {
 function stageCindySourceMetadata(): void {
   const sourceCommit = resolveSourceCommit();
   const builtAt = formatLocalBuildTime();
+  const upstreamTag = resolvePinnedUpstreamTagFromEnv();
+  const metadata = {
+    sourceCommit,
+    builtAt,
+    ...(upstreamTag ? { upstreamTag } : {}),
+  };
   fs.writeFileSync(
     CINDY_SOURCE_METADATA_PATH,
-    `${JSON.stringify({ sourceCommit, builtAt }, null, 2)}\n`,
+    `${JSON.stringify(metadata, null, 2)}\n`,
     'utf8',
   );
   console.log(
-    `[forge:prePackage] staged Cindy source metadata (${sourceCommit || 'unknown commit'})`,
+    `[forge:prePackage] staged Cindy source metadata (${sourceCommit || 'unknown commit'}${
+      upstreamTag ? `, ${upstreamTag}` : ''
+    })`,
   );
 }
 

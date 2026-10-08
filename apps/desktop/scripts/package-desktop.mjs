@@ -147,7 +147,28 @@ function verifyPackagedSourceMetadata({ appName, platform, arch, expectedCommit 
       `packaged Cindy source metadata commit mismatch: expected ${expectedCommit}, got ${metadata.sourceCommit}`,
     );
   }
-  console.log(`    verified packaged source metadata: ${metadata.sourceCommit}`);
+  const expectedTag = process.env.CINDY_UPSTREAM_TAG?.trim();
+  if (expectedTag) {
+    if (metadata.upstreamTag !== expectedTag) {
+      throw new Error(
+        `packaged Cindy source metadata upstreamTag mismatch: expected ${expectedTag}, got ${metadata.upstreamTag ?? '<missing>'}`,
+      );
+    }
+    if (!/^v\d+\.\d+\.\d+(?:-beta(?:\.[0-9A-Za-z.-]+)?)?$/.test(metadata.upstreamTag)) {
+      throw new Error(
+        `packaged Cindy source metadata has invalid upstreamTag: ${metadata.upstreamTag}`,
+      );
+    }
+  } else if (metadata.upstreamTag !== undefined) {
+    throw new Error(
+      `packaged Cindy source metadata has unexpected upstreamTag without CINDY_UPSTREAM_TAG: ${metadata.upstreamTag}`,
+    );
+  }
+  console.log(
+    `    verified packaged source metadata: ${metadata.sourceCommit}${
+      metadata.upstreamTag ? ` ${metadata.upstreamTag}` : ''
+    }`,
+  );
 }
 
 // ── CDN 基线(仅 --version major/minor/patch 时调用,只读)─────────────────────

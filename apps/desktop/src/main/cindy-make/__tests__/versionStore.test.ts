@@ -187,6 +187,19 @@ describe('local Cindy version snapshots', () => {
     });
     expect(listPersonalVersions(h.userData, h.original)).toHaveLength(1);
   });
+  it('retains a snapshot when cindy-source.json also carries an unused upstreamTag', async () => {
+    const h = await fixture();
+    await writeFile(
+      path.join(h.resources, 'cindy-source.json'),
+      JSON.stringify({
+        sourceCommit: h.commit,
+        builtAt: h.builtAt,
+        upstreamTag: 'v0.1.97',
+      }),
+    );
+    const id = (await h.retain())!;
+    expect(id).toMatch(/^[a-f0-9-]{36}$/);
+  });
   it('adopts only the newest legacy application and never resurrects it after explicit deletion', async () => {
     const h = await fixture();
     const first = (await h.retain())!;

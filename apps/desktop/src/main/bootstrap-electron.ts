@@ -46,6 +46,11 @@ import {
 } from './localDb/ipc/sessions';
 import { tryGetDbClient } from './localDb/client/current';
 import {
+  formatAppDisplayVersionInfo,
+  parseCindySourceMetadata,
+  type AppDisplayVersionInfo,
+} from './cindySourceMetadata.js';
+import {
   app,
   BrowserWindow,
   clipboard,
@@ -219,29 +224,37 @@ function readGitText(args: string[]): string | null {
   }
 }
 
-interface AppDisplayVersionInfo {
-  display: string;
-  detail: string;
+function readPackagedCindySourceMetadata(): import('./cindySourceMetadata.js').CindySourceMetadata | null {
+  try {
+    const raw = fs.readFileSync(path.join(process.resourcesPath, 'cindy-source.json'), 'utf8');
+    if (raw.length > 16 * 1024) return null;
+    return parseCindySourceMetadata(JSON.parse(raw));
+  } catch {
+    return null;
+  }
 }
 
 function getAppDisplayVersionInfo(): AppDisplayVersionInfo {
   const version = app.getVersion();
-  if (app.isPackaged) {
-    return {
-      display: version,
-      detail: version,
-    };
+  try {
+    if (!app.isPackaged) {
+      const branch = readGitText(['branch', '--show-current']);
+      const sha = readGitText(['rev-parse', '--short=7', 'HEAD']);
+      return formatAppDisplayVersionInfo({
+        packaged: false,
+        version,
+        metadata: null,
+        unpackagedLabel: branch && sha ? `${branch}@${sha}` : sha,
+      });
+    }
+    return formatAppDisplayVersionInfo({
+      packaged: true,
+      version,
+      metadata: readPackagedCindySourceMetadata(),
+    });
+  } catch {
+    return { display: version, detail: version };
   }
-
-  const branch = readGitText(['branch', '--show-current']);
-  const sha = readGitText(['rev-parse', '--short=7', 'HEAD']);
-  const current = branch && sha ? `${branch}@${sha}` : sha;
-  const display = current ? `${version} · ${current}` : version;
-
-  return {
-    display,
-    detail: display,
-  };
 }
 
 import {
