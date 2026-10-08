@@ -16,10 +16,27 @@
 
 import { z } from 'zod';
 
-import { withStore } from './_shared.js';
+import { isXdtWriteNotApplicable, withStore, xdtWriteForbiddenResult } from './_shared.js';
 import type { MemoryMcpDeps } from '../types.js';
-import type { MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
-import type { WriteOptions } from '@cindy/maker-core';
+import type { MemoryToolCallExtra, MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
+import {
+  peekCodexCindyMemoryWriteSlot,
+  type WriteOptions,
+} from '@cindy/maker-core';
+import { classifyMemoryLane } from './resolve-store.js';
+
+const FACADE_RESERVED_ARG_KEYS = new Set([
+  'invocationId',
+  'capability',
+  'capabilityMac',
+  'facadeOperationId',
+  'sessionInstanceId',
+  'preparedMemorySessionId',
+  'capabilityKind',
+  'issuer',
+  'nonce',
+  'callId',
+]);
 
 export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: MemoryMcpDeps): void {
   registry.register({
@@ -50,12 +67,75 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       body: z.string().min(1),
       mode: z.enum(['create', 'update', 'append']).optional(),
     },
-    handler: async (args) => {
-      const saved = deps.beginWrite?.(deps.getSessionContext?.());
-      const result = await withStore(deps, (store) => store.write(args as WriteOptions));
-      if (!result.isError) saved?.({ key: `${args.type}_${args.name}.md`, title: args.title as string,
-        action: args.mode === 'update' || args.mode === 'append' ? 'updated' : 'created' });
-      return result;
+    handler: async (args, extra?: MemoryToolCallExtra) => {
+      const writeInternal = async () => {
+        const saved = deps.beginWrite?.(deps.getSessionContext?.());
+        const result = await withStore(deps, (store) => store.write(args as WriteOptions));
+        if (!result.isError) {
+          saved?.({
+            key: `${args.type}_${args.name}.md`,
+            title: args.title as string,
+            action: args.mode === 'update' || args.mode === 'append' ? 'updated' : 'created',
+          });
+        }
+        return result;
+      };
+      const ctx = deps.getSessionContext?.();
+      const lane = classifyMemoryLane(ctx);
+      const mode = args.mode ?? 'create';
+      const facadeEligible =
+        (ctx?.agentKind === 'claude-code' || ctx?.agentKind === 'codex')
+        && (mode === 'create' || mode === 'update')
+        && Boolean(deps.executeXdtFacadeWrite)
+        && (lane === 'xdt' || lane === 'internal');
+      if (!facadeEligible) {
+        if (lane === 'xdt') {
+          return xdtWriteForbiddenResult();
+        }
+        return writeInternal();
+      }
+      if (!ctx) {
+        return xdtWriteForbiddenResult();
+      }
+      if (Object.keys(args).some((key) => FACADE_RESERVED_ARG_KEYS.has(key))) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              ok: false,
+              errorCode: 'INVALID_ARGS',
+              message: 'model-reported invocation identity is forbidden',
+            }),
+          }],
+          isError: true,
+        };
+      }
+      const slot = ctx.agentKind === 'codex'
+        ? peekCodexCindyMemoryWriteSlot(ctx.sessionInstanceId)
+        : undefined;
+      const callId = ctx.agentKind === 'codex'
+        ? (slot && slot.sessionId === ctx.sessionId ? slot.itemId : undefined)
+        : extra?.requestId;
+      if (!callId || !deps.executeXdtFacadeWrite) {
+        return xdtWriteForbiddenResult();
+      }
+      const facade = await deps.executeXdtFacadeWrite({
+        args: {
+          type: args.type,
+          name: args.name,
+          title: args.title,
+          description: args.description,
+          body: args.body,
+          mode,
+        },
+        callId,
+        mcpSessionId: extra?.mcpSessionId,
+        sessionContext: ctx,
+      });
+      if (lane === 'internal' && isXdtWriteNotApplicable(facade)) {
+        return writeInternal();
+      }
+      return facade;
     },
   });
 }

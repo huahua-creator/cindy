@@ -61,6 +61,7 @@ import type { AgentRuntimeConfig } from '../interfaces/runtime-config.js';
 import type { Logger } from '../interfaces/logger.js';
 import type { McpProvider } from '../interfaces/mcp-provider.js';
 import type { MakerMemoryManager } from '../memory/manager.js';
+import type { PreparedMemorySession, XdtMemoryBindingV1 } from '../memory/xdt-binding.js';
 import type {
   CodexModelListItem,
   DynamicToolCallParams,
@@ -120,6 +121,8 @@ export interface CodexMcpThreadContextArgs {
    */
   remoteHostId?: string;
   vendorOptions: Record<string, unknown>;
+  memoryBinding?: XdtMemoryBindingV1;
+  preparedMemorySessionId?: string;
 }
 
 export interface CodexHostDynamicToolContext {
@@ -382,6 +385,8 @@ export interface PiExtraSpawnConfigContext {
   mcpCallerAttested?: boolean;
   /** SSH remote 会话的 host id;host 据此把 bridge URL 改成 remote-forward 地址。 */
   remoteHostId?: string | null;
+  memoryBinding?: XdtMemoryBindingV1;
+  preparedMemorySessionId?: string;
 }
 
 export type CodexSubagentRoutingProfile = 'default' | 'configured' | 'oauth-default' | 'smart';
@@ -1896,6 +1901,11 @@ export interface StartSessionOptions {
    * can observe different memory generations.
    */
   makerMemoryIndexSnapshot?: string;
+  /**
+   * Host-frozen xdt fixture binding. 仅第 2 路 prepareMemorySession 成功后注入。
+   * 现网 internal 不得签发 InternalMemoryBindingV1。
+   */
+  preparedMemorySession?: PreparedMemorySession;
   /**
    * Host-owned Cindy Review policy. This is not a user permission preset:
    * adapters must keep the session local, fresh, memory-free and hard

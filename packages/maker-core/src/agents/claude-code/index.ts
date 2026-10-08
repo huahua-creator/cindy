@@ -74,8 +74,14 @@ import {
 } from '../base-agent.js';
 import { preparePinnedClaudeSkillInvocation } from './pinned-skill-invocation.js';
 import { isBotMcpServerAllowed } from '../shared/bot-runtime-policy.js';
+import {
+  forgetLiveClaudeMcpContext,
+  getLiveClaudeMcpContext,
+  rememberLiveClaudeMcpContext,
+} from './live-mcp-context.js';
 import { SYSTEM_PROMPT_APPEND as MAKER_SYSTEM_PROMPT_APPEND } from './system-prompt-append.js';
 import { MAKER_MEMORY_RULES } from '../../memory/system-prompt.js';
+import { isXdtMemoryBinding } from '../../memory/xdt-binding.js';
 import {
   CONTACTS_RULES_DISABLED,
   CONTACTS_RULES_ENABLED,
@@ -1658,11 +1664,14 @@ export class ClaudeCodeAgent extends BaseAgent {
           });
     // opts.makerMemoryEnabled 优先 (per-session, renderer 透传); fallback 到 runtimeConfig
     // (host 静态配置, 一般 undefined)。manager 没注入视为禁用。
+    const preparedMemory = opts.preparedMemorySession;
     const makerMemoryFlag = reviewMode
       ? false
-      : opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false;
+      : preparedMemory
+        ? true
+        : opts.makerMemoryEnabled ?? this.deps.runtimeConfig.makerMemoryEnabled ?? false;
     const makerMemory = this.deps.makerMemory;
-    const makerMemoryEnabled = makerMemoryFlag === true && !!makerMemory;
+    const makerMemoryEnabled = makerMemoryFlag === true && (!!makerMemory || !!preparedMemory);
     // SSH remote 的 workingDir 是远端路径 — store 定位统一经 scope key;
     // 本地会话额外做 git worktree 归一化 (#2379)。已注入的 makerMemoryScopeKey
     // (含 bot:) 原样透传。Maker Memory 关闭时跳过 git 探测 (Codex #2399 P1):
@@ -1671,13 +1680,23 @@ export class ClaudeCodeAgent extends BaseAgent {
       ? (opts.makerMemoryScopeKey ?? (await resolveMemoryScopeKey(opts.workingDir, opts.remoteHostId)))
       : (opts.makerMemoryScopeKey ?? opts.workingDir);
     // This per-session injection flag must not mutate the shared manager.
-    if (makerMemoryEnabled && makerMemory) {
+    if (makerMemoryEnabled) {
       try {
-        const store = await makerMemory.getStore(memoryScopeKey);
-        makerMemoryRules = opts.makerMemoryScopeKey?.startsWith('bot:')
-          ? ''
-          : MAKER_MEMORY_RULES;
-        makerMemoryIndex = opts.makerMemoryIndexSnapshot ?? await store.getIndex();
+        if (preparedMemory) {
+          if (!isXdtMemoryBinding(preparedMemory.binding)) {
+            throw new Error('PreparedMemorySession.binding must be XdtMemoryBindingV1');
+          }
+          makerMemoryRules = MAKER_MEMORY_RULES;
+          makerMemoryIndex = preparedMemory.indexSnapshot.content;
+        } else if (makerMemory) {
+          const store = await makerMemory.getStore(memoryScopeKey);
+          makerMemoryRules = opts.makerMemoryScopeKey?.startsWith('bot:')
+            ? ''
+            : MAKER_MEMORY_RULES;
+          makerMemoryIndex = opts.makerMemoryIndexSnapshot ?? await store.getIndex();
+        } else {
+          throw new Error('maker memory enabled without manager or prepared session');
+        }
         memoryFlushController = new MemoryFlushController({
           logger: log.child('memory-flush'),
           workdir: memoryScopeKey,
@@ -1688,6 +1707,7 @@ export class ClaudeCodeAgent extends BaseAgent {
           indexBytes: makerMemoryIndex.length,
         });
       } catch (e) {
+        if (preparedMemory) throw e;
         log.warn('maker memory load failed at session start (skipping injection)', {
           error: String(e),
         });
@@ -1783,22 +1803,34 @@ export class ClaudeCodeAgent extends BaseAgent {
         nonHarnessMcpServerNames = hostMcpServerNames;
         return undefined;
       }
-      const context: McpProviderContext = {
+      const sessionId = opts.sessionId;
+      const existing = sessionId ? getLiveClaudeMcpContext(sessionId) : undefined;
+      const context: McpProviderContext = existing ?? {
         agentKind: 'claude-code' as const,
         workingDir: opts.workingDir,
         ...((makerMemoryEnabled || opts.makerMemoryScopeKey) ? { memoryScopeKey } : {}),
         vendorOptions: vo,
+        ...(preparedMemory
+          ? {
+              memoryBinding: preparedMemory.binding,
+              preparedMemorySessionId: preparedMemory.preparedMemorySessionId,
+              preparedMemorySession: preparedMemory,
+            }
+          : {}),
         // business sessionId 由 maker.createSession 通过 opts.sessionId 注入
         // (见 maker.ts: agent.startSession({...opts, sessionId: id}))。MCP server
         // 工厂闭包绑定此值, 控制类工具 (如 start_team / create_worker) 用它把回调路由
         // 到对应 session 的业务函数。host 直接调 startSession 而没透 sessionId
         // 时此处为 undefined, 工具按"无 session 绑定"语义处理。
-        sessionId: opts.sessionId,
+        sessionId,
         mcpCallerKind: 'root',
         mcpCallerAttested: true,
         ...(opts.sessionInstanceId ? { sessionInstanceId: opts.sessionInstanceId } : {}),
-        getSessionContext: () => context,
       };
+      if (!existing) {
+        context.getSessionContext = () => context;
+        if (sessionId) rememberLiveClaudeMcpContext(sessionId, context);
+      }
       // null-prototype: server 名来自用户可控的自定义 MCP id, 而 id 正则允许下划线,
       // `__proto__` 是合法 id。用普通 `{}` 时 `out['__proto__'] = config` 命中的是原型
       // 访问器 —— 不产生自有属性(hasOwnProperty / Object.keys 都看不见, 去重与归属判定
@@ -6855,6 +6887,7 @@ export class ClaudeCodeAgent extends BaseAgent {
 
       async close() {
         if (closed) return;
+        if (opts.sessionId) forgetLiveClaudeMcpContext(opts.sessionId);
         // Closing/dead sessions settle through Session status (or their queued
         // terminal event), never through the successful task-stop path.
         resetClaudeGenerationTiming(runtimeState.generation);
@@ -6893,6 +6926,7 @@ export class ClaudeCodeAgent extends BaseAgent {
         ? {
             async detach() {
               if (closed) return;
+              if (opts.sessionId) forgetLiveClaudeMcpContext(opts.sessionId);
               resetClaudeGenerationTiming(runtimeState.generation);
               discardActiveContinuation('session_detached', true);
               clearUpstreamResponseIdle();

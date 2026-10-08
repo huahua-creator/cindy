@@ -36,6 +36,7 @@ import {
   registerMemoryWriteTool,
   registerSessionSearchTool,
 } from './memory/index.js';
+import { normalizeMcpRequestId } from './memory/mcp-request-id.js';
 import type { MemoryMcpDeps } from './types.js';
 
 // ── Entry-tool descriptions (内嵌, 跟 scheduler 同模式) ─────────────────────
@@ -112,7 +113,18 @@ function registerCallToolEntry(server: McpServer, registry: MemoryToolRegistry, 
       name: z.string().describe('工具名, 从 list_tools 获取 (e.g. memory_write / memory_search)'),
       args: jsonObjectArg('工具参数 JSON; 不确定 schema 可先传 {} 触发反馈'),
     },
-    async ({ name, args }) => withAccountDataAccess(deps.withAccountDataAccess, deps.getSessionContext?.().sessionId, async () => registry.call(name, args)),
+    async ({ name, args }, extra) => {
+      const requestId = normalizeMcpRequestId(extra?.requestId);
+      const mcpSessionId = typeof extra?.sessionId === 'string' && extra.sessionId.trim()
+        ? extra.sessionId.trim()
+        : undefined;
+      return withAccountDataAccess(deps.withAccountDataAccess, deps.getSessionContext?.().sessionId, async () => {
+        if (!requestId) {
+          return registry.call(name, args);
+        }
+        return registry.call(name, args, { requestId, mcpSessionId });
+      });
+    },
   );
 }
 

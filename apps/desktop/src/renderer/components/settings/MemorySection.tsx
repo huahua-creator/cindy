@@ -12,7 +12,7 @@
  * 跟 UserPromptSection 同视觉栈 (settings-* css var token), Memory 主标题用同
  * 的 16/medium, 卡片 bg/border 用 settings-theme-card-* token。
  */
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { RotateCcw, Sparkles } from 'lucide-react';
 
@@ -25,6 +25,8 @@ import { CodexMark } from '@/components/icons/CodexMark';
 import { PiMark } from '@/components/icons/PiMark';
 import { createLogger } from '@/lib/logger';
 import { useMemorySettings } from '@/hooks/useMemorySettings';
+import { extractIpcError } from '@/utils/ipcError';
+import { getLastWorkingDir, subscribeToLastWorkingDir } from '@/state/lastWorkingDir';
 import { DefaultOverrideControls } from './DefaultOverrideControls';
 
 const log = createLogger('MemorySection');
@@ -65,9 +67,20 @@ interface MemorySlotState {
 
 const INITIAL: MemorySlotState = { enabled: undefined, pending: false };
 
+type WorkspaceIdentityStatus = 'missing' | 'bound' | 'unknown';
+
 export function MemorySection() {
   const { confirm } = useConfirmDialog();
   const { t } = useTranslation();
+  const lastWorkingDir = useSyncExternalStore(
+    subscribeToLastWorkingDir,
+    getLastWorkingDir,
+    getLastWorkingDir,
+  );
+  const [identityStatus, setIdentityStatus] = useState<WorkspaceIdentityStatus>('unknown');
+  const [identityId, setIdentityId] = useState<string | null>(null);
+  const [identityDigest, setIdentityDigest] = useState<string | null>(null);
+  const [identityPending, setIdentityPending] = useState(false);
   // Maker Memory 启用时，下方 Claude Code / Codex 运行时的原生 toggle 强制 disable + 视觉变灰。
   // (manager.enable() 在 maker-core 层会自动调 setMemory(false), 这里 UI 防止用户
   // 在状态不同步的窗口里点击 toggle 引发误解)。
@@ -270,6 +283,67 @@ export function MemorySection() {
     [confirm, t],
   );
 
+  const reloadIdentity = useCallback(async () => {
+    if (!lastWorkingDir) {
+      setIdentityStatus('unknown');
+      setIdentityId(null);
+      setIdentityDigest(null);
+      return;
+    }
+    try {
+      const result = await window.electronAPI.maker.workspaceIdentityLookup({
+        absDir: lastWorkingDir,
+      });
+      if (result.status === 'bound') {
+        setIdentityStatus('bound');
+        setIdentityId(result.canonicalWorkspaceId ?? null);
+        setIdentityDigest(result.locatorDigest ?? null);
+      } else {
+        setIdentityStatus('missing');
+        setIdentityId(null);
+        setIdentityDigest(null);
+      }
+    } catch (err) {
+      log.warn('workspaceIdentityLookup failed', err);
+      setIdentityStatus('unknown');
+    }
+  }, [lastWorkingDir]);
+
+  useEffect(() => {
+    void reloadIdentity();
+  }, [reloadIdentity]);
+
+  const handleRegisterDirectory = useCallback(async () => {
+    if (!lastWorkingDir) return;
+    const ok = await confirm({
+      title: t('settings.memory.workspaceIdentity.confirm.title'),
+      description: t('settings.memory.workspaceIdentity.confirm.description'),
+      confirmText: t('settings.memory.workspaceIdentity.confirm.confirm'),
+      cancelText: t('settings.memory.workspaceIdentity.confirm.cancel'),
+    });
+    if (!ok) return;
+    setIdentityPending(true);
+    try {
+      const result = await window.electronAPI.maker.workspaceIdentityCreate({
+        absDir: lastWorkingDir,
+        confirmed: true,
+      });
+      setIdentityStatus('bound');
+      setIdentityId(result.canonicalWorkspaceId);
+      setIdentityDigest(result.locatorDigest);
+      toast.success(t('settings.memory.workspaceIdentity.toast.registered'));
+    } catch (err) {
+      log.warn('workspaceIdentityCreate failed', err);
+      const ipc = extractIpcError(err);
+      const key = ipc
+        ? `settings.memory.workspaceIdentity.ipcError.${ipc.code}`
+        : 'settings.memory.workspaceIdentity.toast.registerFailed';
+      toast.error(t(key, { defaultValue: t('settings.memory.workspaceIdentity.toast.registerFailed') }));
+    } finally {
+      setIdentityPending(false);
+    }
+  }, [confirm, lastWorkingDir, t]);
+
   return (
     <div className="flex flex-col gap-[14px]">
       <div className="flex flex-col gap-1">
@@ -405,6 +479,58 @@ export function MemorySection() {
             </div>
           );
         })}
+      </div>
+
+      <div
+        className={cn(
+          'flex flex-col overflow-hidden rounded-xl',
+          'bg-[var(--settings-theme-card-bg)]',
+          'border border-[var(--settings-theme-card-border)]',
+        )}
+      >
+        <div className="flex items-start justify-between gap-3 px-4 py-[14px]">
+          <div className="flex min-w-0 flex-col gap-[8px]">
+            <p className="text-14 font-medium leading-none text-[var(--settings-section-title)]">
+              {t('settings.memory.workspaceIdentity.label')}
+            </p>
+            <p className="text-12 leading-[1.4] text-[var(--settings-section-desc)]">
+              {t('settings.memory.workspaceIdentity.description')}
+            </p>
+            {lastWorkingDir ? (
+              <p className="break-all text-12 leading-[1.4] text-[var(--settings-section-title)]">
+                {lastWorkingDir}
+              </p>
+            ) : (
+              <p className="text-12 leading-[1.4] text-[var(--settings-section-desc)]">
+                {t('settings.memory.workspaceIdentity.noDirectory')}
+              </p>
+            )}
+            <p className="text-12 leading-none text-[var(--settings-section-desc)]">
+              {identityStatus === 'bound'
+                ? t('settings.memory.workspaceIdentity.statusBound', {
+                    id: identityId ?? '',
+                    digest: identityDigest ? identityDigest.slice(0, 12) : '',
+                  })
+                : identityStatus === 'missing'
+                  ? t('settings.memory.workspaceIdentity.statusMissing')
+                  : t('settings.memory.workspaceIdentity.statusUnknown')}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleRegisterDirectory()}
+            disabled={!lastWorkingDir || identityPending || identityStatus === 'bound'}
+            className={cn(
+              'h-[30px] shrink-0 rounded-full px-3',
+              'text-12 font-medium',
+              'bg-[var(--settings-input-bg)] text-[var(--settings-section-title)]',
+              'hover:opacity-90',
+              'disabled:cursor-not-allowed disabled:opacity-40',
+            )}
+          >
+            {t('settings.memory.workspaceIdentity.register')}
+          </button>
+        </div>
       </div>
     </div>
   );

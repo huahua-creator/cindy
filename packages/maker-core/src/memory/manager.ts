@@ -196,6 +196,11 @@ export class MakerMemoryManager {
    * 同时关闭该集合, 保证 reset 扫描前无任何 open 句柄。
    */
   private readonly openingStores = new Map<Database.Database, boolean>();
+  /**
+   * xdt prepared session scopes. manager.write 对 xdt scope 必须红，不能 non-fatal warn。
+   * 仅 Host fixture 登记；不得把现网 internal workdir 放进来。
+   */
+  private readonly xdtReadOnlyScopes = new Set<string>();
 
   constructor(private readonly deps: MakerMemoryManagerDeps) {
     this.enabled = deps.initialEnabled ?? false;
@@ -924,8 +929,16 @@ export class MakerMemoryManager {
     return { suggestions };
   }
 
+  /** Host fixture 把 xdt prepared session 的 scope 登记为只读。 */
+  markXdtReadOnlyScope(absWorkdir: string): void {
+    this.xdtReadOnlyScopes.add(absWorkdir);
+  }
+
   /** 直接给 store 一个 write 入口. mcp-server 层会拿这个 (而不是先 getStore 再 write) */
   async write(absWorkdir: string, opts: WriteOptions) {
+    if (this.xdtReadOnlyScopes.has(absWorkdir)) {
+      throw new MemoryError('not-ready', 'xdt prepared session forbids manager.write');
+    }
     const store = await this.getStore(absWorkdir);
     return store.write(opts);
   }

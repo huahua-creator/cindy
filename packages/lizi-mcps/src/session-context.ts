@@ -23,6 +23,10 @@ function withoutSessionAttribution<T extends LiziMcpSessionContext>(fallback: T)
     sessionInstanceId: undefined,
     remoteHostId: undefined,
     vendorOptions: undefined,
+    memoryBinding: undefined,
+    preparedMemorySessionId: undefined,
+    preparedMemorySession: undefined,
+    memoryProviderRequested: undefined,
   };
 }
 

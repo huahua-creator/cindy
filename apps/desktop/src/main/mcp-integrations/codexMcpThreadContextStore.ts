@@ -27,7 +27,9 @@ export function isSameCodexMcpSessionContext(
     left.agentKind === right.agentKind &&
     left.workingDir === right.workingDir &&
     left.remoteHostId === right.remoteHostId &&
-    isDeepStrictEqual(left.vendorOptions, right.vendorOptions)
+    left.preparedMemorySessionId === right.preparedMemorySessionId &&
+    isDeepStrictEqual(left.vendorOptions, right.vendorOptions) &&
+    isDeepStrictEqual(left.memoryBinding, right.memoryBinding)
   );
 }
 

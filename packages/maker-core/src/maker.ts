@@ -651,6 +651,11 @@ export class Maker {
         this.pendingLifecycleCloses.delete(cleanup);
       });
     };
+    // 段 5：prepareStartOptions 之前先铸 sessionInstanceId。prepare 的 native
+    // proof 与 agent.startSession / Session.instanceId 必须是同一个 UUID v4。
+    // 钩子后再铸第二个 id = proof 错绑。
+    const sessionInstanceId = generateSessionId();
+    startOpts.sessionInstanceId = sessionInstanceId;
     if (this.lifecycleHooks.prepareStartOptions) {
       try {
         await this.lifecycleHooks.prepareStartOptions(id, startOpts);
@@ -695,9 +700,8 @@ export class Maker {
     // provider ctx 时塞到 ctx.sessionId 上 (claude-code/index.ts buildMcpServers)。
     // MCP server 工厂据此闭包绑定 "我属于哪个 session", 控制类工具 (如
     // start_team / create_worker) 需要它把回调路由到对应 session 的业务函数。
-    // business id 在 close/rebuild 后会复用；另铸一个只活在本次内存实例里的
-    // 代号，让迟到的旧 MCP 请求不能借用新 Session 的权限状态。
-    const sessionInstanceId = generateSessionId();
+    // sessionInstanceId 已在 prepareStartOptions 之前铸好并写入 startOpts，
+    // startSession 必须用同一个 id，不得覆盖成另一个。
     let codexThreadClaim: CodexThreadClaimLease | null = null;
     let handle: AgentSessionHandle;
     let agentStartAttempted = false;

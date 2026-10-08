@@ -37,6 +37,11 @@ export interface MakerSessionCreateOpts extends CreateSessionOptions {
    */
   makerMemoryEnabled?: boolean;
   /**
+   * Host-frozen xdt fixture session。仅第 2 路 prepareAndRemember 成功后注入。
+   * 现网 internal 不得签发 InternalMemoryBindingV1。
+   */
+  preparedMemorySession?: import('@cindy/maker-core').PreparedMemorySession;
+  /**
    * 附加只读引用目录列表。Claude 透传到 SDK additionalDirectories；
    * Codex 透传到 app-server runtimeWorkspaceRoots + 只读 permission profile。
    * main 端仍统一校验，防 IPC 直调 / 老 DB 残留 / bug 数据。

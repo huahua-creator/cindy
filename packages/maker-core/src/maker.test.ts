@@ -618,6 +618,37 @@ describe('Maker session creation singleflight', () => {
     expect(second.instanceId).not.toBe(first.instanceId);
   });
 
+  it('mints sessionInstanceId before prepareStartOptions and reuses it for startSession and Session.instanceId', async () => {
+    const seen: string[] = [];
+    const startSession = vi.fn(async (opts: CreateSessionOptions) => {
+      seen.push(opts.sessionInstanceId ?? '');
+      return createHandle({ id: 'thread-instance' });
+    });
+    const maker = new Maker({
+      agents: { 'claude-code': createAgent(startSession, 'claude-code') },
+      storage: createStorage(),
+      logger: createLogger(),
+      lifecycleHooks: {
+        prepareStartOptions: async (_sessionId, opts) => {
+          expect(opts.sessionInstanceId).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          );
+          seen.push(opts.sessionInstanceId ?? '');
+        },
+      },
+    });
+    const session = await maker.createSession({
+      id: 'session-instance-align',
+      agentKind: 'claude-code',
+      workingDir: '/repo',
+      model: 'claude-sonnet-4-5',
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBe(seen[1]);
+    expect(session.instanceId).toBe(seen[0]);
+    expect(startSession.mock.calls[0]?.[0].sessionInstanceId).toBe(session.instanceId);
+  });
+
   it('shares one startup when the same business session is restored concurrently', async () => {
     let resolveStart!: (handle: AgentSessionHandle) => void;
     const startPending = new Promise<AgentSessionHandle>((resolve) => {
@@ -4319,5 +4350,65 @@ describe('Maker invalid-resume persistence bridge', () => {
     );
     expect(persistedSdkSessionIds).toEqual(['sdk-old', 'sdk-fresh']);
     await maker.closeSession('session-1');
+  });
+});
+
+describe('Maker createSession carries Host-prepared xdt fixture session', () => {
+  it('passes preparedMemorySession from createSession into agent.startSession', async () => {
+    const { prepareMemorySession } = await import('./memory/xdt-prepare.js');
+    const HEX_A = 'a'.repeat(64);
+    const HEX_B = 'b'.repeat(64);
+    const root = mkdtempSync(path.join(tmpdir(), 'cindy-xdt-maker-'));
+    mkdirSync(path.join(root, 'data'), { recursive: true });
+    try {
+    const prepared = await prepareMemorySession({
+      agentKind: 'claude-code',
+      sessionInstanceId: '33333333-3333-4333-8333-333333333333',
+      binding: {
+        schemaVersion: 1,
+        ownerScopeFingerprint: HEX_A,
+        ownerEpoch: 'epoch-1',
+        configGeneration: 'cfg-1',
+        registryGeneration: 'reg-1',
+        bindingDigest: HEX_A,
+        enabled: true,
+        provider: 'xdt',
+        canonicalWorkspaceId: '11111111-1111-4111-8111-111111111111',
+        serverRegistrationId: '22222222-2222-4222-8222-222222222222',
+        serverRegistrationGeneration: 'gen-1',
+        serverRegistrationDigest: HEX_B,
+      },
+      isolatedStanzaPresent: true,
+      nativeSetResult: { effective: 'immediate' },
+      nativeObservedStatus: { enabled: false, source: 'host-runtime' },
+      indexSource: {
+        repoRoot: root,
+        dataRoot: path.join(root, 'data'),
+        workspace: '11111111-1111-4111-8111-111111111111',
+      },
+      xdtReadOnlyScope: '/tmp/xdt-fixture-repo',
+      makerMemory: { markXdtReadOnlyScope() {} },
+    });
+    const startSession = vi.fn(async () => createHandle({ id: 'thread-xdt', agentKind: 'claude-code' }));
+    const maker = new Maker({
+      agents: { 'claude-code': createAgent(startSession, 'claude-code') },
+      storage: createStorage(),
+      logger: createLogger(),
+    });
+
+    await maker.createSession({
+      id: 'session-xdt-fixture',
+      agentKind: 'claude-code',
+      workingDir: '/tmp/xdt-fixture-repo',
+      model: 'claude-sonnet-4-5',
+      preparedMemorySession: prepared,
+    });
+
+    expect(startSession).toHaveBeenCalledWith(expect.objectContaining({
+      preparedMemorySession: prepared,
+    }));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

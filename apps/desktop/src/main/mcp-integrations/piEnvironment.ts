@@ -314,6 +314,10 @@ export async function getPiExtraSpawnConfig(
     vendorOptions,
     mcpCallerKind: sessionCtx?.mcpCallerKind ?? 'unknown',
     mcpCallerAttested: sessionCtx?.mcpCallerAttested === true,
+    ...(sessionCtx?.memoryBinding ? { memoryBinding: sessionCtx.memoryBinding } : {}),
+    ...(sessionCtx?.preparedMemorySessionId
+      ? { preparedMemorySessionId: sessionCtx.preparedMemorySessionId }
+      : {}),
   };
   // 同 session 重建(resume/reattach)直接覆盖注册,注册表以 sessionId 为 key,
   // 天然不累积。必须在返回(即 spawn)前完成 —— cindy-bridge extension 一起进程

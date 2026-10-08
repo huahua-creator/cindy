@@ -7,6 +7,12 @@ export {
   setClaudeSupportedModelsListener,
   setClaudeRateLimitInfoListener,
 } from './claude-code/index.js';
+export {
+  getLiveClaudeMcpContext,
+  rememberLiveClaudeMcpContext,
+  forgetLiveClaudeMcpContext,
+  resetLiveClaudeMcpContextsForTest,
+} from './claude-code/live-mcp-context.js';
 export type {
   ClaudeSubagentModelAccessResult,
   ClaudeSubagentModelAccessStatus,
