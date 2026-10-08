@@ -1,9 +1,11 @@
+param([switch]$VerifyOnly)
+
 $ErrorActionPreference = 'Stop'
 $log = 'D:\AI\Claude\cindy\apps\desktop\release\replace-install-20261008.log'
 function Log([string]$m) {
   $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
-  Add-Content -Path $log -Value $line -Encoding UTF8
-  Write-Output $line
+  if (-not $VerifyOnly) { Add-Content -LiteralPath $log -Value $line -Encoding UTF8 }
+  Write-Host $line
 }
 function Sha256([string]$path) {
   return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -23,7 +25,7 @@ function StopCindy {
 }
 function InstallSetup([string]$setup) {
   Log ('installer=' + $setup)
-  $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait
+  $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru -Wait -WindowStyle Hidden
   Log ('installer exit=' + $p.ExitCode)
   return $p.ExitCode
 }
@@ -37,10 +39,12 @@ $setup = 'D:\AI\Claude\cindy\apps\desktop\release\artifacts\cn\unversioned\win32
 $rollback = 'D:\AI\Claude\cindy\apps\desktop\release\rollback\e0041fc08\cindy-unversioned-Setup.exe'
 $exe = 'C:\Users\XINDONG\AppData\Local\Programs\Cindy\Cindy.exe'
 $src = 'C:\Users\XINDONG\AppData\Local\Programs\Cindy\resources\cindy-source.json'
-$want = '3cfe760885beb85369660fa343ac5abd8585a83b'
+$want = 'bbc495b1223b69622845f8f0ff2caa342a61fe2d'
 $wantTag = 'v0.1.97'
 $old = 'e0041fc0877756723409544cae7c2693923dab0d'
 $rollbackSha = '6da74aaccc9b0dbab215b47b71b53211e369f5fd9a452b542157e6411bedf2a0'
+$expectedNewSha = '928bd4f55996f2191268b2d1f977a7bf8bd0e5a83b648f4bf8425b5f74ea5793'
+$buildInfoPath = Join-Path (Split-Path -Parent $setup) 'build-info.json'
 
 if (-not (Test-Path -LiteralPath $rollback)) {
   Log 'rollback MISSING'
@@ -59,6 +63,19 @@ $newSha = Sha256 $setup
 if ($newSha -eq $rollbackSha) {
   Log 'new installer is still the rollback copy; pack did not replace artifacts'
   exit 1
+}
+if ($newSha -ne $expectedNewSha) { throw 'New installer does not match the reviewed artifact' }
+$buildInfo = Get-Content -LiteralPath $buildInfoPath -Raw | ConvertFrom-Json
+$artifacts = @($buildInfo.files | Where-Object { $_.role -eq 'installer' -and $_.name -eq (Split-Path -Leaf $setup) })
+if ($buildInfo.commitSha -ne $want -or $buildInfo.region -ne 'cn' -or
+    $buildInfo.platformKey -ne 'win32-x64' -or $buildInfo.versionless -ne $true -or
+    $artifacts.Count -ne 1 -or $artifacts[0].sha256 -ne $expectedNewSha -or
+    $artifacts[0].size -ne (Get-Item -LiteralPath $setup).Length) {
+  throw 'New installer metadata mismatch; no processes stopped'
+}
+if ($VerifyOnly) {
+  Log 'preflight passed (VerifyOnly); no stop, install or launch performed'
+  return
 }
 
 function RestoreOld {
