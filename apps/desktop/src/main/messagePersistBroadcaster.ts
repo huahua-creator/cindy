@@ -1,4 +1,5 @@
 import { readTaskResultsForReply } from './botTaskReplyResults.js';
+import { budgetBindingForMessage, budgetMessagePersisted } from './maker-host/sub2api-budget.js';
 /**
  * messagePersistBroadcaster — 把 agent 消息的持久化从 renderer 收口到 main 单点。
  * ---------------------------------------------------------------------------
@@ -398,6 +399,7 @@ function createVisibleDbMessage(
   const createdAt = typeof body.createdAt === 'number' && Number.isFinite(body.createdAt)
     ? body.createdAt
     : undefined;
+  const budgetBinding=body.role==='assistant'?budgetBindingForMessage(sessionId,body.agentMeta?.requestId):null;
   return createDbMessage(sessionId, body, {
     ...(createdAt === undefined
       ? {}
@@ -408,7 +410,7 @@ function createVisibleDbMessage(
           },
         }),
     broadcastOwnerScope: ownerScope,
-  });
+  }).then(result=>{if(budgetBinding)void budgetMessagePersisted(budgetBinding,body.clientId);return result;});
 }
 
 /**

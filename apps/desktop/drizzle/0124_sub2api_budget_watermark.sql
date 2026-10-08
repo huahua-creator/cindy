@@ -1,0 +1,1 @@
+ALTER TABLE `sub2api_budget_requests` ADD `observed_message_rowid` integer DEFAULT -1 NOT NULL;

@@ -52,6 +52,7 @@ import { providerModelRecord } from '@cindy/model-providers';
 import { outboundFetch } from './outbound-fetch.js';
 import { invocationModelRecord, requiresNativeProviderAuth } from './pi-provider-transport.js';
 import { createClaudeProviderBridge } from './claude-provider-bridge.js';
+import { withBudgetObservation } from './sub2api-budget.js';
 import { isOpenAiSubscriptionProviderId } from './codex-account-auth.js';
 import { isClaudeSubscriptionProviderId, isXaiSubscriptionProviderId } from './subscription-account-auth.js';
 import {
@@ -166,7 +167,9 @@ function attachClaudeProviderBridge(route: RoutingDecision, providerId: string, 
         reasoningField: thinkingFormat === 'qwen' ? 'enable_thinking'
           : thinkingFormat === 'zai' ? 'thinking.type' : 'reasoning_effort',
       },
-      fetchImpl: outboundFetch,
+      fetchImpl: protocol === 'openai-responses'
+        ? withBudgetObservation(outboundFetch, sessionId, provider.id, `${base.replace(/\/+$/, '')}/${requestPath.replace(/^\/+/, '')}`)
+        : outboundFetch,
     });
     return { ...route, localHandler: args => handler.handle({ ...args,
       prefs: { reasoningEffort: (sessionId ? getSessionEffort(sessionId) : null) ?? model.defaultEffort ?? undefined,

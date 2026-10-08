@@ -9615,6 +9615,10 @@
       "hiddenEarlier_other": "これより前に {{count}} 件の質問"
     },
     "messageActionBar": {
+      "requestBudgetValue": "リクエスト予算 ${{amount}}",
+      "requestBudgetPending": "リクエスト予算を確認中",
+      "requestBudgetUnavailable": "リクエスト予算は未確認",
+      "requestBudgetMeaning": "この API リクエストのみの Sub2API 予算です。ターン全体の合計や現金請求ではありません。SDK の値は別の見積もりです。",
       "copy": "メッセージをコピー",
       "reply": "返信",
       "linkCopied": "リンクをコピーしました",

@@ -4,6 +4,7 @@ import {
 } from '../model-access/byokCredentials.js';
 import { app, safeStorage } from 'electron';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { readChunkedSecret, writeChunkedSecret } from './chunkedSecretFile.js';
 
@@ -415,6 +416,28 @@ export function readCustomProviderKey(providerId: string, agent: string): string
     );
     return null;
   }
+}
+
+/** Main-only opaque generation of the exact encrypted runtime key used by a request. */
+export function customProviderKeyGeneration(providerId: string, agent: string, expectedKey: string): string | null {
+  try {
+    const owner = getActiveAppSession();
+    if (!owner.dataOwnerId || isAppSessionBoundaryPending() || !expectedKey || !safeStorage.isEncryptionAvailable()) return null;
+    const physical = resolveOwnerScopedSecretStorageKey(customProviderSecretStorageKey(storedCustomProviderId(providerId), agent));
+    if (!physical) return null;
+    const file = path.join(secretDir(), `${physical}.enc`);
+    const fd = fs.openSync(file, 'r');
+    const buffer = Buffer.alloc(16_385);
+    let length: number;
+    try { length = fs.readSync(fd, buffer, 0, buffer.length, null); }
+    finally { fs.closeSync(fd); }
+    if (length === buffer.length) return null;
+    const raw = buffer.subarray(0, length);
+    if (safeStorage.decryptString(Buffer.from(raw.toString('utf8'), 'base64')) !== expectedKey) return null;
+    const current = getActiveAppSession();
+    if (current.dataOwnerId !== owner.dataOwnerId || current.generation !== owner.generation || isAppSessionBoundaryPending()) return null;
+    return createHash('sha256').update(raw).digest('hex');
+  } catch { return null; }
 }
 
 function parseCustomProviderHeaders(raw: string): Record<string, string> {

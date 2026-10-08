@@ -9614,6 +9614,10 @@
       "hiddenEarlier_other": "更早還有 {{count}} 條提問"
     },
     "messageActionBar": {
+      "requestBudgetValue": "此請求預算 ${{amount}}",
+      "requestBudgetPending": "此請求預算待核驗",
+      "requestBudgetUnavailable": "此請求預算未核驗",
+      "requestBudgetMeaning": "來自 Sub2API，僅計這一次 API 請求，不代表整輪總額或現金扣款。下方 SDK 數值是獨立估算。",
       "copy": "複製訊息",
       "reply": "回覆",
       "linkCopied": "連結已複製",

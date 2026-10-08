@@ -191,6 +191,7 @@ import {
 import type { IssueHarness } from '../../shared/issueRuntimeMetadata';
 import { resolveStaleCodexSubscriptionValueEstimate } from '../../shared/codexSubscriptionValue';
 import { normalizeTurnUsageDetails, type TurnUsageDetails } from '../../shared/turnUsageDetails';
+import { normalizeSub2apiBudget, type Sub2apiBudget } from '../../shared/sub2apiBudget';
 import {
   legacyUsdMoney,
   normalizeRegionalMoney,
@@ -618,6 +619,7 @@ export interface ChatMessage {
    */
   turnCostUsd?: number;
   turnMoney?: RegionalMoney;
+  sub2apiBudget?: Sub2apiBudget;
   /** true = 订阅模式下的 token 价值;false = API 账单 cost / API 单价折算 cost。 */
   turnCostIsEstimate?: boolean;
   /** 用户从最近一条真实输入至本消息的累计成本；只用于消息旁展示。 */
@@ -18572,6 +18574,8 @@ function mapServerMessages(serverMsgs: Message[]): ChatMessage[] {
       // 本轮 token 明细独立于金额挂载:Pi/新模型算不出报价的轮次只有它，
       // UI 据此退回显示 token，历史加载不能把它绑在 money 分支。
       ...(m.role === 'assistant' && turnUsageDetails ? { turnUsageDetails } : {}),
+      ...(m.role === 'assistant' && normalizeSub2apiBudget(agentMeta?.sub2apiBudget)
+        ? {sub2apiBudget:normalizeSub2apiBudget(agentMeta?.sub2apiBudget)} : {}),
       // 整轮累计费用同样独立挂载:无价收尾轮只有它,没有 turnCost。
       ...persistedUserTurnCostPatch,
       // assistant 上挂的 per-turn 费用(main turn 结束时 patch 进 agent_meta)

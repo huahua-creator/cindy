@@ -60,6 +60,8 @@ import { SHARE_EXCLUDE_ATTR } from '@/lib/shareConversationImage';
 import { formatCompactTokens, formatTurnCostMoney } from '@/lib/usageFormat';
 import { buildTurnUsageTooltipLines } from '@/lib/turnUsageTooltip';
 import type { TurnUsageDetails } from '../../../shared/turnUsageDetails';
+import { normalizeSub2apiBudget, type Sub2apiBudget } from '../../../shared/sub2apiBudget';
+import { RequestBudgetBadge } from './RequestBudgetBadge';
 import {
   legacyUsdMoney,
   type RegionalMoney,
@@ -107,6 +109,7 @@ interface MessageActionBarProps {
   rewindInFlight?: boolean;
   /** Per-turn 费用 (USD) — 仅该轮最后一条 assistant 有值, 时间旁显示。 */
   turnMoney?: RegionalMoney;
+  sub2apiBudget?: Sub2apiBudget;
   turnCostUsd?: number;
   turnCostIsEstimate?: boolean;
   /** User-visible cumulative cost for the surrounding user round. */
@@ -147,6 +150,7 @@ export function MessageActionBar({
   onRewind,
   rewindInFlight = false,
   turnMoney,
+  sub2apiBudget,
   turnCostUsd,
   turnCostIsEstimate = false,
   userTurnMoney,
@@ -456,6 +460,10 @@ export function MessageActionBar({
     'text-[var(--settings-section-desc)] cursor-default',
   );
 
+  const budget=normalizeSub2apiBudget(sub2apiBudget);
+  const budgetText=budget && (
+    <RequestBudgetBadge key="sub2api-budget" budget={budget} className={metaTextClassName} details={turnCostTooltipNode} />
+  );
   const costText = displayedMoney && displayedMoney.amount > 0 && (
     <Tooltip.Root key="cost">
       <Tooltip.Trigger asChild>
@@ -650,7 +658,7 @@ export function MessageActionBar({
           editBtn,
           moreMenu,
           timeText,
-          simplifiedBotConversation ? null : costText || tokensText,
+          simplifiedBotConversation ? null : budgetText || costText || tokensText,
         ]
       : [timeText, copyBtn, shareBtn, forkBtn, replyBtn, editBtn, moreMenu];
 

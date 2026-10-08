@@ -4,6 +4,7 @@ import { listWorktreeRecycleStatus, controlWorktreeRecycle } from './worktree/re
 import { registerFilePeerIpc } from './device-link/filePeer';
 import { registerTaskMigrationIpc } from './task-migration/service';
 import { registerLoginItemIpc } from './login-item-ipc.js';
+import { startBudgetReceiptRecovery } from './maker-host/sub2api-budget.js';
 import {
   createLatestSourceVersionReader,
   sourceChannel,
@@ -10184,6 +10185,9 @@ onQuit('db-client', async () => {
   await lifecycleDbClientManager.dispose('quit');
 }, 'post-async');
 onQuit('local-db-close', () => localDbCloseDb(), 'post-async');
+void app.whenReady().then(() => {
+  onQuit('sub2api-budget-recovery', startBudgetReceiptRecovery(), 'sync');
+});
 
 // A display restore may join an in-flight native mode write (5s), restore the
 // original mode (5s), then await Electron geometry (5s). Keep a margin before

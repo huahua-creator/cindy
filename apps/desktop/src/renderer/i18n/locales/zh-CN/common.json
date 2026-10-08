@@ -9615,6 +9615,10 @@
       "hiddenEarlier_other": "更早还有 {{count}} 条提问"
     },
     "messageActionBar": {
+      "requestBudgetValue": "此请求预算 ${{amount}}",
+      "requestBudgetPending": "此请求预算待核验",
+      "requestBudgetUnavailable": "此请求预算未核验",
+      "requestBudgetMeaning": "来自 Sub2API，仅计这一次 API 请求，不代表整轮总额或现金扣款。下方 SDK 数值是独立估算。",
       "copy": "复制消息",
       "reply": "回复",
       "linkCopied": "链接已复制",

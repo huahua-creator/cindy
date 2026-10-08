@@ -20,6 +20,29 @@ import {
 
 import type { SessionSource } from '../../shared/sessionSource.js';
 
+export const sub2apiBudgetRequests = sqliteTable('sub2api_budget_requests', {
+  id: text('id').primaryKey(),
+  ownerId: text('owner_id').notNull(),
+  sessionId: text('session_id').notNull(),
+  providerId: text('provider_id').notNull(),
+  responsesUrl: text('responses_url').notNull(),
+  credentialGeneration: text('credential_generation').notNull(),
+  clientRequestId: text('client_request_id'),
+  responseId: text('response_id'),
+  messageClientId: text('message_client_id'),
+  observedMessageRowid: integer('observed_message_rowid').notNull().default(-1),
+  state: text('state').notNull().default('pending'),
+  amount: text('amount'),
+  attempts: integer('attempts').notNull().default(0),
+  createdAt: integer('created_at').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+}, (t) => ({
+  receipt: uniqueIndex('sub2api_budget_receipt_identity').on(t.ownerId, t.providerId, t.responsesUrl, t.clientRequestId),
+  message: uniqueIndex('sub2api_budget_message_identity').on(t.ownerId, t.sessionId, t.messageClientId),
+  pending: index('sub2api_budget_pending').on(t.ownerId, t.state, t.createdAt),
+  response: index('sub2api_budget_response').on(t.ownerId, t.sessionId, t.responseId),
+}));
+
 /** Per-profile authority journal. Snapshots are recovery/audit data, not offline grants. */
 export const sharedTaskEvents = sqliteTable('shared_task_events', {
   id: integer('id').primaryKey({ autoIncrement: true }),

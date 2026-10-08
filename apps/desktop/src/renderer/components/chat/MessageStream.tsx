@@ -6638,6 +6638,7 @@ const MessageItem = memo(function MessageItem({
             // turn 结束后只有收尾正文出现 —— 中间句彻底不挂 bar。
             showActionBar={Boolean(assistantIsTurnFinal) && !assistantForkBlocked}
             turnMoney={message.turnMoney}
+            sub2apiBudget={message.sub2apiBudget}
             turnCostUsd={message.turnCostUsd}
             turnCostIsEstimate={message.turnCostIsEstimate}
             userTurnMoney={message.userTurnMoney}

@@ -9615,6 +9615,10 @@
       "hiddenEarlier_other": "이전 질문 {{count}}개"
     },
     "messageActionBar": {
+      "requestBudgetValue": "요청 예산 ${{amount}}",
+      "requestBudgetPending": "요청 예산 확인 중",
+      "requestBudgetUnavailable": "요청 예산 미확인",
+      "requestBudgetMeaning": "이 API 요청의 Sub2API 예산만 표시합니다. 전체 턴의 합계나 현금 청구가 아닙니다. SDK 값은 별도의 추정치입니다.",
       "copy": "메시지 복사",
       "reply": "답장",
       "linkCopied": "링크가 복사되었습니다",

@@ -9628,6 +9628,10 @@
       "hiddenEarlier_other": "{{count}} earlier prompts not shown"
     },
     "messageActionBar": {
+      "requestBudgetValue": "Request budget ${{amount}}",
+      "requestBudgetPending": "Request budget pending",
+      "requestBudgetUnavailable": "Request budget unverified",
+      "requestBudgetMeaning": "Sub2API budget for this API request only, not the entire turn or a cash charge. SDK values below are separate estimates.",
       "copy": "Copy message",
       "reply": "Reply",
       "linkCopied": "Link copied",

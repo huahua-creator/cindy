@@ -51,6 +51,7 @@ import { GhostToolCard } from './GhostToolCard';
 import type { KnownLocalFileRef } from '@/lib/localPathResolver';
 import type { AgentKind as RendererAgentKind } from '@/lib/ccAgent.types';
 import type { TurnUsageDetails } from '../../../shared/turnUsageDetails';
+import type { Sub2apiBudget } from '../../../shared/sub2apiBudget';
 import type { RegionalMoney } from '../../../shared/regionalMoney';
 import { useAgentCapabilities, type AgentKind as MakerAgentKind } from '@/hooks/useAgentCapabilities';
 import { useSessionFileOrigin } from './ChatSessionFileContext';
@@ -60,6 +61,7 @@ import { getStickySessionDeviceId } from '@/features/device-link/stickySessionOr
 import { insertSessionLinkIntoComposer } from '@/lib/composerActionsBus';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { MessageActionBar } from './MessageActionBar';
+import { RequestBudgetBadge } from './RequestBudgetBadge';
 import { shareSelectionStore } from './shareSelectionStore';
 import { useForkAtMessage } from './useForkAtMessage';
 import { useDeleteMessage } from './useDeleteMessage';
@@ -200,6 +202,7 @@ interface AssistantMessageProps {
   botTaskResults?: BotCollaborationMeta[];
   /** Per-turn 费用 (USD) — 仅该轮最后一条 assistant 有值, action bar 时间旁显示。 */
   turnMoney?: RegionalMoney;
+  sub2apiBudget?: Sub2apiBudget;
   turnCostUsd?: number;
   /** true = 订阅模式下的 token 价值;false = API 账单 cost / API 单价折算 cost。 */
   turnCostIsEstimate?: boolean;
@@ -237,6 +240,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   botTaskResults,
   botLearning,
   turnMoney,
+  sub2apiBudget,
   turnCostUsd,
   turnCostIsEstimate,
   userTurnMoney,
@@ -429,6 +433,7 @@ export const AssistantMessage = memo(function AssistantMessage({
           onShareAsImage={handleShareAsImage}
           onDelete={!sharedGuest && currentSessionId && messageClientId ? handleDelete : undefined}
           turnMoney={turnMoney}
+          sub2apiBudget={sub2apiBudget}
           turnCostUsd={turnCostUsd}
           turnCostIsEstimate={turnCostIsEstimate}
           userTurnMoney={userTurnMoney}
@@ -436,6 +441,9 @@ export const AssistantMessage = memo(function AssistantMessage({
           userTurnCostIsEstimate={userTurnCostIsEstimate}
           turnUsageDetails={userTurnUsageDetails ?? turnUsageDetails}
         />
+      )}
+      {!isStreaming && !showActionBar && !simplifiedBotConversation && (
+        <RequestBudgetBadge budget={sub2apiBudget} className="text-xs text-[var(--cmd-palette-item-meta)]" />
       )}
     </div>
   );

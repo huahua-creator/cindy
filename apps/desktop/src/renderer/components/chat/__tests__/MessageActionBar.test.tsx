@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string, values?: {amount?:string}) => key==='chat.messageActionBar.requestBudgetValue'?`${key} ${values?.amount}`:key }),
 }));
 
 vi.mock('@/components/ui/tooltip', async (importOriginal) => ({
@@ -30,6 +30,15 @@ vi.mock('@/lib/toast', () => ({
 import { MessageActionBar } from '../MessageActionBar';
 
 describe('MessageActionBar', () => {
+  it.each(['0.98506000','0.00000000'])('labels a verified request budget without relabeling SDK estimates (%s)',(amount)=>{
+    render(<MessageActionBar copyText="reply" align="left" hovered sub2apiBudget={{state:'complete',amount}} turnCostUsd={0.49253} turnCostIsEstimate />);
+    expect(screen.getByText(`chat.messageActionBar.requestBudgetValue ${amount==='0.00000000'?'0.00':'0.98506'}`)).toBeTruthy();
+    expect(screen.getByText(/chat.messageActionBar.requestBudgetMeaning/)).toBeTruthy();
+  });
+  it.each(['pending','unavailable'] as const)('keeps %s budget distinct from a verified zero',(state)=>{
+    render(<MessageActionBar copyText="reply" align="left" hovered sub2apiBudget={{state}} />);
+    expect(screen.getByText(state==='pending'?'chat.messageActionBar.requestBudgetPending':'chat.messageActionBar.requestBudgetUnavailable')).toBeTruthy();
+  });
   const writeText = vi.fn(async () => undefined);
 
   beforeEach(() => {

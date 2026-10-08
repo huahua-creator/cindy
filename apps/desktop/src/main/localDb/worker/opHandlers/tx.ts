@@ -1,4 +1,5 @@
 import { runTaskTagsTransaction } from './taskTagsTx.js';
+import { sub2apiBudgetMutation } from './sub2apiBudgetTx.js';
 import { batchAutoReviewProjection, readAutoReviewProjectionTransaction } from '../../autoReviewProjection.js';
 import { CLOSE_SHARED_TASKS_FOR_SESSION_SQL } from '../../sharedTaskClosureSql.js';
 import { normalizeBotName } from '../../../../shared/botCreation.js';
@@ -58,6 +59,8 @@ function dispatchTransaction(db: Database.Database, args: unknown): unknown {
   const txArgs = payload.args;
 
   switch (name) {
+    case 'sub2apiBudget.mutate':
+      return sub2apiBudgetMutation(db, txArgs);
     case 'authorization.readProjection':
       return readAutoReviewProjectionTransaction(db, txArgs);
     case 'codex.importMessages':

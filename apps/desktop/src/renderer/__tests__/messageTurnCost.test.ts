@@ -171,6 +171,14 @@ describe('makerChatStore per-turn 费用', () => {
   let getTurnCostCb: () => FanOutCb | null;
   const SID = 'sess-turn-cost';
 
+  it('hydrates a separate request budget while retaining the historical SDK estimate',async()=>{
+    vi.mocked(messageService.list).mockResolvedValueOnce([serverMessage({clientId:'budget',agentMeta:{turnCostUsd:0.49253,turnCostIsEstimate:true,sub2apiBudget:{state:'complete',amount:'0.98506000'}}})]);
+    makerChatStore.ensureInitialMessages(SID);await flush();await flush();
+    const message=makerChatStore.getSnapshot(SID).messages.find(m=>m.clientId==='budget');
+    expect(message?.sub2apiBudget).toEqual({state:'complete',amount:'0.98506000'});
+    expect(message?.turnCostUsd).toBe(0.49253);
+  });
+
   beforeEach(() => {
     dataOwnerTesting.reset();
     setDataOwnerGeneration(TEST_OWNER_STAMP.dataOwnerId, TEST_OWNER_STAMP.ownerGeneration);

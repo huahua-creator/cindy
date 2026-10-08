@@ -2,6 +2,7 @@ import type { ImMessageSource } from '../../shared/imMessageSource';
 import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 import type { SessionSource } from '../../shared/sessionSource';
 import type { TurnUsageDetails } from '../../shared/turnUsageDetails';
+import type { Sub2apiBudget } from '../../shared/sub2apiBudget';
 import type { RegionalMoney } from '../../shared/regionalMoney';
 import type { AutoResumeInfo, RecoveryCheckpoint } from '../../shared/agentInputQueue';
 import type { ReviewRunMeta } from '../../shared/reviewRun';
@@ -181,6 +182,7 @@ export interface CcMeta {
   userTurnCostIsEstimate?: boolean;
   /** Per-turn token/cache 明细,与 turnCostUsd 同时由 main patch 到 agent_meta。 */
   turnUsageDetails?: TurnUsageDetails;
+  sub2apiBudget?: Sub2apiBudget;
 
   /**
    * Host-side 模型降级标记:turn 结束时 main 检测到「所选模型家族在本轮实际
