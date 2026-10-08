@@ -175,7 +175,7 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
         type: 'mcpToolCall',
         server: 'cindy_memory',
         tool: 'call_tool',
-        arguments: { name: 'memory_write', args: { mode: 'create' } },
+        arguments: { name: 'memory_write', args: WRITE_ARGS },
       },
     });
     expect(peekCodexCindyMemoryWriteSlot(SLOT_INSTANCE)?.itemId).toBe(SLOT_ITEM);
@@ -280,7 +280,7 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
         type: 'mcpToolCall',
         server: 'cindy_memory',
         tool: 'call_tool',
-        arguments: { name: 'memory_write', args: { mode: 'create' } },
+        arguments: { name: 'memory_write', args: WRITE_ARGS },
       },
     });
     let releaseFirst: () => void = () => {};
@@ -365,7 +365,7 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
         method: 'tools/call',
         params: {
           name: 'call_tool',
-          arguments: { name: 'memory_write', args: { ...WRITE_ARGS, name: 'second-call' } },
+          arguments: { name: 'memory_write', args: WRITE_ARGS },
           _meta: { threadId: 'thread-xdt-hold' },
         },
       }),
@@ -391,7 +391,7 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
         type: 'mcpToolCall',
         server: 'cindy_memory',
         tool: 'call_tool',
-        arguments: { name: 'memory_write', args: { mode: 'create' } },
+        arguments: { name: 'memory_write', args: WRITE_ARGS },
       },
     });
     rememberCodexCindyMemoryWriteSlot({
@@ -402,7 +402,7 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
         type: 'mcpToolCall',
         server: 'cindy_memory',
         tool: 'call_tool',
-        arguments: { name: 'memory_write', args: { mode: 'create' } },
+        arguments: { name: 'memory_write', args: WRITE_ARGS },
       },
     });
     expect(peekCodexCindyMemoryWriteSlot(SLOT_INSTANCE)?.itemId).toBe('item-A');
@@ -482,6 +482,95 @@ describe('Codex cindy_memory writes require a Host item.id slot', () => {
       expect(reached.mock.calls[0]?.[0]).toMatchObject({ peekedItemId: 'item-A' });
       expect(reached.mock.calls[0]?.[0]).not.toMatchObject({ peekedItemId: 'item-B' });
     }
+  });
+
+  it('Codex digest 不等时 xdt memory_write 在 handleRequest 前红', async () => {
+    const reached = vi.fn();
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: SLOT_SESSION,
+      sessionInstanceId: SLOT_INSTANCE,
+      item: {
+        id: SLOT_ITEM,
+        type: 'mcpToolCall',
+        server: 'cindy_memory',
+        tool: 'call_tool',
+        arguments: { name: 'memory_write', args: WRITE_ARGS },
+      },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(SLOT_INSTANCE)?.itemId).toBe(SLOT_ITEM);
+    bridge = await startCodexHttpBridge({
+      serverFactories: {
+        cindy_memory: () => {
+          const server = new McpServer({ name: 'cindy_memory', version: '1.0.0' });
+          server.tool(
+            'call_tool',
+            'spy',
+            {
+              name: z.string(),
+              args: z.record(z.string(), z.unknown()),
+            },
+            async (args) => {
+              reached(args);
+              return { content: [{ type: 'text', text: JSON.stringify({ ok: true, leaked: true }) }] };
+            },
+          );
+          return server;
+        },
+      },
+      logger: noopLogger(),
+    });
+    const current = bridge;
+    current.registerThreadContext('thread-xdt-digest', {
+      agentKind: 'codex',
+      sessionId: SLOT_SESSION,
+      sessionInstanceId: SLOT_INSTANCE,
+      workingDir: '/tmp/xdt-fixture-repo',
+      memoryBinding: xdtBinding(),
+      preparedMemorySessionId: '44444444-4444-4444-8444-444444444444',
+    });
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${current.token}`,
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    };
+    const init = await fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'codex-digest-test', version: '1' },
+        },
+      }),
+    });
+    headers['mcp-session-id'] = init.headers.get('mcp-session-id')!;
+    await init.text();
+    const write = await fetch(mcpUrl(current, 'cindy_memory', SLOT_INSTANCE), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: {
+          name: 'call_tool',
+          arguments: { name: 'memory_write', args: { ...WRITE_ARGS, name: 'other-body' } },
+          _meta: { threadId: 'thread-xdt-digest' },
+        },
+      }),
+    });
+    expect(write.status).toBe(200);
+    const payload = await readRpcResponse(write) as {
+      result?: { isError?: boolean; content?: Array<{ text?: string }> };
+    };
+    expect(payload.result?.isError).toBe(true);
+    expect(payload.result?.content?.[0]?.text).toContain('MAKER_MEMORY_NOT_READY');
+    expect(payload.result?.content?.[0]?.text).not.toContain('leaked');
+    expect(reached).not.toHaveBeenCalled();
   });
 
   it('Codex 本刀预期只读：internal memory_write 仍进入 handleRequest', async () => {

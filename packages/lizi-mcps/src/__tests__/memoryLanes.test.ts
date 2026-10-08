@@ -382,7 +382,17 @@ describe('cindy_memory three lanes', () => {
         type: 'mcpToolCall',
         server: 'cindy_memory',
         tool: 'call_tool',
-        arguments: { name: 'memory_write', args: { mode: 'create' } },
+        arguments: {
+          name: 'memory_write',
+          args: {
+            type: 'project',
+            name: 'codex-slot',
+            title: 'yes',
+            description: 'callId from item.id',
+            body: 'ok',
+            mode: 'create',
+          },
+        },
       },
     });
     const cfg = provider.toClaudeSdkConfig(ctx) as { instance: unknown };
@@ -410,7 +420,7 @@ describe('cindy_memory three lanes', () => {
           type: 'project',
           name: 'codex-slot',
           title: 'yes',
-          description: 'same item.id replay',
+          description: 'callId from item.id',
           body: 'ok',
         },
       },
@@ -463,6 +473,67 @@ describe('cindy_memory three lanes', () => {
     expect(parse(written as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
     expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
     expect(frozenWrite).not.toHaveBeenCalled();
+  });
+
+  it('keeps Codex xdt writes red when HTTP args digest does not match the Host slot', async () => {
+    const prepared = await preparedSession();
+    const executeXdtFacadeWrite = vi.fn(async () => ({
+      content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, facade: true }) }],
+    }));
+    const provider = createLiziMcpProviders({
+      memory: {
+        getManager: () => ({ isEnabled: () => true, getStore: async () => ({}) }) as never,
+        getPreparedMemorySession: () => prepared,
+        executeXdtFacadeWrite,
+      },
+    }).find((p) => p.name === 'cindy_memory');
+    if (!provider) throw new Error('cindy_memory missing');
+    const ctx: LiziMcpSessionContext = {
+      agentKind: 'codex',
+      workingDir: '/tmp/xdt-fixture-repo',
+      vendorOptions: {},
+      sessionId: 'session-codex-mismatch',
+      sessionInstanceId: SESSION_INSTANCE,
+      memoryBinding: prepared.binding,
+      preparedMemorySessionId: PREPARED_ID,
+    };
+    rememberCodexCindyMemoryWriteSlot({
+      sessionId: 'session-codex-mismatch',
+      sessionInstanceId: SESSION_INSTANCE,
+      item: {
+        id: 'item-A',
+        type: 'mcpToolCall',
+        server: 'cindy_memory',
+        tool: 'call_tool',
+        arguments: {
+          name: 'memory_write',
+          args: {
+            type: 'project',
+            name: 'slot-a',
+            title: 'A',
+            description: 'slot A body',
+            body: 'aaa',
+            mode: 'create',
+          },
+        },
+      },
+    });
+    const cfg = provider.toClaudeSdkConfig(ctx) as { instance: unknown };
+    const written = await tools(cfg.instance).call_tool.handler(
+      {
+        name: 'memory_write',
+        args: {
+          type: 'project',
+          name: 'slot-b',
+          title: 'B',
+          description: 'slot B body',
+          body: 'bbb',
+        },
+      },
+      { requestId: 'jsonrpc-mismatch' },
+    );
+    expect(parse(written as never)).toMatchObject({ ok: false, code: 'MAKER_MEMORY_NOT_READY' });
+    expect(executeXdtFacadeWrite).not.toHaveBeenCalled();
   });
 
   it('falls back to internal store only for XDT_WRITE_NOT_APPLICABLE on Claude internal lane', async () => {

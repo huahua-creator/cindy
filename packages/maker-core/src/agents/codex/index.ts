@@ -51,6 +51,7 @@ import { skillEntryPath, snapshotDisabledSkillLaunch, currentDisabledSkillLaunch
 import { snapshotManagedSkillGrants } from '../shared/managed-skill-policy.js';
 import {
   forgetCodexCindyMemoryWriteSlot,
+  forgetCodexCindyMemoryWriteSlotsForTurn,
   rememberCodexCindyMemoryWriteSlot,
 } from '../../memory/codex-cindy-memory-write-slot.js';
 import type { AgentCredentialMode } from '../../interfaces/auth-adapter.js';
@@ -6073,6 +6074,12 @@ assertRouteCurrent();
         if (method === 'item/completed') {
           completeActiveToolContext(record?.item, turnId);
         } else {
+          rememberCodexCindyMemoryWriteSlot({
+            sessionId: sid,
+            sessionInstanceId: opts.sessionInstanceId,
+            item: record?.item,
+            turnId,
+          });
           noteActiveToolContext(record?.item, turnId);
         }
       }
@@ -9480,6 +9487,7 @@ assertRouteCurrent();
         sessionId: sid,
         sessionInstanceId: opts.sessionInstanceId,
         item,
+        turnId: turnId ?? undefined,
       });
     }
 
@@ -10291,6 +10299,10 @@ assertRouteCurrent();
       if (bufferedOrphanTurnIds.size === 0 && pendingSpawnLineageByTurn.size === 0) return;
       log.debug('abandoning buffered turns', { reason, turnIds: [...bufferedOrphanTurnIds] });
       for (const bufferedId of bufferedOrphanTurnIds) {
+        forgetCodexCindyMemoryWriteSlotsForTurn({
+          sessionInstanceId: opts.sessionInstanceId,
+          turnId: bufferedId,
+        });
         settleBufferedTurnReconcile(bufferedId, false);
       }
       for (const turnId of pendingSpawnLineageByTurn.keys()) {
@@ -12404,6 +12416,13 @@ assertRouteCurrent();
         handleTurnCompleted(params);
       },
       itemStarted: (params) => {
+        // cindy_memory write slot 必须在缓冲对账之前登记，HTTP tools/call 可能更早到达。
+        rememberCodexCindyMemoryWriteSlot({
+          sessionId: sid,
+          sessionInstanceId: opts.sessionInstanceId,
+          item: params.item,
+          turnId: params.turnId,
+        });
         // 血缘不能跟着 turn 对账队列一起迟到:AppServerHost 只为未知 child 缓冲 5s。
         // 卡片/翻译仍在队列内,这里只保留 provisional claim；父 turn 被接受后
         // 重放 item 才 commit root route，孤儿则 discard。
@@ -12536,6 +12555,12 @@ assertRouteCurrent();
         if (replayedSubagentUpdate) emitSubagentCardUpdate(replayedSubagentUpdate);
       },
       itemUpdated: (params) => {
+        rememberCodexCindyMemoryWriteSlot({
+          sessionId: sid,
+          sessionInstanceId: opts.sessionInstanceId,
+          item: params.item,
+          turnId: params.turnId,
+        });
         const reservedChildThreadIds = reserveSubagentSpawnLineage(params.item);
         if (enqueueIfBufferedTurn(params.turnId, () => handlers.itemUpdated?.(params), {
           modelWork: itemRepresentsModelWork(params.item),
@@ -13463,6 +13488,10 @@ assertRouteCurrent();
                 // 渲染到 / 收口本次 send; 挂起的审批/输入请求按拒绝释放
                 // (codex R12 P1)。
                 bufferedTurnEventQueues.delete(bufferedId);
+                forgetCodexCindyMemoryWriteSlotsForTurn({
+                  sessionInstanceId: opts.sessionInstanceId,
+                  turnId: bufferedId,
+                });
                 settleBufferedTurnReconcile(bufferedId, false);
                 log.warn('buffered turnStarted proven orphan by turn/start response — interrupting', {
                   turnId: bufferedId,

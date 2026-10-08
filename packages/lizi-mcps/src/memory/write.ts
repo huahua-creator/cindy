@@ -20,6 +20,7 @@ import { isXdtWriteNotApplicable, withStore, xdtWriteForbiddenResult } from './_
 import type { MemoryMcpDeps } from '../types.js';
 import type { MemoryToolCallExtra, MemoryToolRegistry } from '../cindy_memoryToolRegistry.js';
 import {
+  digestCodexCindyMemoryWriteArgs,
   peekCodexCindyMemoryWriteSlot,
   type WriteOptions,
 } from '@cindy/maker-core';
@@ -113,8 +114,25 @@ export function registerMemoryWriteTool(registry: MemoryToolRegistry, deps: Memo
       const slot = ctx.agentKind === 'codex'
         ? peekCodexCindyMemoryWriteSlot(ctx.sessionInstanceId)
         : undefined;
+      const argsDigest = ctx.agentKind === 'codex'
+        ? digestCodexCindyMemoryWriteArgs({
+            type: args.type,
+            name: args.name,
+            title: args.title,
+            description: args.description,
+            body: args.body,
+            mode,
+          })
+        : undefined;
       const callId = ctx.agentKind === 'codex'
-        ? (slot && slot.sessionId === ctx.sessionId ? slot.itemId : undefined)
+        ? (
+          slot
+          && slot.sessionId === ctx.sessionId
+          && argsDigest
+          && slot.argsDigest === argsDigest
+            ? slot.itemId
+            : undefined
+        )
         : extra?.requestId;
       if (!callId || !deps.executeXdtFacadeWrite) {
         return xdtWriteForbiddenResult();

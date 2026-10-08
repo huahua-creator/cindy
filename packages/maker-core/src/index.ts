@@ -127,9 +127,12 @@ export {
   rememberCodexCindyMemoryWriteSlot,
   peekCodexCindyMemoryWriteSlot,
   forgetCodexCindyMemoryWriteSlot,
+  forgetCodexCindyMemoryWriteSlotsForTurn,
   tryAcquireCodexCindyMemoryWriteSlot,
   releaseCodexCindyMemoryWriteSlot,
   resetCodexCindyMemoryWriteSlotsForTest,
+  digestCodexCindyMemoryWriteArgs,
+  CODEX_CINDY_MEMORY_WRITE_RESERVED_ARG_KEYS,
   type CodexCindyMemoryWriteSlot,
 } from './memory/codex-cindy-memory-write-slot.js';
 export {

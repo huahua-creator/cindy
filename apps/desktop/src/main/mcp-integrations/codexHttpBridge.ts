@@ -24,6 +24,7 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { runWithLiziMcpSessionContext, type LiziMcpSessionContext } from '@cindy/mcps';
 
 import {
+  digestCodexCindyMemoryWriteArgs,
   isXdtMemoryBinding,
   releaseCodexCindyMemoryWriteSlot,
   tryAcquireCodexCindyMemoryWriteSlot,
@@ -736,6 +737,7 @@ async function dispatchToTransport(opts: DispatchOpts): Promise<void> {
       const slot = tryAcquireCodexCindyMemoryWriteSlot({
         sessionId: activeContext.sessionId,
         sessionInstanceId: activeContext.sessionInstanceId,
+        argsDigest: cindyMemoryWriteArgsDigest(parsedBody),
       });
       if (!slot) {
         writeXdtCodexWriteRejectedResponse(res, parsedBody);
@@ -966,6 +968,31 @@ function hasCindyMemoryWriteCreateOrUpdate(body: unknown): boolean {
     const mode = cindyMemoryWriteMode(message);
     return mode === 'create' || mode === 'update';
   });
+}
+
+function cindyMemoryWriteArgsFromMessage(message: unknown): unknown {
+  if (!isToolCallMessage(message)) return undefined;
+  const params = (message as { params?: unknown }).params;
+  if (!params || typeof params !== 'object') return undefined;
+  if ((params as { name?: unknown }).name !== 'call_tool') return undefined;
+  const envelope = (params as { arguments?: unknown }).arguments;
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return undefined;
+  if ((envelope as { name?: unknown }).name !== 'memory_write') return undefined;
+  return (envelope as { args?: unknown }).args;
+}
+
+function cindyMemoryWriteArgsDigest(body: unknown): string | undefined {
+  const messages = Array.isArray(body) ? body : [body];
+  let digest: string | undefined;
+  for (const message of messages) {
+    const mode = cindyMemoryWriteMode(message);
+    if (mode !== 'create' && mode !== 'update') continue;
+    const next = digestCodexCindyMemoryWriteArgs(cindyMemoryWriteArgsFromMessage(message));
+    if (!next) return undefined;
+    if (digest && digest !== next) return undefined;
+    digest = next;
+  }
+  return digest;
 }
 
 function writeXdtCodexWriteRejectedResponse(
