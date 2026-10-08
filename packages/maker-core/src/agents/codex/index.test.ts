@@ -7603,6 +7603,75 @@ describe('CodexAgent send', () => {
     expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write-next');
     await handle.close();
   });
+
+  it('forgets a cindy_memory write slot when recovery completed arrives before turn/start', async () => {
+    const instanceId = 'instance-recovery-completed-before-start-cindy-memory-slot';
+    const firstStart = deferred<{ turn: { id: string } }>();
+    let turnStarts = 0;
+    const armCodexHttpRecovery = vi.fn(() => 'encrypted_content');
+    const agent = new CodexAgent(createDeps({}, { armCodexHttpRecovery }));
+    const host = installFakeHost(agent, (method) => {
+      if (method === Method.TurnInterrupt) return {};
+      if (method !== Method.TurnStart) return undefined;
+      turnStarts += 1;
+      if (turnStarts === 1) return firstStart.promise;
+      return { turn: { id: `turn-${turnStarts}` } };
+    });
+    const handle = await agent.startSession({
+      sessionId: 'session-recovery-completed-before-start-cindy-memory-slot',
+      sessionInstanceId: instanceId,
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+    const sendPromise = handle.send({ type: 'user', content: 'first' });
+    await waitForExpectation(() => expect(turnStarts).toBe(1));
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.itemStarted || !handlers.turnStarted || !handlers.turnCompleted || !handlers.error) {
+      throw new Error('expected handlers');
+    }
+    handlers.turnStarted({ turn: { id: 'turn-1' } });
+    const recoveryError =
+      'Encrypted content could not be decrypted or parsed. code=invalid_encrypted_content';
+    handlers.error({
+      threadId: 'start-thread-id',
+      turnId: 'turn-1',
+      willRetry: false,
+      error: {
+        message: 'Bad request',
+        additionalDetails: recoveryError,
+        codexErrorInfo: 'badRequest',
+      },
+    });
+    handlers.itemStarted({
+      turnId: 'turn-1',
+      item: CINDY_MEMORY_WRITE_ITEM,
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write');
+    handlers.turnCompleted({
+      threadId: 'start-thread-id',
+      turn: {
+        id: 'turn-1',
+        status: 'failed',
+        error: { message: recoveryError },
+      },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)).toBeUndefined();
+    expect(turnStarts).toBe(1);
+
+    firstStart.resolve({ turn: { id: 'turn-1' } });
+    await sendPromise.catch(() => undefined);
+    await handle.send({ type: 'user', content: 'second' });
+    expect(turnStarts).toBe(2);
+    handlers.itemStarted({
+      turnId: 'turn-2',
+      item: {
+        ...CINDY_MEMORY_WRITE_ITEM,
+        id: 'item-cindy-write-recovered',
+      },
+    });
+    expect(peekCodexCindyMemoryWriteSlot(instanceId)?.itemId).toBe('item-cindy-write-recovered');
+    await handle.close();
+  });
 });
 
 describe('CodexAgent MCP thread context hooks', () => {

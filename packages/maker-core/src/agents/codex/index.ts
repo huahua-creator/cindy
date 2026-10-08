@@ -8682,7 +8682,7 @@ assertRouteCurrent();
      * 转圈 / scheduler 把 run 记 failed / IM 转播 finalize),再 turn/interrupt 让
      * daemon 侧那个 turn 停掉(与用户手动 Stop 同路径,thread 保持可用)。
      */
-    function onUpstreamIdleTimeout(opts?: {
+    function onUpstreamIdleTimeout(timeoutOpts?: {
       reason?: string;
       timeoutMs?: number;
       message?: string;
@@ -8692,16 +8692,16 @@ assertRouteCurrent();
     }): void {
       if (closed) return;
       const pendingTurnId =
-        opts?.allowPendingTurnStart && !isTurnInFlight && isTurnStartPending
+        timeoutOpts?.allowPendingTurnStart && !isTurnInFlight && isTurnStartPending
           ? reconnectStallTurnId
           : null;
       if (!isTurnInFlight && !pendingTurnId) return;
-      if (!opts?.ignorePendingTools && pendingToolItemIds.size > 0) return;
-      const idleMs = opts?.timeoutMs ?? upstreamIdleTimeoutMs;
+      if (!timeoutOpts?.ignorePendingTools && pendingToolItemIds.size > 0) return;
+      const idleMs = timeoutOpts?.timeoutMs ?? upstreamIdleTimeoutMs;
       const msSinceLast =
         upstreamIdleLastEventAt > 0 ? Date.now() - upstreamIdleLastEventAt : null;
       const turnId = currentTurnId ?? pendingTurnId;
-      const timeoutReason = opts?.reason ?? 'upstream_response_idle_timeout';
+      const timeoutReason = timeoutOpts?.reason ?? 'upstream_response_idle_timeout';
       const deferTurnCleanupUntilInterrupt =
         timeoutReason === 'codex_reconnect_stalled' ||
         timeoutReason === 'upstream_response_idle_timeout';
@@ -8712,7 +8712,7 @@ assertRouteCurrent();
         reconnectStallCleanupTurnId = turnId;
         reconnectStallDeferredTurnCompletion = null;
       }
-      log.warn(opts?.logLabel ?? 'upstream-response-idle watchdog tripped — interrupting current turn', {
+      log.warn(timeoutOpts?.logLabel ?? 'upstream-response-idle watchdog tripped — interrupting current turn', {
         idleMs,
         threadId,
         turnId,
@@ -8728,7 +8728,7 @@ assertRouteCurrent();
           // reason 与 claude-code 侧共用同一稳定 key(renderer i18n 映射,规则 18);
           // message 仅作非 renderer 消费方(IM / orca / 日志)的英文兜底。
           reason: timeoutReason,
-          message: opts?.message ??
+          message: timeoutOpts?.message ??
             (`The upstream response has been silent for ${Math.round(idleMs / 1000)}s; ` +
               'the turn was interrupted automatically to avoid hanging forever. ' +
               'You can send the next message to continue.'),
@@ -8918,6 +8918,12 @@ assertRouteCurrent();
         // 在 ACK 失败后必须把本地 busy 放下，否则 isTurnRunning() 恒 true，自动续跑
         // 会被 SESSION_RUNNING 挡住，只能干等到 Session 观察到 eventQueue.end()。
         if (currentTurnId === turnId || currentTurnId === null) {
+          if (turnId) {
+            forgetCodexCindyMemoryWriteSlotsForTurn({
+              sessionInstanceId: opts.sessionInstanceId,
+              turnId,
+            });
+          }
           isTurnInFlight = false;
           currentTurnId = null;
         }
@@ -10881,6 +10887,10 @@ assertRouteCurrent();
               // 等响应建立 turn 归属后再由 completed 这一唯一入口重进并执行重投。
               turnsCompletedBeforeStartResp.add(turn.id);
               terminalErroredTurnIds.add(turn.id);
+              forgetCodexCindyMemoryWriteSlotsForTurn({
+                sessionInstanceId: opts.sessionInstanceId,
+                turnId: turn.id,
+              });
               dismissPendingUserInputForTurn(turn.id, 'turn_failed');
               clearActiveToolContextsForTurn(turn.id);
               stopActiveRolloutPlanFallback();
@@ -10985,6 +10995,10 @@ assertRouteCurrent();
       }
       const completedTurnWasPlanMode = currentTurnPlanModeActive;
       if (currentTurnId === turn.id || currentTurnId === null) {
+        forgetCodexCindyMemoryWriteSlotsForTurn({
+          sessionInstanceId: opts.sessionInstanceId,
+          turnId: turn.id,
+        });
         isTurnInFlight = false;
         currentTurnId = null;
         currentTurnPlanModeActive = false;
@@ -11452,6 +11466,10 @@ assertRouteCurrent();
       // 下一次重投也没有终态事件, 永久悬空(review #844 codex P1)。与错误自带 id 时的
       // 死 turn 处理保持一致。
       if (currentTurnId === turnId) {
+        forgetCodexCindyMemoryWriteSlotsForTurn({
+          sessionInstanceId: opts.sessionInstanceId,
+          turnId,
+        });
         dismissPendingUserInputForTurn(turnId, 'turn_failed');
         clearActiveToolContextsForTurn(turnId);
         stopActiveRolloutPlanFallback();
@@ -11760,6 +11778,10 @@ assertRouteCurrent();
         // 只在确认是同一个 turn 时清: 真有别的 turn 活着说明这条错误不针对当前轮,
         // 那时本就不该补排。
         if (deadTurnId && currentTurnId === deadTurnId) {
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: deadTurnId,
+          });
           dismissPendingUserInputForTurn(deadTurnId, 'turn_failed');
           clearActiveToolContextsForTurn(deadTurnId);
           stopActiveRolloutPlanFallback();
@@ -11797,6 +11819,10 @@ assertRouteCurrent();
       // 该 turn 在 app-server 侧确实已经死了：它挂起的审批 / user-input 必须清掉，
       // 否则重投出来的新 turn 会与旧 turn 的悬空交互混在一起。
       if (deadTurnId) {
+        forgetCodexCindyMemoryWriteSlotsForTurn({
+          sessionInstanceId: opts.sessionInstanceId,
+          turnId: deadTurnId,
+        });
         dismissPendingUserInputForTurn(deadTurnId, 'turn_failed');
         clearActiveToolContextsForTurn(deadTurnId);
       } else {
@@ -12116,7 +12142,13 @@ assertRouteCurrent();
         terminalDescendantTurnIds.clear();
         stopActiveRolloutPlanFallback();
         resetUpstreamIdleForTurnEnd();
-        if (currentTurnId) terminalErroredTurnIds.add(currentTurnId);
+        if (currentTurnId) {
+          terminalErroredTurnIds.add(currentTurnId);
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: currentTurnId,
+          });
+        }
         currentTurnId = null;
         isTurnInFlight = false;
         isTurnStartPending = false;
@@ -13138,6 +13170,10 @@ assertRouteCurrent();
         }
         if (terminalTurnId) {
           terminalErroredTurnIds.add(terminalTurnId);
+          forgetCodexCindyMemoryWriteSlotsForTurn({
+            sessionInstanceId: opts.sessionInstanceId,
+            turnId: terminalTurnId,
+          });
           dismissPendingUserInputForTurn(terminalTurnId, 'turn_failed');
           clearActiveToolContextsForTurn(terminalTurnId);
         }
