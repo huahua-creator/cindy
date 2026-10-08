@@ -11,16 +11,20 @@ function Sha256([string]$path) {
   return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 function StopCindy {
-  Get-Process -Name Cindy -ErrorAction SilentlyContinue | ForEach-Object {
-    Log ('stop pid=' + $_.Id)
-    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+  for ($i = 0; $i -lt 8; $i++) {
+    $running = @(Get-Process -Name Cindy -ErrorAction SilentlyContinue)
+    if ($running.Count -eq 0) {
+      Log 'cindy stopped'
+      return
+    }
+    Log ('stop attempt=' + ($i + 1) + ' pids=' + (($running | ForEach-Object { $_.Id }) -join ','))
+    foreach ($p in $running) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
   }
-  Start-Sleep -Seconds 3
   $left = @(Get-Process -Name Cindy -ErrorAction SilentlyContinue)
   if ($left.Count -gt 0) {
-    Log ('still running after stop: ' + (($left | ForEach-Object { $_.Id }) -join ','))
-    foreach ($p in $left) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 2
+    Log ('cindy still running after stop: ' + (($left | ForEach-Object { $_.Id }) -join ','))
+    throw 'Cindy still running; silent NSIS would show the running-app dialog and exit 1602'
   }
 }
 function InstallSetup([string]$setup) {
@@ -119,8 +123,20 @@ if (-not $ok) {
   RestoreOld
   exit 1
 }
+if (-not (Test-Path -LiteralPath $exe)) {
+  Log 'Cindy.exe MISSING after verified install; rolling back'
+  RestoreOld
+  exit 1
+}
 Log 'launch Cindy'
 Start-Process -FilePath $exe
+Start-Sleep -Seconds 3
+$launched = @(Get-Process -Name Cindy -ErrorAction SilentlyContinue)
+if ($launched.Count -eq 0) {
+  Log 'Cindy did not stay running after launch'
+  exit 1
+}
+Log ('launched pids=' + (($launched | ForEach-Object { $_.Id }) -join ','))
 Log 'done'
 Log 'VISIBLE CHECK REQUIRED: sidebar CN · 0.1.97 Beta; About 0.1.97; get-app-version still 0.0.0'
 exit 0
