@@ -59,10 +59,11 @@ function parseArgs() {
   const outDir = out['out-dir'] || null;
   const appName = out['app-name'] || PACKAGED_APP_NAME;
   const pluginStorage = args.includes('--plugin-storage');
-  return { platform, arch, outDir, appName, pluginStorage };
+  const budgetRecovery = args.includes('--budget-recovery');
+  return { platform, arch, outDir, appName, pluginStorage, budgetRecovery };
 }
 
-const { platform, arch, outDir, appName, pluginStorage } = parseArgs();
+const { platform, arch, outDir, appName, pluginStorage, budgetRecovery } = parseArgs();
 
 if (!['win32', 'darwin', 'linux'].includes(platform)) {
   console.error(`[smoke] ERROR: unsupported --platform=${platform}`);
@@ -172,6 +173,7 @@ const child = spawn(
     '--smoke-test',
     `--smoke-user=${SMOKE_USER}`,
     ...(pluginStorage ? ['--smoke-plugin-storage'] : []),
+    ...(budgetRecovery ? ['--disable-sub2api-budget'] : []),
     `--user-data-dir=${tmpUserData}`,
   ],
   {
@@ -235,6 +237,14 @@ child.on('exit', (code, signal) => {
   }
 
   // 验收
+  if (
+    (budgetRecovery && parsed.budget_receipts_disabled !== true) ||
+    (!budgetRecovery && parsed.budget_receipts_disabled !== undefined && parsed.budget_receipts_disabled !== false)
+  ) {
+    console.error('[smoke] FAIL: budget recovery startup mode mismatch');
+    cleanupUserData();
+    process.exit(1);
+  }
   if (parsed.ok !== true) {
     console.error(`[smoke] FAIL: main reported ok=false, error=${parsed.error || '(none)'}`);
     cleanupUserData();

@@ -4,7 +4,7 @@ import { listWorktreeRecycleStatus, controlWorktreeRecycle } from './worktree/re
 import { registerFilePeerIpc } from './device-link/filePeer';
 import { registerTaskMigrationIpc } from './task-migration/service';
 import { registerLoginItemIpc } from './login-item-ipc.js';
-import { startBudgetReceiptRecovery } from './maker-host/sub2api-budget.js';
+import { isBudgetReceiptRecoveryMode, startBudgetReceiptRecovery } from './maker-host/sub2api-budget.js';
 import {
   createLatestSourceVersionReader,
   sourceChannel,
@@ -8788,6 +8788,7 @@ async function runSmokeTest(
     const payload = {
       ok: true,
       schema_version: schemaVersion,
+      budget_receipts_disabled: isBudgetReceiptRecoveryMode(),
       tables: {
         sessions: sessionsCount,
         messages: messagesCount,

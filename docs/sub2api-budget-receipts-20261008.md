@@ -54,6 +54,58 @@ extremely long-lived renderer can show stale pending until reload. Formal
 profile migration, live receipt acceptance, packaged installation and real
 process-crash validation are not implied by unit/restart simulations.
 
-Rollback should first disable this optional connection integration. Preserve
-the previous custom package and user data; do not downgrade or rewrite historical
-migrations. Do not use a public stock application as the rollback package.
+## Schema-preserving service recovery
+
+After normal exit, a build containing this recovery option can be started by
+passing the exact `--disable-sub2api-budget` argument to **Cindy.exe**, not the
+Setup installer. This process-local flag is frozen at module load. It bypasses
+budget observation, credential/config reads by that service, message binding,
+receipt requests, its recovery timer and observation cleanup. The original model
+fetch function and response stream are preserved. Ordinary model requests still
+incur their usual costs; this flag does not affect provider accounting or SDK
+estimates. Existing budget badges/metadata remain and pending badges can stay
+pending; recovery does not rewrite them.
+
+This is an advanced diagnostic launch option, not a persisted preference. Start
+without the flag after normal exit to resume the optional integration according
+to its existing connection settings. Passing the flag to a second process while
+Cindy is already running does not reconfigure the existing process. Never force
+stop tasks to use it.
+
+Keep schema 124. Do not install a schema-122 package on an upgraded database, edit
+migration metadata, or restore an old database over new messages. Recovery mode
+only isolates the budget service; it does not repair earlier initialization,
+migration, renderer or unrelated failures. Those require a schema-compatible
+forward fix. This mode is not read-only: ordinary app startup and session writes
+remain, including migration/backup behavior if the profile has not yet upgraded.
+Coordinate the user's data-maintenance constraints before installation.
+
+For the reviewed candidate, first verify its source metadata and installer hash.
+Once installed and fully stopped, the ordinary application launch command is:
+
+```powershell
+Start-Process -FilePath "$env:LOCALAPPDATA/Programs/Cindy/Cindy.exe" -ArgumentList '--disable-sub2api-budget' -WindowStyle Normal
+```
+
+This command is documentation, not an installation or restart performed by this
+change. Custom install paths must use the verified actual executable.
+
+The packaged smoke exposes `budget_receipts_disabled` from the same immutable
+budget-module flag. From `apps/desktop`, run both modes against the same package:
+
+```powershell
+node scripts/smoke-packaged.mjs --platform=win32 --arch=x64
+node scripts/smoke-packaged.mjs --platform=win32 --arch=x64 --budget-recovery
+```
+
+Both use synthetic temporary profiles. Recovery smoke requires an explicit true
+result; missing support is failure. Default smoke requires false when present,
+and remains compatible with older packages that omit the diagnostic field.
+
+Recovery-mode review (2026-10-09): `context_pre_review`, gpt-5.6-sol / medium,
+reviewed v7 before implementation and the final source diff afterwards: GO,
+no P0/P1. Guards precede dependency access; startup-mode parsing is immutable;
+smoke rejects unsupported recovery mode; default behavior is unchanged.
+49 focused tests, Desktop typecheck, migration validation, documentation checks,
+script syntax and diff-check passed. Native packaged argv verification is a
+separate post-build step; no live profile or installation is implied here.

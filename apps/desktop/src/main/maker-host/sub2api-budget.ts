@@ -39,6 +39,12 @@ import {
 } from '../../shared/sub2apiBudget.js';
 
 const log = createLogger('sub2api-budget');
+// Process-local recovery only: never downgrade schema or rewrite saved connections.
+const budgetServiceDisabled = process.argv.includes('--disable-sub2api-budget');
+/** Read-only startup diagnostic, also used by the isolated packaged smoke. */
+export function isBudgetReceiptRecoveryMode(): boolean {
+  return budgetServiceDisabled;
+}
 interface Settings {
   connections: Array<{ providerId: string; responsesUrl: string }>;
 }
@@ -70,6 +76,7 @@ const settings = createOverrideSettingsFile<Settings>({
 });
 
 function scope() {
+  if (budgetServiceDisabled) return null;
   const stopSignal = shutdown.signal;
   if (!app.isReady() || isAppSessionBoundaryPending() || stopSignal.aborted) return null;
   const owner = getActiveAppSession();
@@ -114,6 +121,7 @@ function connection(providerId: string) {
   return { url, key, generation, revision };
 }
 export function captureBudgetMessageBinding(sessionId: string) {
+  if (budgetServiceDisabled) return null;
   try {
     const s = scope();
     const providerId = getSessionProvider(sessionId);
@@ -180,6 +188,7 @@ async function mutate(
 }
 
 export async function budgetMessagePersisted(binding: RequestBinding | null, clientId: string) {
+  if (budgetServiceDisabled) return;
   if (!binding?.valid()) return;
   try {
     const result = await mutate(binding, {
@@ -207,6 +216,7 @@ export function withBudgetObservation(
   providerId: string,
   url: string,
 ): typeof fetch {
+  if (budgetServiceDisabled) return fetchImpl;
   return async (input, init) => {
     const binding = sessionId ? captureBudgetMessageBinding(sessionId) : null;
     const actual =
@@ -326,6 +336,10 @@ let interval: ReturnType<typeof setInterval> | undefined;
 let shutdown = new AbortController();
 const cooldowns = new Map<string, number>();
 export function startBudgetReceiptRecovery(): () => void {
+  if (budgetServiceDisabled) {
+    log.warn('Budget receipt service disabled by startup recovery flag');
+    return () => {};
+  }
   if (!interval) {
     shutdown = new AbortController();
     interval = setInterval(() => void pumpBudgetReceipts(), 10000);
