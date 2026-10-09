@@ -289,6 +289,8 @@ function appendManagedImageReferences(
 export interface SessionSendOptions extends SendOptions {
   /** Host-owned authorization refresh after all async preparation, before vendor dispatch. */
   resolveAutoReviewUserIntent?: () => Promise<AutoReviewUserIntent>;
+  /** Host-only final async validation; runs after accepted preparation and before vendor dispatch. */
+  beforeVendorDispatch?: () => void | Promise<void>;
   /**
    * Turn reservation 建立后的原子准备钩子。
    *
@@ -738,6 +740,7 @@ export class Session {
       onDispatching,
       onTurnReserved,
       resolveAutoReviewUserIntent,
+      beforeVendorDispatch,
       ...handleOpts
     } = opts ?? {};
     const cancelledBeforeReservation = (): SessionSendResult | null =>
@@ -888,6 +891,11 @@ export class Session {
         handleOpts[AUTO_REVIEW_USER_INTENT] = await resolveAutoReviewUserIntent();
         const cancelledAfterAuthorization = finishCancelledBeforeDispatch();
         if (cancelledAfterAuthorization !== null) return cancelledAfterAuthorization;
+      }
+      if (beforeVendorDispatch) {
+        await beforeVendorDispatch();
+        const cancelledAfterValidation = finishCancelledBeforeDispatch();
+        if (cancelledAfterValidation !== null) return cancelledAfterValidation;
       }
       reservation.phase = 'dispatching';
       // 越过 dispatch 边界才记 origin — cancelled-before-dispatch 早返回不会到这,

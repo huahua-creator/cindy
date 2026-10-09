@@ -12,7 +12,7 @@ export function snapshotClaudeMcpExclusions(opts: {
     typeof name !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(name) || name.includes('__'))) {
     throw new Error('claudeExcludedMcpServers requires at most 32 exact MCP server names (letters, digits, hyphens or single underscores)');
   }
-  if (value.length && (opts.remoteHostId || opts.botRuntimeProfile || opts.reviewMode || opts.resumeSessionId)) {
+  if (opts.remoteHostId || opts.botRuntimeProfile || opts.reviewMode || opts.resumeSessionId) {
     throw new Error('claudeExcludedMcpServers supports only fresh local ordinary sessions');
   }
   return Object.freeze([...new Set(value as string[])]);

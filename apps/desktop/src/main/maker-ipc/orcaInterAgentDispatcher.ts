@@ -112,6 +112,9 @@ export type OrcaInterAgentSendToSessionInternalResult =
         | 'LEAD_NOT_SUPPORTED'
         // create + useWorktree 专用;dispatcher 恒走 jump,不会收到,仅为镜像 register.ts 联合形状。
         | 'WORKTREE_UNAVAILABLE'
+        // Diagnostic create only; mirror the shared sender, never produced by this jump dispatcher.
+        | 'PRECONDITION_FAILED'
+        | 'CLEANUP_INCOMPLETE'
         | 'INTERNAL';
       message: string;
     };

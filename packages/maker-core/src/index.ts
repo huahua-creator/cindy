@@ -196,3 +196,4 @@ export {
 } from './contacts/manager.js';
 
 export { LIBRARY_READ_ROOT, parseLibraryAssetRef, resolveLibraryAssetPath } from './agents/shared/library-native-read.js';
+export { snapshotClaudeMcpExclusions } from './agents/claude-code/mcp-exclusions.js';

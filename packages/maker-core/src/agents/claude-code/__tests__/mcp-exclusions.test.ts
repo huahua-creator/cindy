@@ -4,9 +4,10 @@ import { ClaudeCodeAgent } from '../index.js';
 import type { AgentDeps } from '../../base-agent.js';
 
 describe('fresh diagnostic MCP exclusions', () => {
-  it('keeps absent and empty overrides inert, including existing session contexts', () => {
+  it('keeps absent overrides inert and accepts an explicit empty fresh profile', () => {
     expect(snapshotClaudeMcpExclusions({})).toEqual([]);
-    expect(snapshotClaudeMcpExclusions({ resumeSessionId: 'existing', vendorOptions: { claudeExcludedMcpServers: [] } })).toEqual([]);
+    expect(snapshotClaudeMcpExclusions({ resumeSessionId: 'existing' })).toEqual([]);
+    expect(snapshotClaudeMcpExclusions({ vendorOptions: { claudeExcludedMcpServers: [] } })).toEqual([]);
   });
 
   it('snapshots exact server names without sharing caller-owned mutable state', () => {
@@ -32,6 +33,8 @@ describe('fresh diagnostic MCP exclusions', () => {
 
   it.each([{ remoteHostId: 'remote' }, { botRuntimeProfile: {} }, { reviewMode: true }, { resumeSessionId: 'old' }])('rejects unsupported contexts: %j', context => {
       expect(() => snapshotClaudeMcpExclusions({ ...context, vendorOptions: { claudeExcludedMcpServers: ['wwise-mcp'] } }))
+        .toThrow('fresh local ordinary');
+      expect(() => snapshotClaudeMcpExclusions({ ...context, vendorOptions: { claudeExcludedMcpServers: [] } }))
         .toThrow('fresh local ordinary');
     });
 });

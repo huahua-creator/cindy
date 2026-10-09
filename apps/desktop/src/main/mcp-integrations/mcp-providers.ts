@@ -686,6 +686,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
         model,
         effort,
         fast,
+        claudeExcludedMcpServers,
       }) => {
         const svc = tryGetOrcaCollabService();
         if (!svc) {
@@ -704,6 +705,7 @@ export function createDesktopMcpProviders(deps: DesktopMcpProvidersDeps): LiziMc
             title,
             useWorktree,
             workingDir,
+            ...(claudeExcludedMcpServers !== undefined ? { claudeExcludedMcpServers } : {}),
             ...(hasExecutionOverrides
               ? {
                   execution: {

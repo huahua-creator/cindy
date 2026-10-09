@@ -18,6 +18,69 @@ function parsePayload(result: unknown): Record<string, unknown> {
 }
 
 describe("cindy_helper MCP server", () => {
+  it('exposes fresh Claude diagnostic profiles through the existing discovered handoff tool', async () => {
+    const sendToSession = vi.fn(async (params: { claudeExcludedMcpServers?: string[] }) => ({
+      ok: true as const, targetSessionId: TARGET_SESSION_ID, agentKind: 'claude-code' as const,
+      wakeKind: 'created' as const, targetTitle: 'diagnostic', targetLastUserSendAt: null,
+      model: 'model', providerId: 'provider',
+      ...(params.claudeExcludedMcpServers !== undefined ? { claudeExcludedMcpServers: params.claudeExcludedMcpServers } : {}),
+    }));
+    const server = createXdtHelperMcpServer({ sendToSession }, {
+      agentKind: 'claude-code', workingDir: '/repo', sessionId: 'source',
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'diagnostic-profile-test', version: '1' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const call = (args: Record<string, unknown>) => client.callTool({ name: 'call_tool', arguments: { name: 'send_to_session', args } });
+    try {
+      const discovery = await client.callTool({ name: 'list_tools', arguments: { category: 'handoff' } });
+      expect(JSON.stringify(discovery)).toContain('claude_excluded_mcp_servers');
+      expect((await client.listTools()).tools.map(t => t.name).sort()).toEqual(['call_tool', 'list_tools']);
+      for (const names of [[], ['wwise-mcp']]) {
+        sendToSession.mockClear();
+        const result = await call({ message: 'Only OK', claude_excluded_mcp_servers: names });
+        expect(parsePayload(result)).toMatchObject({ ok: true, wake_kind: 'created',
+          claude_excluded_mcp_servers: names, model: 'model', provider_id: 'provider' });
+        expect(sendToSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+          dispatcherSessionId: 'source', claudeExcludedMcpServers: names,
+        }));
+      }
+      for (const extra of [{ target_session_id: 'existing' }, { model: 'other' }, { agent_kind: 'codex' },
+        { effort: 'high' }, { fast: true }, { working_dir: '/elsewhere' }, { use_worktree: true }]) {
+        sendToSession.mockClear();
+        expect(parsePayload(await call({ message: 'Only OK', claude_excluded_mcp_servers: [], ...extra })))
+          .toMatchObject({ ok: false, errorCode: 'INVALID_ARGS' });
+        expect(sendToSession).not.toHaveBeenCalled();
+      }
+      for (const names of [['*'], ['a__b'], [null], 'wwise-mcp']) {
+        sendToSession.mockClear();
+        const result = await call({ message: 'Only OK', claude_excluded_mcp_servers: names });
+        expect(result.isError).toBe(true);
+        expect(sendToSession).not.toHaveBeenCalled();
+      }
+      sendToSession.mockClear();
+      expect(parsePayload(await call({ message: 'Only OK' }))).not.toHaveProperty('claude_excluded_mcp_servers');
+      expect(sendToSession.mock.calls[0][0]).not.toHaveProperty('claudeExcludedMcpServers');
+    } finally { await client.close(); await server.close(); }
+  });
+
+  it.each(['preserved-closed', 'cleanup-incomplete'] as const)('preserves diagnostic failure receipt: %s', async draftState => {
+    const errorCode = draftState === 'preserved-closed' ? 'PRECONDITION_FAILED' : 'CLEANUP_INCOMPLETE';
+    const server = createXdtHelperMcpServer({ sendToSession: async () => ({ ok: false, errorCode,
+      message: 'Draft retained', diagnostic: { targetSessionId: TARGET_SESSION_ID, dispatchStarted: false, draftState } }) },
+      { agentKind: 'claude-code', workingDir: '/repo', sessionId: 'source' });
+    const client = new Client({ name: 'diagnostic-failure-test', version: '1' });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(st), client.connect(ct)]);
+    try {
+      const result = await client.callTool({ name: 'call_tool', arguments: { name: 'send_to_session',
+        args: { message: 'OK', claude_excluded_mcp_servers: [] } } });
+      expect(result.isError).toBe(true);
+      expect(parsePayload(result)).toMatchObject({ ok: false, errorCode, data: {
+        target_session_id: TARGET_SESSION_ID, dispatch_started: false, draft_state: draftState, hint: 'Draft retained' } });
+    } finally { await client.close(); await server.close(); }
+  });
+
   it.each(['default', 'bot-main'] as const)('exposes runtime declarations through the same helper tool for %s', async (surface) => {
     const runtimeCapabilities = vi.fn(async () => ({ ok: true, capabilities: [{ server: 'fixture' }] }));
     const server = createXdtHelperMcpServer({ resolveSurface: async () => surface, runtimeCapabilities }, {

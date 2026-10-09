@@ -2960,6 +2960,47 @@ describe('Session turn send guard', () => {
     expect(order).toEqual(['barrier-start', 'barrier-end', 'accepted', 'provider']);
   });
 
+  it.each(['pass', 'throw', 'cancel', 'omitted'])('beforeVendorDispatch barrier: %s', async mode => {
+    const order: string[] = [];
+    let release!: () => void;
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const handle = createHandle({ id: `vendor-gate-${mode}` });
+    handle.send = vi.fn(async (_message, opts) => {
+      expect(opts).not.toHaveProperty('beforeVendorDispatch'); order.push('vendor');
+    });
+    const session = new Session({ id: `vendor-gate-${mode}`, agentKind: 'codex', workDir: '/repo',
+      handle, capabilities: createAgent(async () => handle).capabilities, logger: createLogger() });
+    const undispatched = vi.fn();
+    session.setTurnLifecycleObserver({ beforeProviderStart() {}, onUndispatched: undispatched, onTerminal() {} });
+    const sending = session.send('first', {
+      onAccepted: () => { order.push('accepted'); },
+      resolveAutoReviewUserIntent: async () => { order.push('authorization'); return 'test intent'; },
+      ...(mode === 'omitted' ? {} : { beforeVendorDispatch: async () => {
+        order.push('gate'); await barrier;
+        if (mode === 'throw') throw new Error('route changed');
+        order.push('validated');
+      } }),
+      onDispatching: () => { order.push('dispatching'); },
+    });
+    if (mode !== 'omitted') {
+      await vi.waitFor(() => expect(order).toEqual(['accepted', 'authorization', 'gate']));
+      expect(handle.send).not.toHaveBeenCalled();
+      if (mode === 'cancel') await session.abort();
+      release();
+    }
+    if (mode === 'throw') await expect(sending).rejects.toThrow('route changed');
+    else await expect(sending).resolves.toEqual(mode === 'cancel'
+      ? { accepted: false, reason: 'cancelled-before-dispatch' } : { accepted: true });
+    if (mode === 'throw' || mode === 'cancel') {
+      expect(handle.send).not.toHaveBeenCalled(); expect(undispatched).toHaveBeenCalledOnce();
+      expect(session.isTurnRunning()).toBe(false);
+    } else {
+      expect(order).toEqual(mode === 'omitted' ? ['accepted', 'authorization', 'dispatching', 'vendor']
+        : ['accepted', 'authorization', 'gate', 'validated', 'dispatching', 'vendor']);
+      expect(undispatched).not.toHaveBeenCalled();
+    }
+  });
+
   it('awaits the host turn lifecycle barrier and releases an undispatched generation', async () => {
     const order: string[] = [];
     const handle = createHandle({ id: 'thread-host-turn-lifecycle' });

@@ -1,4 +1,7 @@
 import { openSession, setSessionOpeningModelAdmission } from '../localDb/sessionOpening.js';
+import { handoffMcpSourceFingerprint, readHandoffMcpProfile, sameHandoffRuntimeRoute, snapshotHandoffRuntime,
+  type HandoffDiagnosticFailure, type HandoffRuntimeRoute, type HandoffRuntimeSnapshot } from './handoffMcpProfile.js';
+import { getProviderRouteCredentialRevision } from '../maker-host/provider-route.js';
 import { createPluginTaskReviewResolver } from './pluginTaskReviewContext.js';
 import { isPluginTaskPermissionAllowed, assertPluginTaskResult, createPluginTaskService, readPluginTaskPlanReceipt, PluginTaskError, type PluginTaskService } from './pluginTaskService.js';
 import { assertPluginWorkerDirectoryScope, resolvePluginWorkerDirectory } from './pluginWorkerDirectory.js';
@@ -1827,6 +1830,8 @@ type SendToSessionInternalResult =
       effort?: SendToSessionCreateDefaults['effort'] | null;
       fastMode?: boolean;
       providerId?: string | null;
+      /** Requested fresh-handle profile, not observed tool removal or token savings. */
+      claudeExcludedMcpServers?: string[];
     }
   | {
       ok: false;
@@ -1845,8 +1850,11 @@ type SendToSessionInternalResult =
         // create + useWorktree 专用:workingDir 不是 git 仓库 / git 未装 / worktree 创建失败。
         // 显式要隔离却拿不到时硬报,不静默降级成共享工作树(调用方自行决定是否去掉参数重试)。
         | 'WORKTREE_UNAVAILABLE'
-        | 'INTERNAL';
+        | 'INTERNAL'
+        | 'PRECONDITION_FAILED'
+        | 'CLEANUP_INCOMPLETE';
       message: string;
+      diagnostic?: HandoffDiagnosticFailure;
     };
 
 /** 暴露给 xdt-helper MCP provider 的协同控制面，必须复用 IPC 同源业务路径。 */
@@ -1987,6 +1995,7 @@ interface OrcaCollabService {
     execution?: SendToSessionExecutionOverrides;
     /** Host-owned create defaults for non-session callers such as scheduler script tasks. */
     createDefaults?: SendToSessionCreateDefaults;
+    claudeExcludedMcpServers?: string[];
   }) => Promise<SendToSessionInternalResult>;
   enableOrca: (
     leadSessionId: string,
@@ -7049,7 +7058,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     return verdict.kind === 'reroute' ? verdict.providerId : undefined;
   }
 
-  async function bootstrapSession(o: CreateOpts, assertAccess?: () => void): Promise<{
+  async function bootstrapSession(o: CreateOpts, assertAccess?: () => void,
+    onCreated?: (session: Awaited<ReturnType<typeof maker.createSession>>) => void,
+  ): Promise<{
     session: Awaited<ReturnType<typeof maker.createSession>>;
     didInjectOrcaInstructions: boolean;
     didInjectProjectContext: boolean;
@@ -7150,6 +7161,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     }
     assertAccess?.();
     const session = await maker.createSession(o);
+    onCreated?.(session);
     await markProjectContextIfNeeded(session.id, didInjectProjectContext);
     wireSessionToIpc(session);
     markOrcaMcpHydratedIfNeeded(session.id, o);
@@ -9180,7 +9192,26 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     inheritSourcePermissionMode?: boolean;
     /** Host-owned durable inputs use the coordinator even when idle. */
     forceQueue?: boolean;
+    claudeExcludedMcpServers?: string[];
   }): Promise<SendToSessionInternalResult> {
+    const mcpProfile = readHandoffMcpProfile(params);
+    if (!mcpProfile.ok) return mcpProfile;
+    const diagnosticReaders = {
+      owner: getCurrentDbClientSnapshot,
+      scopeGeneration: () => getActiveAppSession().generation,
+      boundaryPending: isAppSessionBoundaryPending,
+      session: (id: string) => maker.getSession(id),
+      control: getSessionRuntimeControlSnapshot,
+      provider: getSessionProvider,
+      effort: getSessionEffort,
+      fast: getSessionFastMode,
+      providerRevision: getProviderRouteCredentialRevision,
+    };
+    let diagnosticSource: HandoffRuntimeSnapshot | undefined;
+    if (mcpProfile.requested) {
+      try { diagnosticSource = snapshotHandoffRuntime(params.dispatcherSessionId!, diagnosticReaders); }
+      catch { return { ok: false, errorCode: 'INVALID_ARGS', message: 'Diagnostic source must have a stable local Claude runtime and explicit provider.' }; }
+    }
     const {
       targetSessionId,
       message,
@@ -9250,6 +9281,36 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       let createdPreviewClientId: string | null = null;
       let createdPreviewStarted = false;
       let handoffWorktree: { sessionId: string; meta: WorktreeMeta } | null = null;
+      let mcpSourceFingerprint: string | undefined;
+      let diagnosticTarget: Awaited<ReturnType<typeof maker.createSession>> | undefined;
+      let diagnosticTargetState: { instanceId: string; generation: number; permission: number | undefined; plan: number | undefined; turn: number } | undefined;
+      let diagnosticDraftId: string | undefined;
+      let diagnosticTurn: number | undefined;
+      let diagnosticDispatched = false;
+      let diagnosticDispatchRoute: HandoffRuntimeRoute | undefined;
+      const assertDiagnosticSourceRuntime = () => {
+        if (!diagnosticSource) return;
+        const current = snapshotHandoffRuntime(dispatcherSessionId!, diagnosticReaders, diagnosticSource);
+        if (!sameHandoffRuntimeRoute(current.route, diagnosticSource.route)) throw new Error('Diagnostic source route changed');
+      };
+      const assertDiagnosticTarget = () => {
+        assertDiagnosticSourceRuntime();
+        if (!diagnosticTarget || !diagnosticTargetState || !diagnosticSource
+          || diagnosticTarget.stablePermissionModeState?.mode !== 'ask'
+          || diagnosticTarget.stablePermissionModeState.generation !== diagnosticTargetState.permission
+          || diagnosticTarget.stablePlanModeState?.enabled !== true
+          || diagnosticTarget.stablePlanModeState.generation !== diagnosticTargetState.plan
+          || diagnosticTarget.getTurnGeneration() !== (diagnosticTurn ?? diagnosticTargetState.turn)
+          || (diagnosticTurn !== undefined && diagnosticTurn !== diagnosticTargetState.turn + 1)) {
+          throw new Error('Diagnostic target safety state changed');
+        }
+        const current = snapshotHandoffRuntime(diagnosticTarget.id, diagnosticReaders, {
+          owner: diagnosticSource.owner, scopeGeneration: diagnosticSource.scopeGeneration,
+          instance: diagnosticTarget, instanceId: diagnosticTargetState.instanceId, generation: diagnosticTargetState.generation,
+        });
+        if (!sameHandoffRuntimeRoute(current.route, diagnosticSource.route)) throw new Error('Diagnostic target route changed');
+        return current.route;
+      };
       try {
         const db = getDbClient().drizzle;
         let inherited: SendToSessionCreateDefaults;
@@ -9263,6 +9324,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
               errorCode: 'NOT_FOUND',
               message: `dispatcher session ${dispatcherSessionId} not found`,
             };
+          }
+          if (mcpProfile.requested && (meta.agentKind !== 'claude-code' || meta.remoteHostId)) {
+            return { ok: false, errorCode: 'INVALID_ARGS', message: 'Diagnostic MCP profiles require a local Claude Code source.' };
           }
           // working_dir 覆盖(#811):把新 session 落到指定项目目录,而不是恒继承
           // dispatcher 的目录。先于 worktree 预建校验——use_worktree 的 base 仓库
@@ -9290,21 +9354,37 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             .from(sessions)
             .where(eq(sessions.id, dispatcherSessionId))
             .limit(1);
+          if (mcpProfile.requested) {
+            if (!row || row.status !== 'active' || row.source !== 'desktop' || row.remoteHostId || row.orcaRole
+              || row.agentKind !== 'cc' || row.model !== meta.model || row.workingDir !== meta.workDir) {
+              return { ok: false, errorCode: 'INVALID_ARGS', message: 'Diagnostic MCP profiles require an active ordinary desktop Claude source.' };
+            }
+            const [botLink] = await db.select({ sessionId: botSessionLinks.sessionId }).from(botSessionLinks)
+              .where(eq(botSessionLinks.sessionId, dispatcherSessionId)).limit(1);
+            if (botLink) return { ok: false, errorCode: 'INVALID_ARGS', message: 'Diagnostic MCP profiles do not support Bot-linked sessions.' };
+            mcpSourceFingerprint = handoffMcpSourceFingerprint(row);
+            assertDiagnosticSourceRuntime();
+          }
           const inheritedBase: SendToSessionCreateDefaults = {
             agentKind: meta.agentKind,
             workingDir: resolvedWorkDir,
             // 覆盖目录必有真实项目目录 → 归 project 工作区(标题/侧栏分组按项目
             // 语义走);未覆盖时保持缺省继承,行为不变。
             ...(workingDirOverride !== undefined ? { workspaceKind: 'project' as const } : {}),
+            ...(mcpProfile.requested ? { workspaceKind: row!.workspaceKind } : {}),
             model: meta.model,
             effort: (row?.effort ?? undefined) as SendToSessionCreateDefaults['effort'],
             fastMode: !!row?.fastMode,
             providerId: row?.providerId,
+            ...(mcpProfile.requested ? {
+              model: diagnosticSource!.route.model, providerId: diagnosticSource!.route.providerId,
+              effort: diagnosticSource!.route.effort as CreateOpts['effort'], fastMode: diagnosticSource!.route.fastMode,
+            } : {}),
             // working_dir 覆盖时强制继承来源会话的权限档(review 反馈):把新目录
             // 以 Full access 打开是相对 dispatcher 的权限升级,跨项目 handoff
             // 不应隐式发生;未覆盖时保持既有缺省(bypassPermissions)不变。
             permissionMode:
-              inheritSourcePermissionMode || workingDirOverride !== undefined
+              mcpProfile.requested ? 'ask' : inheritSourcePermissionMode || workingDirOverride !== undefined
                 ? permissionModeOrAsk(row?.permissionMode)
                 : 'bypassPermissions',
           };
@@ -9384,6 +9464,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           inherited = createDefaults!;
         }
         const newTitle = title?.trim() || message.split('\n')[0].slice(0, 60);
+        if (mcpProfile.requested && inherited.agentKind !== 'claude-code') {
+          return { ok: false, errorCode: 'INVALID_ARGS', message: 'Diagnostic MCP target must remain Claude Code.' };
+        }
+        assertDiagnosticSourceRuntime();
         const createOpts = buildCreateOptsWithStderr({
           ...(handoffWorktree ? { id: handoffWorktree.sessionId } : {}),
           agentKind: inherited.agentKind,
@@ -9395,17 +9479,49 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           providerId: inherited.providerId,
           title: newTitle,
           permissionMode: inherited.permissionMode ?? 'bypassPermissions',
+          ...(mcpProfile.requested ? {
+            planMode: true,
+            vendorOptions: { claudeExcludedMcpServers: [...mcpProfile.names] },
+          } : {}),
         });
         const { row: openedRow, value: { session } } = await openSession({
+          ...(mcpProfile.requested ? { assertCurrent: assertDiagnosticSourceRuntime } : {}),
           id: createOpts.id, body: { title: newTitle,
             agentKind: inherited.agentKind === 'claude-code' ? 'cc' : inherited.agentKind,
             model: inherited.model, providerId: inherited.providerId, effort: inherited.effort,
             fastMode: !!inherited.fastMode, permissionMode: createOpts.permissionMode,
+            ...(mcpProfile.requested ? { planModeEnabled: true } : {}),
             workspaceKind: inherited.workspaceKind, workingDir: createOpts.workingDir },
         }, async (row, assertCurrent) => {
+          if (mcpProfile.requested) {
+            const [currentSource] = await db.select().from(sessions)
+              .where(eq(sessions.id, dispatcherSessionId!)).limit(1);
+            const [currentLink] = await db.select({ sessionId: botSessionLinks.sessionId }).from(botSessionLinks)
+              .where(eq(botSessionLinks.sessionId, dispatcherSessionId!)).limit(1);
+            if (currentLink || handoffMcpSourceFingerprint(currentSource) !== mcpSourceFingerprint
+              || row.agentKind !== 'cc' || row.model !== inherited.model
+              || (row.providerId ?? null) !== (inherited.providerId ?? null)
+              || (row.effort || undefined) !== (inherited.effort || undefined)
+              || row.fastMode !== Boolean(inherited.fastMode)) {
+              throw new Error('Diagnostic source or admitted route changed before creation');
+            }
+            assertCurrent();
+            // Persist the safe draft explicitly: Maker's legacy storage omits Plan.
+            diagnosticDraftId = row.id;
+            await db.insert(sessions).values({ ...row, permissionMode: 'ask', planModeEnabled: true }).run();
+          }
           const created = await bootstrapSession({ ...createOpts, id: row.id, model: row.model,
             providerId: row.providerId, effort: (row.effort || undefined) as CreateOpts['effort'],
-            fastMode: row.fastMode, workingDir: row.workingDir ?? createOpts.workingDir }, assertCurrent);
+            fastMode: row.fastMode, workingDir: row.workingDir ?? createOpts.workingDir }, assertCurrent,
+          mcpProfile.requested ? (target) => {
+            // Capture only. A failed/unpublished startup without this receipt is not proven closed.
+            diagnosticTarget = target;
+            diagnosticTargetState = { instanceId: target.instanceId,
+              generation: getSessionRuntimeControlSnapshot(target.id).generation,
+              permission: target.stablePermissionModeState?.generation,
+              plan: target.stablePlanModeState?.generation, turn: target.getTurnGeneration() };
+          } : undefined);
+          if (mcpProfile.requested) assertDiagnosticTarget();
           // A later owner check must not reclaim a worktree whose Session already exists.
           createdPreviewSessionId = created.session.id;
           return created;
@@ -9429,9 +9545,27 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         const clientId = createId();
         createdPreviewSessionId = session.id;
         createdPreviewClientId = clientId;
+        if (mcpProfile.requested) assertDiagnosticTarget();
+        const recheckDiagnosticBeforeDispatch = async () => {
+          const [currentSource] = await db.select().from(sessions).where(eq(sessions.id, dispatcherSessionId!)).limit(1);
+          const [link] = await db.select({ sessionId: botSessionLinks.sessionId }).from(botSessionLinks)
+            .where(eq(botSessionLinks.sessionId, dispatcherSessionId!)).limit(1);
+          if (link || handoffMcpSourceFingerprint(currentSource) !== mcpSourceFingerprint) throw new Error('Diagnostic source state changed');
+          const [target] = await db.select().from(sessions).where(eq(sessions.id, session.id)).limit(1);
+          if (!target || target.status !== 'active' || target.permissionMode !== 'ask' || target.planModeEnabled !== true) {
+            throw new Error('Diagnostic stored safety state changed');
+          }
+          assertDiagnosticTarget();
+        };
         const sendResult = await sendUserMessageWithAwaitedGitBaseline(session, message, clientId, {
-          planMode: false,
+          planMode: mcpProfile.requested ? true : false,
+          ...(mcpProfile.requested ? {
+            onTurnReserved: (generation: number) => { diagnosticTurn = generation; },
+            beforeProviderStart: () => { assertDiagnosticTarget(); },
+            beforeVendorDispatch: recheckDiagnosticBeforeDispatch,
+          } : {}),
           onAccepted: async () => {
+            if (mcpProfile.requested) await recheckDiagnosticBeforeDispatch();
             notifyAgentIslandUserPrompt(session, persistedContent ?? message, {
               source: 'send_to_session:create:onPersisting',
               clientId,
@@ -9449,7 +9583,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
             // (jump/resume 分支是既有 session 重建,不在此发,见 wakeKind:'resumed' 分支。)
             broadcastSessionCreated(session.id);
           },
-          onDispatching: () => dispatchAgentIslandUserPrompt(session.id),
+          onDispatching: () => {
+            if (mcpProfile.requested) {
+              diagnosticDispatchRoute = assertDiagnosticTarget();
+              diagnosticDispatched = true;
+            }
+            dispatchAgentIslandUserPrompt(session.id);
+          },
         });
         if (createdPreviewStarted) {
           if (sendResult.accepted) {
@@ -9463,6 +9603,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           }
         }
         assertDesktopSendDispatched(sendResult, 'send_to_session create');
+        if (mcpProfile.requested && !diagnosticDispatchRoute) {
+          diagnosticDispatched = true; // Accepted without our receipt: dispatch cannot be disproved.
+          throw new Error('Diagnostic dispatch receipt missing');
+        }
         log.info('sendToSession created new session', {
           dispatcherSessionId,
           newSessionId: session.id,
@@ -9481,8 +9625,52 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
           effort: openedRow.effort || null,
           fastMode: openedRow.fastMode,
           providerId: openedRow.providerId ?? null,
+          ...(mcpProfile.requested ? { claudeExcludedMcpServers: [...mcpProfile.names] } : {}),
+          ...(diagnosticDispatchRoute ? {
+            model: diagnosticDispatchRoute.model, providerId: diagnosticDispatchRoute.providerId,
+            effort: (diagnosticDispatchRoute.effort ?? null) as SendToSessionCreateDefaults['effort'] | null,
+            fastMode: diagnosticDispatchRoute.fastMode,
+          } : {}),
         };
       } catch (err) {
+        if (mcpProfile.requested) {
+          if (!diagnosticDispatched && createdPreviewStarted && createdPreviewSessionId && createdPreviewClientId) {
+            // Restore transient preview state only; preserve the draft and accepted message.
+            rollbackAgentIslandUserPrompt(createdPreviewSessionId, createdPreviewClientId,
+              'send_to_session:diagnostic:failed-before-dispatch');
+          }
+          let draftState: HandoffDiagnosticFailure['draftState'] = diagnosticDraftId ? 'cleanup-incomplete' : 'not-created';
+          if (diagnosticDraftId && !diagnosticDispatched && diagnosticTarget && diagnosticTargetState && diagnosticSource) {
+            try {
+              if (getCurrentDbClientSnapshot() !== diagnosticSource.owner || isAppSessionBoundaryPending()
+                || getActiveAppSession().generation !== diagnosticSource.scopeGeneration
+                || maker.getSession(diagnosticDraftId) !== diagnosticTarget
+                || diagnosticTarget.instanceId !== diagnosticTargetState.instanceId
+                || diagnosticTarget.isTurnRunning()
+                || getSessionRuntimeControlSnapshot(diagnosticDraftId).generation !== diagnosticTargetState.generation
+                || diagnosticTarget.stablePermissionModeState?.mode !== 'ask'
+                || diagnosticTarget.stablePermissionModeState.generation !== diagnosticTargetState.permission
+                || diagnosticTarget.stablePlanModeState?.enabled !== true
+                || diagnosticTarget.stablePlanModeState.generation !== diagnosticTargetState.plan
+                || diagnosticTarget.getTurnGeneration() !== diagnosticTargetState.turn
+                || (diagnosticTurn !== undefined && diagnosticTurn !== diagnosticTargetState.turn + 1)) {
+                throw new Error('Diagnostic target no longer exclusively owned');
+              }
+              const closed = await maker.closeSessionIfCurrent(diagnosticTarget, 'requested');
+              if (closed === 'closed' && diagnosticTarget.getStatus() === 'closed' && !maker.getSession(diagnosticDraftId)
+                && getCurrentDbClientSnapshot() === diagnosticSource.owner && !isAppSessionBoundaryPending()
+                && getActiveAppSession().generation === diagnosticSource.scopeGeneration) {
+                draftState = 'preserved-closed';
+              }
+            } catch { /* Preserve user changes and unknown runtimes; never delete a draft or its messages. */ }
+          }
+          return { ok: false, errorCode: draftState === 'cleanup-incomplete' ? 'CLEANUP_INCOMPLETE' : 'PRECONDITION_FAILED',
+            message: draftState === 'preserved-closed'
+              ? 'Diagnostic was not dispatched to the model. Its live handle is closed; the draft remains in the creating account and appears after refresh.'
+              : draftState === 'not-created' ? 'Diagnostic validation failed before task creation.'
+              : 'Diagnostic did not complete. Runtime cleanup or dispatch is unconfirmed; preserve the task in its creating account and do not retry blindly.',
+            diagnostic: { targetSessionId: diagnosticDraftId, dispatchStarted: diagnosticDispatched, draftState } };
+        }
         if (createdPreviewStarted && createdPreviewSessionId && createdPreviewClientId) {
           rollbackAgentIslandUserPrompt(
             createdPreviewSessionId,

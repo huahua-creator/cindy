@@ -35,6 +35,8 @@ export type SendToSessionCallback = (params: {
   effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
   /** create 模式可选:显式 Fast 开关；缺省继承 dispatcher。jump 忽略。 */
   fast?: boolean;
+  /** Explicit create-only diagnostic profile; [] is a baseline, not omission. */
+  claudeExcludedMcpServers?: string[];
 }) => Promise<
   ControlResult<
     {
@@ -51,6 +53,7 @@ export type SendToSessionCallback = (params: {
       effort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
       fastMode?: boolean;
       providerId?: string | null;
+      claudeExcludedMcpServers?: string[];
     },
     | "NOT_FOUND"
     | "ARCHIVED"
@@ -64,7 +67,13 @@ export type SendToSessionCallback = (params: {
     | "LEAD_NOT_SUPPORTED"
     | "WORKTREE_UNAVAILABLE"
     | "HOST_NOT_READY"
-  >
+    | "PRECONDITION_FAILED"
+    | "CLEANUP_INCOMPLETE"
+  > & { diagnostic?: {
+    targetSessionId?: string;
+    dispatchStarted: boolean;
+    draftState: 'not-created' | 'preserved-closed' | 'cleanup-incomplete';
+  } }
 >;
 
 export interface SendToSessionDeps {
@@ -77,6 +86,7 @@ export interface SendToSessionDeps {
 // 这是 LLM 点进 handoff 类目、看到本工具后的行为说明;选类目阶段的协同规避另见
 // lizi_xdtHelperMcpServer.ts 的 D_LIST_TOOLS(handoff 类目介绍)。
 const DESCRIPTION = [
+  '【一次性上下文诊断】claude_excluded_mcp_servers 可传精确服务器名数组（如 ["wwise-mcp"]），[] 是显式基线。只允许从本机普通 Claude Code 会话新建，继承来源目录和显式模型连接；Host 固定 ask 权限与 Plan 模式；不得同时传 target_session_id、agent_kind/model/effort/fast、working_dir 或 use_worktree=true。名单只作用于新句柄，不持久化；返回名单不是工具移除或 token 降幅的实测结果。普通 handoff 请省略此字段。',
   "⚠️【硬规则:发给已有任务时 target_session_id 必传】上层要求把消息发给某个已存在的任务(session / thread)时,必须传 target_session_id;不知道目标 id 就先用 history 类目的 list_sessions 查到再调用,不要省略。只有明确要为某个业务对象新建一个专属任务时才省略该参数——省略不会报错,而是静默新建一个任务、把消息当作首条输入并立刻跑一轮(返回 wake_kind=created + note)。把 created 误当成「已投给既有任务」会凭空多出一个任务并消耗 token。",
   "",
   '⚠️【不要用于"开协同 / 多 worker"】本工具 create 模式产出的是普通独立 session,不进入 Orca 协同分组或 Lead 右侧 worker 栏。用户明确要协同 team/worker 时才使用 cindy_orca；外部业务对象(issue / jira / pr)需要独立项目 session 时使用本工具。',
@@ -97,6 +107,7 @@ const DESCRIPTION = [
   `【create 边界】create 依赖当前 session 上下文继承配置;未绑定具体 ${BRAND_NAME} session 的 MCP 调用会返 LEAD_NOT_SUPPORTED,skill 应静默回退普通流程。注意:传了 id 但目标不存在会返 NOT_FOUND(绝不自动新建)——只有完全不传 id 才走 create。`,
   "",
   "【失败码语义】",
+  "- PRECONDITION_FAILED / CLEANUP_INCOMPLETE: 诊断失败时查看 data.target_session_id、dispatch_started、draft_state。preserved-closed 表示未派发模型且原句柄已关闭，草稿和可能已落库的消息仍保留在创建账号，刷新后可见；cleanup-incomplete 表示关闭或派发状态无法确认，不要盲目重试。这不是永久只读沙箱。",
   "- NOT_FOUND: 目标 session 不存在。skill 应清掉自己的绑定并回退到新建/普通流程。",
   "- ARCHIVED: 目标 session 已归档。skill 应决定是清绑定、回退新流程,还是等未来的 unarchive 工具。",
   "- DELETED: 目标 session 已删除。skill 应清绑定并回退。",
@@ -193,6 +204,9 @@ export function registerSendToSessionTool(
         .describe(
           "仅 create 模式可选:Fast 模式开关。目标 Agent/provider/model 不支持时创建前失败；jump 模式忽略。",
         ),
+      claude_excluded_mcp_servers: z.array(z.string().min(1).max(64)
+        .regex(/^[A-Za-z0-9_-]+$/).refine(name => !name.includes('__'))).max(32).optional()
+        .describe('Explicit one-shot context diagnostic for create from an ordinary local Claude Code session. [] is the baseline. Requires an explicit provider; inherits source route and directory, with Host-fixed ask permission and Plan mode; do not combine with target_session_id, execution overrides, working_dir or use_worktree=true. Exact server names only. Not persistent across resumed handles; returned names are requested settings, not measured token savings.'),
     },
     handler: async ({
       target_session_id,
@@ -204,7 +218,12 @@ export function registerSendToSessionTool(
       model,
       effort,
       fast,
+      claude_excluded_mcp_servers,
     }) => {
+      if (claude_excluded_mcp_servers !== undefined && (target_session_id !== undefined || agent_kind !== undefined
+        || model !== undefined || effort !== undefined || fast !== undefined || working_dir !== undefined || use_worktree === true)) {
+        return errorPayload('INVALID_ARGS', 'Diagnostic MCP profiles require a fresh task inheriting the current Claude source configuration.');
+      }
       const ctx = deps.getSessionContext();
       const result = await deps.sendToSession({
         targetSessionId: target_session_id,
@@ -217,6 +236,7 @@ export function registerSendToSessionTool(
         ...(model !== undefined ? { model } : {}),
         ...(effort !== undefined ? { effort } : {}),
         ...(fast !== undefined ? { fast } : {}),
+        ...(claude_excluded_mcp_servers !== undefined ? { claudeExcludedMcpServers: claude_excluded_mcp_servers } : {}),
       });
 
       if (!result.ok) {
@@ -226,7 +246,11 @@ export function registerSendToSessionTool(
             `${BRAND_NAME} 主进程会话服务尚未就绪。请告知用户稍等几秒后重试。`,
           );
         }
-        return errorPayload(result.errorCode, result.message);
+        return errorPayload(result.errorCode, result.message, result.diagnostic ? {
+          target_session_id: result.diagnostic.targetSessionId,
+          dispatch_started: result.diagnostic.dispatchStarted,
+          draft_state: result.diagnostic.draftState,
+        } : {});
       }
 
       return okPayload({
@@ -244,6 +268,7 @@ export function registerSendToSessionTool(
         ...(result.effort !== undefined ? { effort: result.effort } : {}),
         ...(result.fastMode !== undefined ? { fast_mode: result.fastMode } : {}),
         ...(result.providerId !== undefined ? { provider_id: result.providerId } : {}),
+        ...(result.claudeExcludedMcpServers !== undefined ? { claude_excluded_mcp_servers: result.claudeExcludedMcpServers } : {}),
       });
     },
   });

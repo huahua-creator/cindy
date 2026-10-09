@@ -378,7 +378,7 @@ describe('sendToSession ordering', () => {
     expect(helperBlock).not.toContain('await session.send(agentMessage, {');
     expect(helperBlock).not.toContain('assertDesktopSendDispatched(sendResult');
     expect(createBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(session, message, clientId, {');
-    expect(createBranch).toContain('planMode: false,');
+    expect(createBranch).toContain('planMode: mcpProfile.requested ? true : false,');
     expect(createBranch).toContain("assertDesktopSendDispatched(sendResult, 'send_to_session create');");
     expect(liveBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(');
     expect(liveBranch).toContain('live,');
@@ -483,7 +483,7 @@ describe('sendToSession ordering', () => {
 
     expect(createBranch).toContain('onAccepted: async () => {');
     expect(createBranch).toContain('const sendResult = await sendUserMessageWithAwaitedGitBaseline(session, message, clientId, {');
-    expect(createBranch).toContain('planMode: false,');
+    expect(createBranch).toContain('planMode: mcpProfile.requested ? true : false,');
     expectOrder(createBranch, 'onAccepted: async () => {', 'notifyAgentIslandUserPrompt(session, persistedContent ?? message, {');
     expectOrder(createBranch, 'notifyAgentIslandUserPrompt(session, persistedContent ?? message, {', 'await createDbMessage(session.id, {');
     expect(createBranch).toContain('content: persistedContent ?? message,');
@@ -505,7 +505,8 @@ describe('sendToSession ordering', () => {
       '          },\n          onDispatching:',
     );
     const sendCallEndNeedle =
-      '          onDispatching: () => dispatchAgentIslandUserPrompt(session.id),\n        });';
+      '            dispatchAgentIslandUserPrompt(session.id);\n          },\n        });';
+    expect(createBranch).toContain(sendCallEndNeedle);
     const afterSendResolves = createBranch.slice(
       createBranch.indexOf(sendCallEndNeedle) + sendCallEndNeedle.length,
     );
